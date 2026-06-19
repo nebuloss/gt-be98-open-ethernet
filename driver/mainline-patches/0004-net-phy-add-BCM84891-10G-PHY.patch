@@ -1,0 +1,238 @@
+From f31a6aa35ab7b38a900e068cc9296d1c6dd300d7 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Fri, 19 Jun 2026 18:12:21 +0000
+Subject: [PATCH] net: phy: add BCM84891/BCM4916 10G XPHY (0x359050e1)
+
+Add a phy_driver entry for the BCM4916 SoC integrated 10G NBASE-T copper
+PHY (PHY ID 0x359050e1, the GT-BE98 eth0/WAN external-facing port), to the
+existing bcm84881 driver family.
+
+Use an EXACT phy_id match: the model field 0x359050e is shared with the
+internal 1G EGPHY 0x359050e0, so a model-mask match would wrongly claim it.
+
+Link/speed are read from the Broadcom-proprietary VEND1 (MMD 0x1e) status
+register 0x400d (link bit5, speed bits[4:2]: 7=10M 2=100M 4=1G 1=2.5G 3=5G
+6=10G), per the vendor GPLv2 phy_drv_ext3.c _phy_read_status().
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ drivers/net/phy/bcm84881.c | 167 ++++++++++++++++++++++++++++++++++++-
+ include/linux/brcmphy.h    |   1 +
+ 2 files changed, 167 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/phy/bcm84881.c b/drivers/net/phy/bcm84881.c
+index 2ae70dcf8..7693f24c9 100644
+--- a/drivers/net/phy/bcm84881.c
++++ b/drivers/net/phy/bcm84881.c
+@@ -16,6 +16,8 @@
+ #include <linux/module.h>
+ #include <linux/phy.h>
+ 
++#include <linux/brcmphy.h>
++
+ enum {
+ 	MDIO_AN_C22 = 0xffe0,
+ };
+@@ -416,6 +418,159 @@ static unsigned int bcm84881_inband_caps(struct phy_device *phydev,
+ 	return LINK_INBAND_DISABLE;
+ }
+ 
++/*
++ * BCM4916 integrated 10G "XPHY" (NBASE-T copper), PHY ID 0x359050e1.
++ *
++ * Unlike the SFP-module BCM84881/91/92 above, this is the multigig copper PHY
++ * integrated in the BCM4916 SoC (the GT-BE98's eth0/WAN). Its link/speed status
++ * is reported through a Broadcom-proprietary VEND1 (MMD 0x1e) status register
++ * rather than the generic C45 AN/PCS status used by bcm84881_read_status().
++ *
++ * The register layout below is taken from the vendor GPLv2 ext-PHY driver
++ * (asuswrt-merlin.ng 4916 behnd SDK,
++ *  bcmdrivers/opensource/phy/phy_drv_ext3.c):
++ *   - PHY ID table: { 0x3590, 0x50e1, "XPHY4916_X", &xphy } -> exact 0x359050e1
++ *   - _phy_read_status() reads MMD 0x1e reg 0x400d:
++ *        bit5      = copper link
++ *        bits[4:2] = speed mode: 7=10M 2=100M 4=1G 1=2.5G 3=5G 6=10G
++ *     and MMD 0x07 reg 0xfff9 (C22-in-C45 1000BASE-T aux status) for the
++ *     sub-1G duplex/pause bits.
++ *
++ * The integrated XPHY needs a one-time microcode ("xphy" firmware) download for
++ * full operation; on the GT-BE98 that download is performed by the SoC boot
++ * infrastructure before Linux runs, so this mainline driver does not issue it.
++ * See driver/mainline-patches/README.md TODOs.
++ */
++#define BCM4916_XPHY_VEND1_STATUS	0x400d
++#define BCM4916_XPHY_STAT_LINK		BIT(5)
++#define BCM4916_XPHY_STAT_SPEED_MASK	GENMASK(4, 2)
++#define BCM4916_XPHY_STAT_SPEED_SHIFT	2
++
++/* 1000BASE-T auxiliary status summary, C22-in-C45 in the AN MMD */
++#define BCM4916_XPHY_AN_AUX_STAT	0xfff9
++
++static int bcm4916_xphy_config_init(struct phy_device *phydev)
++{
++	/* The 4916 integrated XPHY presents a 10GBASE-R/USXGMII style host
++	 * interface to the SoC Ethernet/Runner block. Accept the host modes
++	 * the SF2/Runner conduit uses; do not fail probe on others.
++	 */
++	__set_bit(PHY_INTERFACE_MODE_USXGMII, phydev->possible_interfaces);
++	__set_bit(PHY_INTERFACE_MODE_10GBASER, phydev->possible_interfaces);
++	__set_bit(PHY_INTERFACE_MODE_2500BASEX, phydev->possible_interfaces);
++	__set_bit(PHY_INTERFACE_MODE_SGMII, phydev->possible_interfaces);
++	/* The integrated macro can also present a plain GMII host link at
++	 * sub-1G; the SF2/b53 MAC it connects to only offers MII/GMII, so
++	 * advertise GMII too to let phylink find a common interface.
++	 */
++	__set_bit(PHY_INTERFACE_MODE_GMII, phydev->possible_interfaces);
++
++	return 0;
++}
++
++static int bcm4916_xphy_probe(struct phy_device *phydev)
++{
++	/* Matched by exact C22 PHY ID; the part is genuinely Clause-45 and all
++	 * register access below goes through phy_{read,write}_mmd (C45 native or
++	 * MMD-over-C22 indirect, whichever the host MDIO bus provides).
++	 */
++	return 0;
++}
++
++static int bcm4916_xphy_get_features(struct phy_device *phydev)
++{
++	/* Fixed NBASE-T copper PHY. The SDK marks this part
++	 * INTER_PHY_TYPES_US1K2XIR5KIR10R (USXGMII + 1G/2.5G/5G/10G), i.e. it
++	 * supports 100M..10G copper. Advertise that set directly instead of
++	 * probing the PMA abilities, which keeps us robust against PMA EXTABLE
++	 * quirks on the integrated macro.
++	 */
++	linkmode_zero(phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_Autoneg_BIT, phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_TP_BIT, phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_Pause_BIT, phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT,
++			 phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseT_Full_BIT,
++			 phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_2500baseT_Full_BIT,
++			 phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_5000baseT_Full_BIT,
++			 phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_10000baseT_Full_BIT,
++			 phydev->supported);
++
++	return 0;
++}
++
++static int bcm4916_xphy_read_status(struct phy_device *phydev)
++{
++	int val, aux, mode;
++
++	/* Broadcom-proprietary copper status (phy_drv_ext3.c _phy_read_status) */
++	val = phy_read_mmd(phydev, MDIO_MMD_VEND1, BCM4916_XPHY_VEND1_STATUS);
++	if (val < 0)
++		return val;
++
++	phydev->link = !!(val & BCM4916_XPHY_STAT_LINK);
++	phydev->speed = SPEED_UNKNOWN;
++	phydev->duplex = DUPLEX_UNKNOWN;
++	phydev->pause = 0;
++	phydev->asym_pause = 0;
++
++	if (!phydev->link)
++		return 0;
++
++	mode = (val & BCM4916_XPHY_STAT_SPEED_MASK) >>
++	       BCM4916_XPHY_STAT_SPEED_SHIFT;
++	switch (mode) {
++	case 7:
++		phydev->speed = SPEED_10;
++		break;
++	case 2:
++		phydev->speed = SPEED_100;
++		break;
++	case 4:
++		phydev->speed = SPEED_1000;
++		break;
++	case 1:
++		phydev->speed = SPEED_2500;
++		break;
++	case 3:
++		phydev->speed = SPEED_5000;
++		break;
++	case 6:
++		phydev->speed = SPEED_10000;
++		break;
++	default:
++		/* unknown encoding: treat as no usable link */
++		phydev->link = 0;
++		return 0;
++	}
++
++	aux = phy_read_mmd(phydev, MDIO_MMD_AN, BCM4916_XPHY_AN_AUX_STAT);
++	if (aux < 0)
++		return aux;
++
++	if (phydev->speed > SPEED_1000) {
++		phydev->duplex = DUPLEX_FULL;
++	} else {
++		mode = (aux >> 8) & 0x7;
++		if (mode == 1 || mode == 3 || mode == 6)
++			phydev->duplex = DUPLEX_HALF;
++		else if (mode == 2 || mode == 5 || mode == 7)
++			phydev->duplex = DUPLEX_FULL;
++	}
++
++	if (aux & BIT(1))
++		phydev->pause = 1;
++	if (aux & BIT(0))
++		phydev->asym_pause = 1;
++
++	return 0;
++}
++
+ static struct phy_driver bcm84881_drivers[] = {
+ 	{
+ 		.phy_id		= 0xae025150,
+@@ -456,6 +611,15 @@ static struct phy_driver bcm84881_drivers[] = {
+ 		.led_hw_is_supported = bcm8489x_led_hw_is_supported,
+ 		.led_hw_control_set = bcm8489x_led_hw_control_set,
+ 		.led_hw_control_get = bcm8489x_led_hw_control_get,
++	}, {
++		PHY_ID_MATCH_EXACT(PHY_ID_BCM4916_XPHY),
++		.name		= "Broadcom BCM4916 10G XPHY",
++		.config_init	= bcm4916_xphy_config_init,
++		.probe		= bcm4916_xphy_probe,
++		.get_features	= bcm4916_xphy_get_features,
++		.config_aneg	= bcm84881_config_aneg,
++		.aneg_done	= bcm84881_aneg_done,
++		.read_status	= bcm4916_xphy_read_status,
+ 	},
+ };
+ 
+@@ -466,9 +630,10 @@ static const struct mdio_device_id __maybe_unused bcm84881_tbl[] = {
+ 	{ 0xae025150, 0xfffffff0 },
+ 	{ PHY_ID_MATCH_MODEL(0x35905080) },
+ 	{ PHY_ID_MATCH_MODEL(0x359050a0) },
++	{ PHY_ID_MATCH_EXACT(PHY_ID_BCM4916_XPHY) },
+ 	{ },
+ };
+ MODULE_AUTHOR("Russell King");
+-MODULE_DESCRIPTION("Broadcom BCM84881/BCM84891/BCM84892 PHY driver");
++MODULE_DESCRIPTION("Broadcom BCM84881/BCM84891/BCM84892 + BCM4916 XPHY PHY driver");
+ MODULE_DEVICE_TABLE(mdio, bcm84881_tbl);
+ MODULE_LICENSE("GPL");
+diff --git a/include/linux/brcmphy.h b/include/linux/brcmphy.h
+index c6cd6e5c1..a399f185b 100644
+--- a/include/linux/brcmphy.h
++++ b/include/linux/brcmphy.h
+@@ -55,6 +55,7 @@
+ #define PHY_ID_BCM7445			0x600d8510
+ #define PHY_ID_BCM7712			0x35905330
+ #define PHY_ID_BCM4916_EGPHY		0x359050e0
++#define PHY_ID_BCM4916_XPHY		0x359050e1
+ 
+ #define PHY_ID_BCM_CYGNUS		0xae025200
+ #define PHY_ID_BCM_OMEGA		0xae025100
+-- 
+2.47.3
+

@@ -51,17 +51,17 @@ brcm-sf2 a800000.ethernet-switch: found switch: BCM4916, rev 0
 macb a700000.ethernet eth1: Cadence GEM ... (DSA CPU-port conduit)
 brcm-sf2 ...: Link is Up - 1Gbps/Full
 brcm-sf2 ... eth2: PHY [a900000.mdio--1:02] driver [Broadcom BCM4916 EGPHY]
-brcm-sf2 ... eth0: PHY [a900000.mdio--1:09] driver [Generic PHY]
+brcm-sf2 ... eth0: PHY [a900000.mdio--1:09] driver [Broadcom BCM4916 10G XPHY]
 DSA: tree 0 setup
 brcm-sf2 ...: Starfighter 2 top: 0.53, core: 0.06, IRQs: 19, 20
 ```
-(`found switch: BCM4916` and `driver [Broadcom BCM4916 EGPHY]` are the new
-results vs the earlier stock-kernel boot, which showed `BCM4908` and
-`Generic PHY`.)
+(`found switch: BCM4916`, `driver [Broadcom BCM4916 EGPHY]` on eth2, and
+`driver [Broadcom BCM4916 10G XPHY]` on eth0 are the new results vs the
+earlier stock-kernel boot, which showed `BCM4908` and `Generic PHY`.)
 sysfs confirms phylib read the REAL Broadcom PHY IDs through the modelled MDIO:
 ```
 a900000.mdio--1:02 phy_id=0x359050e0   # eth2 internal EGPHY
-a900000.mdio--1:09 phy_id=0x359050e1   # eth0 ext 10G BCM84891
+a900000.mdio--1:09 phy_id=0x359050e1   # eth0 BCM4916 integrated 10G XPHY
 a900000.mdio--1:15 phy_id=0x35905081   # eth3 ext multigig (addr 21)
 ```
 
@@ -92,7 +92,15 @@ using it, or rebuild QEMU with `--enable-slirp`.
   `driver/mainline-patches/`), so `b53` skips `b53_switch_detect`.
 - **UNIMAC MDIO master** (`TYPE_BCM4916_MDIO`, DT `brcm,unimac-mdio`): the
   CMD/CFG register block + C22 state machine + a fake-PHY register file that
-  returns the real Broadcom PHY IDs (addr 2/9/21) and BMSR link-up.
+  returns the real Broadcom PHY IDs (addr 2/9/21) and BMSR link-up. It also
+  models the **MMD-over-C22 indirect** access (regs `MII_MMD_CTRL` 0x0d /
+  `MII_MMD_DATA` 0x0e, per `drivers/net/phy/phy-core.c::mmd_phy_indirect`) so the
+  Clause-45 `Broadcom BCM4916 10G XPHY` driver (mainline-patches/0004) can read
+  the proprietary VEND1 (0x1e) status reg `0x400d` and AN (0x07) `0xfff9`. For
+  addr 9 (eth0) these preload to "link up, 10G". NOTE: `mdio-bcm-unimac` has no
+  native `read_c45`, so the driver reaches the MMDs via the C22 indirect path —
+  which is why the eth0 PHY is discovered as a C22 device (matched by exact C22
+  PHY ID) rather than a native C45 device.
 - Wiring lives in `hw/arm/virt.c::create_bcm4916()` (a local patch on dev-build):
   maps both devices, emits the matching FDT (switch + ports + mdio + PHYs), and
   adds a **Cadence GEM** (`macb`) as the DSA CPU-port conduit so
@@ -100,16 +108,19 @@ using it, or rebuild QEMU with `--enable-slirp`.
 
 ### Kernel config deltas needed (built-in, set on dev-build `~/mainline/.config`)
 `NET_DSA`, `NET_DSA_BCM_SF2`, `B53`, `NET_DSA_TAG_BRCM`, `MDIO_BCM_UNIMAC`,
-`BROADCOM_PHY`, `MACB` all `=y`. To make `NET_DSA=y` stick, `BRIDGE=y`,
+`BROADCOM_PHY`, `BCM84881_PHY`, `MACB` all `=y`. To make `NET_DSA=y` stick, `BRIDGE=y`,
 `VLAN_8021Q=y`, and `HSR` must be `n` (DSA `depends on HSR || HSR=n` caps it to
 `m` while `HSR=m`).
 
 ### Honest gaps / TODO
-- The internal 1G EGPHY (`0x359050e0`, eth2) now binds the **Broadcom BCM4916
-  EGPHY** driver (patch 0003). The external 10G PHY (`0x359050e1`, BCM84891,
-  eth0) still attaches as **Generic PHY** — supporting it is a non-trivial C45
-  PHY effort, deliberately deferred (see `driver/mainline-patches/README.md`).
-  Enumeration succeeds either way, which is the Stage-2 goal.
+- The internal 1G EGPHY (`0x359050e0`, eth2) binds the **Broadcom BCM4916
+  EGPHY** driver (patch 0003); the external 10G PHY (`0x359050e1`, eth0) now
+  binds the new **Broadcom BCM4916 10G XPHY** driver (patch 0004) via the
+  MMD-over-C22 path above. CAVEAT: the modelled SF2/b53 DSA MAC is 1G-class
+  (offers only MII/GMII), so phylink caps eth0 to GMII even though the XPHY
+  `read_status` reads 10G from VEND1 0x400d. True 10G operation runs through the
+  Runner/crossbar datapath, which the harness does not model — so the harness
+  proves *bind + read_status parse*, not a live 10G link.
 - No real datapath: the CPU conduit is a stand-in Cadence GEM, not the real
   UNIMAC/XPORT/Runner. No frames traverse the switch (that is Stage 3+).
 - The SF2 core base on the real 4916 is still unknown (FDT hides it behind

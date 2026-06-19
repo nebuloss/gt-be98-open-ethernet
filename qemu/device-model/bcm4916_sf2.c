@@ -274,6 +274,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(Bcm4916MdioState, BCM4916_MDIO)
 #define MII_BMSR    0x01
 #define MII_PHYID1  0x02
 #define MII_PHYID2  0x03
+#define MII_MMD_CTRL  0x0d   /* MMD access control (C45-over-C22) */
+#define MII_MMD_DATA  0x0e   /* MMD access data */
+#define MII_MMD_CTRL_NOINCR 0x4000
+#define MII_MMD_DEVAD_MASK  0x1f
+
+/* MMD register slots we model for the C45 BCM4916 XPHY (addr 9):
+ *   VEND1 (0x1e) 0x400d  copper status (link bit5, speed bits[4:2])
+ *   AN    (0x07) 0xfff9  1000BASE-T aux status (duplex/pause)
+ * matching driver/mainline-patches/0004 (Broadcom GPL phy_drv_ext3.c).
+ * 10G link-up status word: link(bit5)=1 + speed mode 6 (10G) -> 0x38. */
+#define XPHY_VEND1_STATUS_REG 0x400d
+#define XPHY_VEND1_STATUS_10G 0x0038
+#define XPHY_AN_AUX_STAT_REG  0xfff9
+#define XPHY_AN_AUX_STAT_VAL  0x0200   /* pause(bit1)=1; >1G forces full */
 
 /*
  * PHY map for GT-BE98 (re-notes/bcm4916-regmap.md). We model the internal
@@ -307,14 +321,41 @@ struct Bcm4916MdioState {
     /* per-PHY C22 register file (only used regs are meaningful) */
     uint16_t phy_regs[MDIO_NUM_PHYS][32];
     bool phy_present[MDIO_NUM_PHYS];
+    /* C45-over-C22 MMD indirection (MII_MMD_CTRL/DATA) per PHY */
+    uint16_t mmd_devad[MDIO_NUM_PHYS];
+    uint16_t mmd_addr[MDIO_NUM_PHYS];
+    /* sparse MMD store: only the few regs the XPHY driver reads */
+    uint16_t xphy_vend1_status[MDIO_NUM_PHYS];
+    uint16_t xphy_an_aux[MDIO_NUM_PHYS];
 };
+
+/* Resolve a selected MMD register (after MII_MMD_CTRL/DATA programming). */
+static uint16_t mmd_reg_read(Bcm4916MdioState *s, int pa)
+{
+    uint16_t devad = s->mmd_devad[pa] & MII_MMD_DEVAD_MASK;
+    uint16_t addr  = s->mmd_addr[pa];
+
+    if (devad == 0x1e && addr == XPHY_VEND1_STATUS_REG) {
+        return s->xphy_vend1_status[pa];
+    }
+    if (devad == 0x07 && addr == XPHY_AN_AUX_STAT_REG) {
+        return s->xphy_an_aux[pa];
+    }
+    /* Unmodeled MMD regs read 0 (benign for genphy_c45 helpers). */
+    return 0x0000;
+}
 
 static uint16_t mdio_phy_read(Bcm4916MdioState *s, int pa, int reg)
 {
     if (pa >= MDIO_NUM_PHYS || !s->phy_present[pa]) {
         return 0xffff;   /* no PHY here */
     }
-    return s->phy_regs[pa][reg & 0x1f];
+    reg &= 0x1f;
+    /* C45-over-C22 MMD data read (function=DATA selected via CTRL) */
+    if (reg == MII_MMD_DATA) {
+        return mmd_reg_read(s, pa);
+    }
+    return s->phy_regs[pa][reg];
 }
 
 static void mdio_phy_write(Bcm4916MdioState *s, int pa, int reg, uint16_t val)
@@ -322,8 +363,24 @@ static void mdio_phy_write(Bcm4916MdioState *s, int pa, int reg, uint16_t val)
     if (pa >= MDIO_NUM_PHYS || !s->phy_present[pa]) {
         return;
     }
-    /* BMCR writes: keep BMSR link state coherent enough for genphy. */
-    s->phy_regs[pa][reg & 0x1f] = val;
+    reg &= 0x1f;
+    /* C45-over-C22 MMD indirection (drivers/net/phy/phy-core.c
+     * mmd_phy_indirect): CTRL<-devad, DATA<-regaddr, CTRL<-devad|NOINCR. */
+    if (reg == MII_MMD_CTRL) {
+        s->mmd_devad[pa] = val & MII_MMD_DEVAD_MASK;
+        return;
+    }
+    if (reg == MII_MMD_DATA) {
+        /* If a devad is selected but no addr latched yet, this DATA write is
+         * the register address phase; otherwise it is a data write (ignored,
+         * the modeled MMD regs are read-only status). The mainline sequence
+         * always writes the address with the plain CTRL (no NOINCR) still
+         * holding the devad, so latch addr here. */
+        s->mmd_addr[pa] = val;
+        return;
+    }
+    /* plain C22 register */
+    s->phy_regs[pa][reg] = val;
 }
 
 static uint64_t mdio_read(void *opaque, hwaddr addr, unsigned size)
@@ -411,6 +468,15 @@ static void mdio_init_phy(Bcm4916MdioState *s, uint8_t addr, uint32_t id)
     s->phy_regs[addr][MII_BMSR]   = 0x796d;
     /* BMCR: autoneg enabled */
     s->phy_regs[addr][MII_BMCR]   = 0x1000;
+
+    /* For the BCM4916 integrated 10G XPHY (id 0x359050e1, eth0 @ addr 9):
+     * preload the Broadcom-proprietary VEND1 copper status to "link up, 10G"
+     * and the AN aux status, so the C45 read_status path in
+     * driver/mainline-patches/0004 reports link at 10G. */
+    if (id == 0x359050e1) {
+        s->xphy_vend1_status[addr] = XPHY_VEND1_STATUS_10G;
+        s->xphy_an_aux[addr]       = XPHY_AN_AUX_STAT_VAL;
+    }
 }
 
 static void bcm4916_mdio_reset(DeviceState *dev)
@@ -421,6 +487,10 @@ static void bcm4916_mdio_reset(DeviceState *dev)
     s->cfg = 0;
     memset(s->phy_regs, 0, sizeof(s->phy_regs));
     memset(s->phy_present, 0, sizeof(s->phy_present));
+    memset(s->mmd_devad, 0, sizeof(s->mmd_devad));
+    memset(s->mmd_addr, 0, sizeof(s->mmd_addr));
+    memset(s->xphy_vend1_status, 0, sizeof(s->xphy_vend1_status));
+    memset(s->xphy_an_aux, 0, sizeof(s->xphy_an_aux));
     for (i = 0; i < ARRAY_SIZE(bcm4916_phys); i++) {
         mdio_init_phy(s, bcm4916_phys[i].addr, bcm4916_phys[i].phy_id);
     }
