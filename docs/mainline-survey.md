@@ -1,7 +1,7 @@
 # Mainline Linux survey — Ethernet/switch extension surface for BCM4916 (ASUS GT-BE98)
 
 **Surveyed tree:** mainline `linux` (stable.git checkout), `Makefile` reports
-`VERSION=7 PATCHLEVEL=1 SUBLEVEL=0` → **kernel v7.1** (clone done `--depth=1` on dev-build, 10.0.50.21, `~/mainline`).
+`VERSION=7 PATCHLEVEL=1 SUBLEVEL=0` → **kernel v7.1** (clone done `--depth=1` on dev-build, `~/mainline`).
 **Method:** read source files directly via SSH on the build box. All file:line references below are against this v7.1 checkout. Nothing was built.
 
 **Headline findings**

@@ -5,7 +5,7 @@ pipe" mode (RX/TX rings moving packets MAC<->Linux CPU, no flow accel/NAT), and 
 register/descriptor ABI?
 
 **Confidence tags:** `[GPL-SRC]` = read directly from the Broadcom GPL SDK source.
-`[BIN]` = confirmed against staged stock binaries on CT 310 (`/opt/re-bins/*`).
+`[BIN]` = confirmed against staged stock binaries on the RE container (`/opt/re-bins/*`).
 `[FDT]` = from the live device tree (see `bcm4916-regmap.md`). `[INFER]` = deduced.
 
 ---
@@ -263,7 +263,7 @@ GPL source (Broadcom SDK `broadcom-sdk-416L05`, mirror
 - `bcmdrivers/opensource/net/enet/shared/bcmenet_runner_inline.h` — host TX dispatch (`rdpa_cpu_send_sysb`, `_fpm`).
 - `bcmdrivers/opensource/char/rdpa_gpl/impl1/include/{rdpa_cpu.h,rdpa_cpu_helper.h}` + `autogen/rdpa_ag_cpu.h` — RDPA CPU API.
 
-Stock 4916 binaries (CT 310 `/opt/re-bins/`, strings only):
+Stock 4916 binaries (the RE container `/opt/re-bins/`, strings only):
 - `rdpa.ko` (7.2 MB): `drv_rnr_load_microcode`, `drv_rnr_load_prediction`, `rdpa_version_firmware_revision`, FPM/SBPM scratch symbols — confirms XRDP uses the same FW-load + host-ring model.
 - `rdpa_gpl.ko`: `rdpa_cpu_send_sysb_fpm`, `f_rdpa_cpu_send_raw_from_fpm` — XRDP host TX via FPM.
 - Pools present: `bcm_mpm.ko`, `bcm_bpm.ko`; runner: `pktrunner.ko`, `cmdlist.ko`, `bdmf.ko`.

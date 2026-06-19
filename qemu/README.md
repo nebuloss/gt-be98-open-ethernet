@@ -4,7 +4,7 @@ Safe, device-free dev loop for the open mainline Ethernet driver. **Live device
 testing is OFF the table for now** (Ethernet is the management link — see the
 repo root README "Safety" section). QEMU is the primary loop.
 
-All builds + QEMU runs happen on **dev-build** (`ssh guillaume@10.0.50.21`),
+All builds + QEMU runs happen on **dev-build** (`ssh <dev-build>`),
 **never** on dev-code. Artifacts (Image, cpio, qemu binaries) stay on dev-build;
 only scripts/docs/skeletons live in this repo.
 
@@ -13,16 +13,16 @@ only scripts/docs/skeletons live in this repo.
 ## TL;DR — run the baseline boot loop (on dev-build)
 
 ```bash
-ssh guillaume@10.0.50.21
-# 1. (once) build the kernel — see docs/build-env.md
+ssh <dev-build>
+# 1. (once) build a recent mainline aarch64 kernel Image
 cd ~/mainline
 rtk make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image
 
 # 2. (once) build the busybox initramfs
-~/be98/gt-be98-open-ethernet/qemu/scripts/build-initramfs.sh
+~/gt-be98-open-ethernet/qemu/scripts/build-initramfs.sh
 
 # 3. boot it under qemu virt (auto-exit + pass/fail in 90s)
-TIMEOUT=90 ~/be98/gt-be98-open-ethernet/qemu/scripts/run-virt-baseline.sh
+TIMEOUT=90 ~/gt-be98-open-ethernet/qemu/scripts/run-virt-baseline.sh
 # -> "RESULT: BOOT OK" when the log contains the BE98_BOOT_OK marker
 ```
 

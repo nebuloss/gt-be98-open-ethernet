@@ -13,9 +13,9 @@ emulation, **[RE]** inferred from reverse-engineering, or **[REF]** from mainlin
 
 ## M1 — Recon + recovery  ⏳ in progress
 - [x] Read-only RE of live device: topology mapped → `re-notes/device-recon.md`
-- [x] Gather RE inputs: 18 stock `.ko`s + live FDT tar staged to CT 310 `/opt/re-bins` (bootloader=mtd1, located not dumped)
+- [x] Gather RE inputs: 18 stock `.ko`s + live FDT tar staged to the RE container `/opt/re-bins` (bootloader=mtd1, located not dumped)
 - [x] Mainline-source survey (v7.1) → `docs/mainline-survey.md` (reuse map + prime-directive change list)
-- [x] Recovery path designed → `docs/recovery-plan.md` (NOT exercised; needs user/physical action)
+- [x] Recovery path designed (internal notes, not published) — NOT exercised; needs user/physical action
 - [ ] **Extract BCM4916 reg/IRQ/topology from live FDT + bcm_enet.ko** (RE) — unblocks the DTS  ⏳ NEXT
 - [ ] Mainline aarch64 cross-toolchain + bcmbca defconfig on dev-build
 
@@ -46,12 +46,24 @@ emulation, **[RE]** inferred from reverse-engineering, or **[REF]** from mainlin
 ## M4 — Multi-gig / 10G PHY
 - [ ] BCM84891 10G PHY driver; 10G + 2.5G ports
 
-## M5 — (stretch, likely never for v1) Runner/RDPA HW offload
-- Out of scope. CPU-forwarded is the v1 deliverable.
+## M5 — Runner/RDPA HW offload  ★ NOW THE GOAL (user re-scope 2026-06-19)
+"Full features: 10G with no CPU overload" → the Runner MUST do fast-path forward/NAT/QoS in HW.
+- [ ] Bring up the Runner: load GPL microcode (`request_firmware`), init FPM/SBPM/BBH pools
+- [ ] CPU host-ring slow-path (RX/TX rings, NAPI on SPI 75–107) — exception/control traffic
+- [ ] Flow-acceleration control plane: flow learning → cmdlist actions → Runner tables (the hard part)
+- [ ] 10G line-rate forward/NAT offloaded, CPU idle — the deliverable
+- Note: Runner firmware is GPLv2-redistributable (so still "fully open"); but the offload control
+  plane (rdpa core / cmdlist) is stock-taint **(P) proprietary** → feasibility of an open
+  reconstruction is the key open question (under study). Likely the multi-person-year core.
+
+### Re-scope note
+The Runner is now central, NOT out-of-scope. All M1–M4 foundation work still applies — it's the
+substrate the offload fast-path sits on. The "CPU-forwarded ~1–3 Gbps" framing is downgraded to an
+intermediate checkpoint, not the deliverable.
 
 ---
 ## Log
 - 2026-06-19: Repo initialized (skeleton, README, this tracker). Connectivity confirmed to
-  device (4.19.294), Proxmox host (CT 310 dev-reverse running), dev-build (x86_64).
+  device (4.19.294), the RE container (dev-reverse running), dev-build (x86_64).
   Inherited WiFi-effort infra/recovery memory. User constraint added: no connectivity-breaking
   live tests for now.

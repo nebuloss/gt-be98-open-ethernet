@@ -25,6 +25,12 @@ re-bins/
 *.img
 !qemu/**/*.elf.note   # allow small annotated notes if any
 
+# Internal-only docs + config — kept locally, NEVER published to the public repo
+.mcp.json
+docs/gt-be98-open-ethernet-orchestrator-prompt.md
+docs/recovery-plan.md
+docs/build-env.md
+
 # Secrets / local
 *.local
 *-psk*

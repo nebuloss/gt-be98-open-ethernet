@@ -25,8 +25,7 @@
  * Build/registration (TODO, Stage 2): add to a QEMU machine (e.g. a
  * "bcm4916-virt" machine_init) via sysbus_create_simple / sysbus_mmio_map at the
  * SoC bases above, or splice onto -machine virt with -device on a custom build.
- * QEMU source tree on dev-build: ~/qemu-src (10.0.0 era). Build there, never on
- * dev-code.
+ * QEMU source tree on dev-build: ~/qemu-src. Build there, never on dev-code.
  */
 
 #include "qemu/osdep.h"

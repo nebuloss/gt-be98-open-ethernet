@@ -4,10 +4,10 @@ Reverse-engineered for mainline `bcm4916.dtsi` + `gt-be98.dts` authoring and a p
 `bcm4908_enet` / `bcm_sf2` extension.
 
 - **Gold source**: live `/proc/device-tree` from the running stock kernel
-  (`/opt/re-bins/live-fdt-device-tree.tar`, extracted to `/tmp/fdt` inside CT 310).
+  (`/opt/re-bins/live-fdt-device-tree.tar`, extracted to `/tmp/fdt` on the RE container).
   Every FDT value below is decoded big-endian from the property file at the noted node path.
 - **Secondary source**: vendor `bcm_enet.ko` (aarch64, "Broadcom Ethernet Interface v7.0")
-  analyzed with r2 (`aa` + targeted `pdf`/`afl`/`iz`). No CT 310 reboot was needed.
+  analyzed with r2 (`aa` + targeted `pdf`/`afl`/`iz`). No RE-container reboot was needed.
 - **Confidence tags**: `[FDT]` = read directly from the live device tree (confirmed hardware).
   `[DISASM]` = from bcm_enet.ko disassembly. `[INFER]` = deduced/cross-referenced, not a raw read.
 

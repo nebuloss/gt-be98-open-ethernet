@@ -3,9 +3,9 @@
 **Device:** ASUS GT-BE98 (`model=GT-BE98`, `productid=GT-BE98`, `build_name=GT-BE98`, `territory_code=EU/01`)
 **SoC:** Broadcom BCM4916 (BCA / XRDP-Runner architecture; DT compatible `brcm,brcm-v8A`, "Broadcom-v8A")
 **Firmware:** ASUSWRT-Merlin `firmver=3.0.0.6` / `buildno=102.6`
-**Kernel:** Linux 4.19.294 #5 SMP PREEMPT aarch64, built by `guillaume@dev-build`, gcc 10.3.0 (Buildroot 2021.02.4)
+**Kernel:** Linux 4.19.294 #5 SMP PREEMPT aarch64, built by `<user>@dev-build`, gcc 10.3.0 (Buildroot 2021.02.4)
 **Bootloader:** U-Boot 2019.07 (06/05/2026), loader build tag `50404p2@450432` (Sep 07 2023)
-**Access used:** `ssh -p 2222 admin@10.0.0.8` (dropbear, busybox userland; `id` absent)
+**Access used:** `ssh -p 2222 <device>` (dropbear, busybox userland; `id` absent)
 **Recon date:** 2026-06-19. ALL commands READ-ONLY. No module load/unload, no ip/ifconfig/ethtool-set, no devmem, no nvram writes, no dd of mtd.
 
 ---
@@ -26,7 +26,7 @@ Notes from nvram corroborating the map:
 - `wired_ifnames=eth1 eth2 eth3`; `wan_ifname_x=eth0`; `eth_ifnames=eth0 vlan4094`; `autowan_ifnames=eth0 vlan4094`
 - `autowan_brport_no_0=9`, `autowan_brport_no_1=8` (brport 9 = the external/WAN PHY)
 - `led_extphy_gpio=255`, `led_10g_white_gpio=4143` (dedicated external-10G-PHY LED → confirms a discrete external 10G PHY)
-- All four netdevs share MAC `60:cf:84:38:87:b0` (`et0macaddr=60:CF:84:38:87:B0`); switching done in HW (SF2), so per-port MAC is shared.
+- All four netdevs share MAC `60:cf:84:xx:xx:xx` (`et0macaddr=60:cf:84:xx:xx:xx`); switching done in HW (SF2), so per-port MAC is shared.
 
 **MDIO bus map (inferred from DT + PHYADs):** one SF2-side MDIO bus (`mdiosf2`, `brcm,mdio-sf2`, base `0x837ffd00`). PHY addresses observed: 2 (egphy/eth2), 7 (serdes/eth1, no C22 ID), 9 (ext 10G/eth0), 21 (multi-gig/eth3). `swblks/phy_base=0x01` (SF2 internal PHY base = addr 1).
 
@@ -87,11 +87,11 @@ bcm_knvram 24576 2 bcm_pcie_hcd,rdpa_mw, Live
 sysfs per port:
 
 ```
-eth0: address=60:cf:84:38:87:b0 operstate=up   carrier=1 speed=10000   (WAN, 10G, LINKED)
-eth1: address=60:cf:84:38:87:b0 operstate=down carrier=0 speed=0
-eth2: address=60:cf:84:38:87:b0 operstate=down carrier=0 speed=0
-eth3: address=60:cf:84:38:87:b0 operstate=down carrier=0 speed=0
-bcmsw: address=60:cf:84:38:87:b0 operstate=down (switch master device)
+eth0: address=60:cf:84:xx:xx:xx operstate=up   carrier=1 speed=10000   (WAN, 10G, LINKED)
+eth1: address=60:cf:84:xx:xx:xx operstate=down carrier=0 speed=0
+eth2: address=60:cf:84:xx:xx:xx operstate=down carrier=0 speed=0
+eth3: address=60:cf:84:xx:xx:xx operstate=down carrier=0 speed=0
+bcmsw: address=60:cf:84:xx:xx:xx operstate=down (switch master device)
 ```
 
 `ethtool -i ethX` (all four identical): `driver: Broadcom Ethernet Interface`, `version: 7.0`, `firmware-version: N/A`, `bus-info:` (empty). No standard register-dump/eeprom support.
@@ -160,7 +160,7 @@ Interpretation: SF2 switch (`swblks`) with embedded quad GPHY (`egphy`, internal
 ## 5. nvram (wired-net relevant keys)
 
 ```
-et0macaddr=60:CF:84:38:87:B0
+et0macaddr=60:cf:84:xx:xx:xx
 lan_ifname=br0
 lan_ifnames=eth0 eth1 eth2 eth3 wl0 wl1 wl2 wl3 wl0.1 wl1.1 wl2.1 wl3.1 wl3.4
 lanports=1 1 1 1 2 3
@@ -208,9 +208,9 @@ Current root = ubiblock0_6 (UBI volume 6 inside mtd "image"). Bootloader = U-Boo
 
 ---
 
-## 7. RE-input binaries staged to CT 310 (`root@10.0.0.2:/opt/re-bins/`)
+## 7. RE-input binaries staged to the RE container (`/opt/re-bins/`)
 
-All copied **device → (stream through dev-code, never landed on disk) → CT 310**. bcm_enet/rdpa/pktrunner sha256 cross-checked identical on device and CT (integrity verified). On-device source: `/lib/modules/4.19.294/extra/`. Live FDT: `tar c` of `/proc/device-tree`.
+All copied **device → (stream through dev-code, never landed on disk) → the RE container**. bcm_enet/rdpa/pktrunner sha256 cross-checked identical on device and the RE container (integrity verified). On-device source: `/lib/modules/4.19.294/extra/`. Live FDT: `tar c` of `/proc/device-tree`.
 
 | File | bytes | sha256 |
 |------|-------|--------|

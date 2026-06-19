@@ -47,9 +47,9 @@ A broken Ethernet driver disconnects the device entirely (no WiFi-style fallback
 
 ## Infra (shared with the WiFi effort)
 
-- **dev-code** (this box, 10.0.50.20): source + git only — **no builds here**.
-- **dev-build** (`ssh guillaume@10.0.50.21`): toolchain + KDIR; build via `rtk <cmd>`.
-- **device** (`admin@10.0.0.8`, :2222 dropbear / :2223 OpenSSH): the live ports/switch.
-- **RE container**: Proxmox LXC **CT 310** on `root@10.0.0.2` (dev-reverse); the `re` MCP.
+- **dev-code** (this box): source + git only — **no builds here**.
+- **dev-build** (`ssh <dev-build>`): toolchain + KDIR; build via `rtk <cmd>`.
+- **device** (`<device>`, :2222 dropbear / :2223 OpenSSH): the live ports/switch.
+- **RE container**: the RE container (dev-reverse); the `re` MCP.
 
 See `docs/` for the detailed methodology and milestone tracker.

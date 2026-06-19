@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run-virt-baseline.sh — boot the mainline aarch64 kernel under qemu-system-aarch64
-# -machine virt as the BE98 host-side sanity loop. RUN ON dev-build (10.0.50.21).
+# -machine virt as the BE98 host-side sanity loop. RUN ON dev-build.
 #
 # This proves toolchain + kernel + rootfs boot. It does NOT model any BCM4916
 # device (no UNIMAC / SF2-MDIO / GPHY) — that is Stage 2+ (see qemu/README.md).

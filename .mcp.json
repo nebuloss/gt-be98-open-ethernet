@@ -1,5 +1,0 @@
-{
-  "mcpServers": {
-    "re": { "type": "http", "url": "https://reverse.mcp.dev.patapouf.club/mcp/" }
-  }
-}

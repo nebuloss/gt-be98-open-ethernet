@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # build-initramfs.sh — build a minimal busybox aarch64 initramfs for the
-# BE98 QEMU baseline boot loop. RUN ON dev-build (10.0.50.21), NOT on dev-code.
+# BE98 QEMU baseline boot loop. RUN ON dev-build, NOT on dev-code.
 #
 # Produces: ~/qemu-be98/initramfs.cpio.gz
 #
