@@ -1,0 +1,514 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * bcm4916.dtsi - SoC-level device tree for Broadcom BCM4916 / "bcm96813"
+ * (quad Cortex-A53, aarch64). This is the GT-BE98 SoC.
+ *
+ * Authored for the gt-be98-open-ethernet effort: a mainline-style, open
+ * wired-Ethernet + switch control-plane model. Reconciled from three sources:
+ *   [FDT]   live /proc/device-tree of the stock kernel
+ *           (see re-notes/bcm4916-regmap.md)
+ *   [SDK]   the 4916 "behnd" SDK gold .dts/.dtsi and chip map headers
+ *           (kernel/dts/6813/6813.dtsi, shared/.../6813_map_part.h)
+ *   [MAIN]  mainline conventions (bcm6813.dtsi, bcm4908.dtsi, bcm4912.dtsi)
+ *
+ * NOTE on chip naming: Broadcom's marketing name is "BCM4916"; the SDK and
+ * mainline kernel call the same die "6813"/"bcm6813". We keep "brcm,bcm4916"
+ * as the primary compatible (this effort's target) and also carry
+ * "brcm,bcm6813" so existing mainline bcmbca SoC code/skeleton can bind.
+ *
+ * Confidence tags inline: [FDT] confirmed from live tree, [SDK] from the
+ * gold SDK source, [MAIN] mainline reference, [INFER]/TODO unconfirmed.
+ *
+ * SCOPE: control plane only (CPU/GIC/clocks, the SF2-class switch + ports +
+ * port->PHY->MDIO map, MDIO bus, PHYs, serdes, UNIMAC/XLMAC/XPORT MAC nodes).
+ * The Runner/RDPA datapath is OUT of scope here (placeholder node + TODO).
+ */
+
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+/ {
+	compatible = "brcm,bcm4916", "brcm,bcm6813", "brcm,bcmbca";
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	interrupt-parent = <&gic>;
+
+	/* 4x Cortex-A53 (Broadcom Brahma-B53). [SDK bcm_b53_quad.dtsi] [MAIN bcm6813.dtsi] */
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		B53_0: cpu@0 {
+			compatible = "brcm,brahma-b53";
+			device_type = "cpu";
+			reg = <0x0 0x0>;
+			next-level-cache = <&L2_0>;
+			enable-method = "psci";
+		};
+
+		B53_1: cpu@1 {
+			compatible = "brcm,brahma-b53";
+			device_type = "cpu";
+			reg = <0x0 0x1>;
+			next-level-cache = <&L2_0>;
+			enable-method = "psci";
+		};
+
+		B53_2: cpu@2 {
+			compatible = "brcm,brahma-b53";
+			device_type = "cpu";
+			reg = <0x0 0x2>;
+			next-level-cache = <&L2_0>;
+			enable-method = "psci";
+		};
+
+		B53_3: cpu@3 {
+			compatible = "brcm,brahma-b53";
+			device_type = "cpu";
+			reg = <0x0 0x3>;
+			next-level-cache = <&L2_0>;
+			enable-method = "psci";
+		};
+
+		L2_0: l2-cache0 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+		};
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 11 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 10 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>;
+	};
+
+	pmu: pmu {
+		compatible = "arm,cortex-a53-pmu";
+		interrupts = <GIC_SPI 7 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 9 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 10 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-affinity = <&B53_0>, <&B53_1>, <&B53_2>, <&B53_3>;
+	};
+
+	psci {
+		compatible = "arm,psci-0.2";
+		method = "smc";
+	};
+
+	clocks: clocks {
+		/* [MAIN bcm6813.dtsi] fixed clocks; real rates are PMC-driven. */
+		periph_clk: periph-clk {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <200000000>;
+		};
+
+		uart_clk: uart-clk {
+			compatible = "fixed-factor-clock";
+			#clock-cells = <0>;
+			clocks = <&periph_clk>;
+			clock-div = <4>;
+			clock-mult = <1>;
+		};
+	};
+
+	/*
+	 * GIC-400. [FDT interrupt-controller@81000000] [MAIN bcm6813.dtsi axi@81000000]
+	 * Live FDT decodes the dist at 0x81001000 / cpu-if at 0x81002000; mainline
+	 * models the whole AXI window 0x81000000 (size 0x8000) and places the GIC at
+	 * offset 0x1000. We follow mainline: dist @0x1000(=0x81001000),
+	 * cpu-if @0x2000(=0x81002000), plus hyp/vcpu (gic-400). [INFER for hyp/vcpu]
+	 */
+	axi@81000000 {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x0 0x81000000 0x8000>;
+
+		gic: interrupt-controller@1000 {
+			compatible = "arm,gic-400";
+			#interrupt-cells = <3>;
+			interrupt-controller;
+			interrupts = <GIC_PPI 9 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_HIGH)>;
+			reg = <0x1000 0x1000>,	/* GIC dist  -> 0x81001000 [FDT] */
+			      <0x2000 0x2000>,	/* GIC cpu   -> 0x81002000 [FDT] */
+			      <0x4000 0x2000>,	/* GIC hyp   [MAIN/INFER]        */
+			      <0x6000 0x2000>;	/* GIC vcpu  [MAIN/INFER]        */
+		};
+	};
+
+	/*
+	 * Legacy peripheral bus. [FDT periph: child 0x0 -> 0xff800000 size 0x62000]
+	 * Mainline bcm6813.dtsi uses bus@ff800000 with a 0x800000 window for
+	 * serial/nand/spi; we keep that shape. The UART used as console lives here.
+	 */
+	bus@ff800000 {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x0 0xff800000 0x800000>;
+
+		/* PL011 UART -> ttyAMA0. [MAIN bcm6813.dtsi serial@12000] */
+		uart0: serial@12000 {
+			compatible = "arm,pl011", "arm,primecell";
+			reg = <0x12000 0x1000>;
+			interrupts = <GIC_SPI 32 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&uart_clk>, <&uart_clk>;
+			clock-names = "uartclk", "apb_pclk";
+			status = "disabled";
+		};
+	};
+
+	/*
+	 * ===================================================================
+	 * Wired Ethernet control plane
+	 * ===================================================================
+	 *
+	 * The XRDP bus carries the switch/PHY "misc" control page, the MDIO
+	 * master, the MAC cores and (out of scope here) the Runner/RDPA window.
+	 *
+	 * [FDT xrdp ranges]:
+	 *   child 0x0          -> SoC 0x82000000 size 0x00cd0000  (runner window)
+	 *   child 0x1_00000000 -> SoC 0xff800000 size 0x00062000  (periph alias)
+	 *
+	 * We DO NOT use the xrdp simple-bus translation for the control-plane MAC
+	 * and switch nodes below: their reg values are full SoC physical addresses
+	 * (2-cell/2-cell, matching the live FDT), placed directly under the root so
+	 * the addresses are unambiguous and review-friendly. A future runner
+	 * datapath driver can reintroduce the translating xrdp bus if desired.
+	 */
+
+	/*
+	 * SF2-class integrated switch.
+	 *
+	 * IMPORTANT - SF2 switch-core base (required deliverable, [SDK]-PINNED):
+	 *   The live FDT hides the switch behind a logical "brcm,enet"/"RUNNER_SW"
+	 *   node with NO reg of its own (re-notes open-question #1). The 4916 SDK
+	 *   chip map header pins the base:
+	 *     shared/opensource/include/bcm963xx/6813_map_part.h
+	 *       #define ETH_PHYS_BASE        0x83400000   (size 0x400000)
+	 *       #define ETH_PHYS_REG_OFFSET  0x3ff000
+	 *       #define SWITCH_REG_BASE      ETH_PHYS_REG_BASE
+	 *                                  = 0x83400000 + 0x3ff000 = 0x837ff000
+	 *   i.e. the switch register page == the 0x837ff000 glue page the FDT
+	 *   exposed piecemeal as ethphytop/swblks/egphy. The MDIO master and serdes
+	 *   ctrl live in the same ETH_PHYS window (0x837ffd00 / 0x837ff500).
+	 *
+	 *   The SDK header also declares a b53-style "EthernetSwitchCore" register
+	 *   struct (SWITCH_CORE_*), but provides NO independent phys-base macro for
+	 *   it in this runner build: the b53 datapath core is not separately
+	 *   memory-mapped in the stock model (the Runner owns forwarding). For a
+	 *   mainline bcm_sf2/DSA bring-up the core registers therefore start at
+	 *   SWITCH_REG_BASE = 0x837ff000; sub-block offsets (core/intrl2/acb)
+	 *   still need confirmation. [INFER for sub-block offsets / TODO]
+	 *
+	 * Compatible: new "brcm,bcm4916-switch" (mainline-style). The closest
+	 * mainline driver family is bcm_sf2/b53/DSA, but this part's forwarding is
+	 * Runner-accelerated, so a real driver decision is still open
+	 * (see re-notes PART B verdict). Modeled DSA-style for upstreamability.
+	 */
+	switch0: ethernet-switch@837ff000 {
+		compatible = "brcm,bcm4916-switch"; /* TODO: bcm_sf2-family vs new driver */
+		reg = <0x0 0x837ff000 0x0 0x1000>;  /* [SDK] SWITCH_REG_BASE; sub-regs TODO */
+		reg-names = "core";
+		dsa,member = <0 0>;
+		status = "disabled";
+
+		/*
+		 * Port map - all values [FDT]/[SDK]-confirmed (re-notes table +
+		 * SDK 6813.dtsi &switch0). reg = SF2 logical port#. Stock disables
+		 * every port; the board dts enables the four wired ones.
+		 *
+		 *   port#1 = eth2  UNIMAC gmii  -> internal EGPHY @MDIO2  (1G)
+		 *   port#5 = eth0  XPORT serdes -> ext 10G BCM84891 @MDIO9
+		 *   port#6 = eth1  XPORT serdes -> serdes0 10GBase-R @MDIO7 (fixed)
+		 *   port#7 = eth3  XPORT serdes -> serdes1 @MDIO8 -> ext PHY @MDIO21
+		 *
+		 * NOTE: the stock "mac-type"/"mac-index"/"gmii-direct" props are SDK/
+		 * RUNNER_SW specifics; we keep them in comments and use mainline
+		 * phy-mode/phy-handle. mac-type per port: UNIMAC (port1) vs XPORT
+		 * (ports 5/6/7). phy-mode "gmii" for the internal GPHY port; the XPORT
+		 * 10G/multigig ports are stock phy-mode="serdes" -> mapped to mainline
+		 * "10gbase-r"/"usxgmii" in the board dts per link type. [INFER mapping]
+		 */
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* port#0 - internal GPHY, unused on GT-BE98 [SDK port_gphy0] */
+			port@0 {
+				reg = <0>;
+				phy-mode = "gmii";	/* mac-type UNIMAC [SDK] */
+				phy-handle = <&phy_gphy0>;
+				status = "disabled";
+			};
+
+			/* port#1 = eth2 - internal EGPHY @MDIO2, our first-light target */
+			port@1 {
+				reg = <1>;
+				phy-mode = "gmii";	/* mac-type UNIMAC [FDT][SDK] */
+				phy-handle = <&phy_gphy1>;
+				status = "disabled";	/* enabled+labelled in board dts */
+			};
+
+			/* port#2 - internal GPHY, unused [SDK port_gphy2] */
+			port@2 {
+				reg = <2>;
+				phy-mode = "gmii";
+				phy-handle = <&phy_gphy2>;
+				status = "disabled";
+			};
+
+			/* port#3 - internal GPHY, unused [SDK port_gphy3] */
+			port@3 {
+				reg = <3>;
+				phy-mode = "gmii";
+				phy-handle = <&phy_gphy3>;
+				status = "disabled";
+			};
+
+			/* port#4 - WAN AE/xfi, WAN-only, leave disabled [SDK port_wan@ae] */
+			port@4 {
+				reg = <4>;
+				phy-mode = "10gbase-r";	/* mac-type XPORT mac-index 1, xfi [SDK] */
+				phy-handle = <&wan_ae>;
+				status = "disabled";	/* WAN - out of scope */
+			};
+
+			/* port#5 = eth0 - XPORT mac-index 0 -> ext 10G BCM84891 @MDIO9 */
+			port@5 {
+				reg = <5>;
+				phy-mode = "usxgmii";	/* [INFER] stock "serdes"; 10G copper PHY */
+				phy-handle = <&phy_xphy>;
+				status = "disabled";	/* enabled+labelled in board dts */
+			};
+
+			/* port#6 = eth1 - XPORT mac-index 2 -> serdes0 10GBase-R (fixed) */
+			port@6 {
+				reg = <6>;
+				phy-mode = "10gbase-r";	/* [INFER] stock "serdes" + config-xfi 10GBase-R */
+				phy-handle = <&phy_serdes0>;
+				status = "disabled";	/* enabled in board dts (fixed-link) */
+			};
+
+			/* port#7 = eth3 - XPORT mac-index 4 -> serdes1 -> ext PHY @MDIO21 */
+			port@7 {
+				reg = <7>;
+				phy-mode = "usxgmii";	/* [INFER] stock "serdes"; cascade ext PHY */
+				phy-handle = <&phy_serdes1>;
+				status = "disabled";	/* enabled+labelled in board dts */
+			};
+
+			/*
+			 * CPU/IMP port. The stock RUNNER_SW model has no explicit DT
+			 * CPU-port node (the runner is the CPU endpoint). For a mainline
+			 * DSA model we need an IMP/CPU port with an ethernet= handle to a
+			 * MAC and a fixed-link. Port index and MAC binding are UNCONFIRMED.
+			 * TODO: confirm IMP port index + which MAC fronts the CPU port
+			 * (re-notes open-question #5). Using port@8 + UNIMAC as the
+			 * working assumption (cf. mainline bcm4908 port@8 IMP pattern).
+			 */
+			port@8 {
+				reg = <8>;		/* TODO: confirm IMP/CPU port index */
+				phy-mode = "internal";	/* TODO confirm */
+				ethernet = <&unimac>;	/* TODO confirm CPU-port MAC */
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+				};
+			};
+		};
+	};
+
+	/*
+	 * MDIO master. [FDT mdiosf2 / SDK mdiosf2] compatible "brcm,mdio-sf2",
+	 * reg 0x837ffd00 (cmd/data window, size 0x10) + 0xff85a024 (clk/strap, 4B).
+	 *
+	 * The 0x10 (4-register) command window + separate config reg is the classic
+	 * Broadcom UniMAC MDIO master shape -> mainline driver mdio-bcm-unimac
+	 * (drivers/net/mdio/mdio-bcm-unimac.c), compatible "brcm,unimac-mdio".
+	 * Confidence high that mainline can drive it at this base; the busy/start
+	 * bit layout should be verified before trusting it (re-notes #3). [INFER]
+	 *
+	 * All EGPHY/serdes/cascade PHYs enumerate on this one bus; their MDIO
+	 * addresses are the reg values below (PHY id <-> address table in re-notes).
+	 */
+	mdio: mdio@837ffd00 {
+		compatible = "brcm,unimac-mdio";	/* [INFER] stock = "brcm,mdio-sf2" */
+		reg = <0x0 0x837ffd00 0x0 0x10>;	/* [FDT] cmd/data window */
+		reg-names = "mdio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* TODO: second reg 0xff85a024 (4B, periph page) = MDIO clk/strap [FDT] */
+
+		/* Internal quad EGPHY (1G). reg = MDIO addr. [FDT][SDK] */
+		phy_gphy0: ethernet-phy@1 {	/* unused on GT-BE98 */
+			reg = <1>;
+			status = "disabled";
+		};
+
+		phy_gphy1: ethernet-phy@2 {	/* eth2 - first-light target */
+			reg = <2>;
+			status = "disabled";	/* board dts enables */
+		};
+
+		phy_gphy2: ethernet-phy@3 {	/* unused */
+			reg = <3>;
+			status = "disabled";
+		};
+
+		phy_gphy3: ethernet-phy@4 {	/* unused */
+			reg = <4>;
+			status = "disabled";
+		};
+
+		/* serdes0 pseudo-PHY (10GAE), core0/lane0. eth1 path. [FDT][SDK] */
+		phy_serdes0: ethernet-phy@7 {
+			reg = <7>;
+			/* brcm,serdes-core=0 brcm,serdes-lane=0 [SDK] */
+			status = "disabled";	/* board dts: phy-fixed 10GBase-R */
+		};
+
+		/* serdes1 pseudo-PHY (10GAE), core1/lane0. eth3 path. [FDT][SDK] */
+		phy_serdes1: ethernet-phy@8 {
+			reg = <8>;
+			/* brcm,serdes-core=1 brcm,serdes-lane=0 [SDK] */
+			status = "disabled";	/* board dts; cascades to phy_cascade1@21 */
+		};
+
+		/* external 10G copper PHY (BCM84891) on XPORT mac0. eth0. [FDT][SDK] */
+		phy_xphy: ethernet-phy@9 {
+			reg = <9>;
+			status = "disabled";	/* board dts enables; ext PHY needs compat */
+		};
+	};
+
+	/*
+	 * -------------------------------------------------------------------
+	 * MAC cores. All reg bases are [FDT]+[SDK] confirmed (identical in both).
+	 * No mainline binding exists for these exact cores; the stock compatibles
+	 * are kept. They have NO interrupts of their own - datapath IRQs belong to
+	 * the runner (see rdpa placeholder). [FDT]
+	 * -------------------------------------------------------------------
+	 */
+
+	/* UNIMAC 1G MAC cores (feed the internal EGPHY ports incl. eth2). */
+	unimac: ethernet@828a8000 {
+		compatible = "brcm,unimac3";	/* TODO: no mainline binding (re-notes verdict) */
+		reg = <0x0 0x828a8000 0x0 0x5000>,	/* [FDT][SDK] core */
+		      <0x0 0x828b0000 0x0 0x1400>;	/* [FDT][SDK] misc/MIB */
+		reg-names = "core", "misc";
+		/* [FDT] brcm,conf-offset=0x1000 mib-offset=0x400 top-offset=0x400 */
+		status = "disabled";
+	};
+
+	/* XLMAC 10G MAC core. [FDT][SDK] */
+	xlmac: ethernet@828b2000 {
+		compatible = "brcm,xlmac1";	/* TODO: no mainline binding */
+		reg = <0x0 0x828b2000 0x0 0x0680>,	/* [FDT][SDK] XLMAC base */
+		      <0x0 0x82890000 0x0 0x6b88>;	/* [FDT][SDK] BBH_TX / RDP region */
+		reg-names = "xlmac", "bbh-tx";
+		/* [FDT] xlmac_offset=0x200 bbh_tx_offset=0x2000 */
+		status = "disabled";
+	};
+
+	/* XPORT 10G/multigig MAC+PCS wrapper (eth0/eth1/eth3). [FDT][SDK] */
+	xport: ethernet@837f0000 {
+		compatible = "brcm,xport";	/* TODO: no mainline binding */
+		reg = <0x0 0x837f0000 0x0 0x8000>,	/* [FDT][SDK] XPORT base */
+		      <0x0 0x828b2000 0x0 0x1000>,	/* [FDT][SDK] XLIF (overlaps XLMAC) */
+		      <0x0 0x837ff1f8 0x0 0x0004>;	/* [FDT][SDK] XPORT0_CLK_CTRL */
+		reg-names = "xport", "xlif", "clk-ctrl";
+		status = "disabled";
+	};
+
+	/* 10G PCS for XPORT/serdes. [FDT mpcs / SDK] */
+	mpcs: pcs@828c4000 {
+		compatible = "brcm,mpcs";	/* TODO: no mainline binding */
+		reg = <0x0 0x828c4000 0x0 0x100>;	/* [FDT][SDK] */
+		status = "disabled";
+	};
+
+	/*
+	 * On-die multi-lane serdes control. [FDT serdes / SDK]
+	 * Lives in the ETH_PHYS window (0x83400000 + 0x3ff500 = 0x837ff500).
+	 */
+	serdes: serdes@837ff500 {
+		compatible = "brcm,serdes1";	/* TODO: no mainline binding */
+		reg = <0x0 0x837ff500 0x0 0x300>;	/* [FDT][SDK] */
+		status = "disabled";
+	};
+
+	/*
+	 * Top-level PHY/serdes mux + external xphy enable. [FDT ethphytop / SDK]
+	 *
+	 * IMPORTANT: this block's base is 0x837ff000, which is EXACTLY
+	 * SWITCH_REG_BASE (the switch register page above). In hardware the
+	 * eth-phy-top control lives inside the switch register window; the live FDT
+	 * exposed it as a separate node only because the stock model hid the SF2
+	 * core. We model it as a sibling here for readability, but it overlaps
+	 * switch0's reg. (dtc tolerates the shared address; a future driver should
+	 * decide whether eth-phy-top is a sub-function of the switch syscon.)
+	 * Addressed at +0x4 to avoid a duplicate-unit-address with switch0 while
+	 * keeping the real base in reg. [FDT][SDK]
+	 */
+	ethphytop: phy-mux@837ff004 {
+		compatible = "brcm,eth-phy-top";	/* TODO: no mainline binding */
+		reg = <0x0 0x837ff000 0x0 0x1000>;	/* [FDT][SDK] real base == SWITCH_REG_BASE */
+		/* [FDT] xphy0-addr=0x9 xphy0-enabled */
+		status = "disabled";
+	};
+
+	/* Internal quad-GPHY analog/power control. [FDT egphy / SDK] */
+	egphy: phy-ctrl@837ff00c {
+		compatible = "brcm,egphy";	/* TODO: no mainline binding */
+		reg = <0x0 0x837ff00c 0x0 0x20>;	/* [FDT][SDK] */
+		status = "disabled";
+	};
+
+	/* WAN serdes pseudo-PHY bus (PON/AE). WAN-only -> disabled. [FDT][SDK] */
+	wan_serdes_bus {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+
+		phy_wan_serdes: ethernet-phy@0 {	/* PON [FDT][SDK] */
+			reg = <0>;
+			status = "disabled";
+		};
+
+		wan_ae: ethernet-phy@1 {		/* AE [FDT][SDK] */
+			reg = <1>;
+			status = "disabled";
+		};
+	};
+
+	/*
+	 * ===================================================================
+	 * Runner / RDPA datapath - PLACEHOLDER ONLY (out of scope this pass).
+	 * ===================================================================
+	 * The whole runner register window + its datapath IRQs. There is NO
+	 * mainline driver that speaks "runner": the stock datapath is closed
+	 * firmware programmed via a GPL shim (re-notes PART B verdict). Modeled
+	 * here disabled, reg/IRQs noted for reference, so it can be filled in by a
+	 * future datapath effort.
+	 *
+	 * [FDT rdpa_drv]:
+	 *   reg = <0x0 0x82000000 0x0 0x00caf004>;
+	 *   interrupt-names = "fpm","queue0".."queue31";
+	 *   fpm    = GIC_SPI 0x6b (107), level-high
+	 *   queue0..31 = GIC_SPI 0x4b..0x6a (75..106), contiguous, level-high
+	 * TODO: full runner/RDPA datapath model (re-notes open-question #2).
+	 */
+	rdpa: runner@82000000 {
+		compatible = "brcm,rdpa";	/* TODO: no mainline driver (closed datapath) */
+		reg = <0x0 0x82000000 0x0 0x00caf004>;	/* [FDT][SDK] */
+		status = "disabled";
+	};
+};

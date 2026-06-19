@@ -1,0 +1,473 @@
+/*
+ * BCM4916 / GT-BE98 control-plane model for QEMU (Stage 2)
+ *
+ * Two QOM sysbus devices that, together, present enough of the BCM4916
+ * switch + MDIO control plane that MAINLINE Linux can probe the integrated
+ * Starfighter-2 switch via the bcm_sf2 / b53 DSA drivers and enumerate the
+ * internal PHYs via mdio-bcm-unimac + phylib.
+ *
+ *   TYPE_BCM4916_SF2   - the SF2 switch core (compatible "brcm,bcm4908-switch")
+ *   TYPE_BCM4916_MDIO  - the UNIMAC MDIO master (compatible "brcm,unimac-mdio")
+ *
+ * WHY model the BCM4908 SF2 layout rather than the raw 4916 FDT?
+ * -----------------------------------------------------------------
+ * The live GT-BE98 FDT exposes the switch only as a logical "RUNNER_SW" node
+ * with NO reg of its own (re-notes/bcm4916-regmap.md, open question #1): the
+ * SF2 core base is hidden behind the closed Runner stack. Mainline has no
+ * "runner" driver. The realistic mainline path is the bcm_sf2/b53 DSA driver,
+ * whose closest in-tree match is the "brcm,bcm4908-switch" binding (BCM4908 is
+ * the prior SF2-class BCA SoC and is register-compatible at the SF2 core).
+ * So we model the *mainline driver's* expected register interface, taken from:
+ *
+ *   - drivers/net/dsa/bcm_sf2.c        (probe flow, reg_readl/core_readl)
+ *   - drivers/net/dsa/bcm_sf2_regs.h   (REG_* offsets, CORE_* offsets)
+ *   - drivers/net/dsa/b53/b53_common.c (b53_switch_register/init, chip table)
+ *   - drivers/net/mdio/mdio-bcm-unimac.c (MDIO CMD/CFG layout)
+ *   - arch/arm64/boot/dts/broadcom/bcmbca/bcm4908.dtsi (reg / reg-names / ports)
+ *
+ * KEY PROBE FACTS (so we know exactly what must respond):
+ *   * bcm_sf2 sets pdata->chip_id = priv->type = BCM4908_DEVICE_ID from the
+ *     of_match data, then b53_switch_register() sees dev->pdata and SKIPS
+ *     b53_switch_detect() entirely. => There is NO MDIO/register chip-ID read
+ *     at probe; the chip ID comes from the DT compatible. (b53_common.c
+ *     b53_switch_register(): "if (dev->pdata) dev->chip_id = pdata->chip_id;
+ *     if (!dev->chip_id && b53_switch_detect(dev)) return -EINVAL;")
+ *   * bcm_sf2 DOES read, in the "reg" region:
+ *        REG_SWITCH_REVISION (4908 off 0x10)  -> top/core rev (cosmetic)
+ *        REG_PHY_REVISION    (4908 off 0x14)  -> gphy rev (cosmetic)
+ *   * bcm_sf2 reads, in the "core" region (page<<10 | reg<<2):
+ *        CORE_IMP0_PRT_ID (0x0804) -> num_ports = val + 1
+ *     plus many CORE_* config writes/read-backs during b53_switch_init().
+ *   * PHY enumeration happens on the SEPARATE mdio-bcm-unimac bus; bcm_sf2
+ *     registers that MDIO bus and phylib scans it. The fake PHYs here answer
+ *     PHYID1/2 (real Broadcom EGPHY id) + BMSR (link up, autoneg complete).
+ *
+ * Register-layout cross-check against the vendor GPL SF2 driver
+ * (~/re-sdk/.../bcmdrivers/opensource/net/enet/impl7/sf2.c): it drives the SF2
+ * via the same PAGE_CONTROL / REG_SWITCH_MODE page+reg model b53 uses
+ * (SF2SW_RREG(unit, PAGE_CONTROL, REG_SWITCH_MODE, ...)), and tracks an
+ * e->rev_id read from a revision register -- consistent with the model below.
+ *
+ * Integration: instantiated and MMIO-mapped by hw/arm/virt.c create_bcm4916()
+ * when the machine option `bcm4916=on` is set; virt.c also emits the matching
+ * FDT nodes into the auto-generated DTB, so a stock mainline kernel binds
+ * without an external -dtb. See qemu/README.md.
+ *
+ * Build: copied to hw/net/bcm4916_sf2.c on dev-build, added to
+ * hw/net/meson.build under CONFIG_BCM4916, CONFIG_BCM4916=y in arm config.
+ * Never build on dev-code.
+ */
+
+#include "qemu/osdep.h"
+#include "hw/sysbus.h"
+#include "qemu/log.h"
+#include "qom/object.h"
+#include "migration/vmstate.h"
+
+/* ------------------------------------------------------------------ */
+/* SF2 switch core                                                     */
+/* ------------------------------------------------------------------ */
+
+#define TYPE_BCM4916_SF2 "bcm4916-sf2"
+OBJECT_DECLARE_SIMPLE_TYPE(Bcm4916Sf2State, BCM4916_SF2)
+
+/*
+ * Six register regions, sizes/layout taken verbatim from mainline
+ * bcm4908.dtsi (the brcm,bcm4908-switch node). We back the whole switch
+ * with one contiguous MMIO window and decode within it; the DT splits it
+ * into 6 reg entries with matching reg-names, all relative to the same base:
+ *   core      off 0x00000  size 0x40000
+ *   reg       off 0x40000  size 0x00110
+ *   intrl2_0  off 0x40340  size 0x00030
+ *   intrl2_1  off 0x40380  size 0x00030
+ *   fcb       off 0x40600  size 0x00034
+ *   acb       off 0x40800  size 0x00208
+ */
+#define SF2_CORE_BASE   0x00000
+#define SF2_CORE_SIZE   0x40000
+#define SF2_REG_BASE    0x40000
+#define SF2_WINDOW_SIZE 0x41000   /* covers up to acb end (0x40800+0x208) */
+
+/* "reg" region offsets, from bcm_sf2_4908_reg_offsets[] in bcm_sf2.c.
+ * These are RELATIVE to SF2_REG_BASE. */
+#define REG4908_SWITCH_CNTRL     0x00
+#define REG4908_SWITCH_STATUS    0x04
+#define REG4908_DIR_DATA_WRITE   0x08
+#define REG4908_DIR_DATA_READ    0x0c
+#define REG4908_SWITCH_REVISION  0x10   /* <-- reg_readl(REG_SWITCH_REVISION) */
+#define REG4908_PHY_REVISION     0x14   /* <-- reg_readl(REG_PHY_REVISION)   */
+#define REG4908_SPHY_CNTRL       0x24
+#define REG4908_CROSSBAR         0xc8
+#define REG4908_RGMII_11_CNTRL   0x14c
+
+/* "core" page-register decoding: SF2_PAGE_REG_MKADDR(page,reg)=page<<10|reg<<2
+ * (bcm_sf2.c). The only core read whose value matters at probe is
+ * CORE_IMP0_PRT_ID @ 0x0804 (= page 2, reg 1). bcm_sf2 does
+ *   priv->hw_params.num_ports = CORE_IMP0_PRT_ID + 1 (then clamps to DSA_MAX);
+ * the real port set comes from the b53 BCM4908 chip table (enabled_ports=0x1bf,
+ * imp_port=8). We return the IMP/CPU port index 8, the natural value. */
+#define CORE_IMP0_PRT_ID         0x0804
+
+struct Bcm4916Sf2State {
+    SysBusDevice parent_obj;
+    MemoryRegion iomem;
+    /* sparse backing for the few stateful regs; everything else reads 0 */
+    uint32_t reg_switch_cntrl;
+    uint32_t reg_sphy_cntrl;
+    /* a small register file for the "reg" region so writes read back */
+    uint32_t regfile[0x110 / 4];
+};
+
+/*
+ * SF2 top/core revision. bcm_sf2 just logs this; b53 uses its own core_rev
+ * from the chip table. Use a plausible SF2 value: top 0x53 core rev 0x06.
+ * REG_SWITCH_REVISION layout (bcm_sf2_regs.h):
+ *   SF2_REV_MASK 0xffff (core rev in low 16), SWITCH_TOP_REV in bits >> 16.
+ */
+#define SF2_TOP_REV     0x0053
+#define SF2_CORE_REV    0x0006
+#define SF2_PHY_REV     0x0000
+
+static uint64_t sf2_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Bcm4916Sf2State *s = opaque;
+
+    if (addr < SF2_CORE_SIZE) {
+        /* CORE region (page<<10 | reg<<2) */
+        switch (addr) {
+        case CORE_IMP0_PRT_ID:
+            return 8;   /* IMP/CPU port index for BCM4908-class SF2 */
+        default:
+            /* Most b53_switch_init() reads are status/read-backs that are
+             * happy with 0. Return 0 to keep init progressing. */
+            return 0;
+        }
+    }
+
+    /* "reg" region (and beyond) */
+    hwaddr roff = addr - SF2_REG_BASE;
+    switch (roff) {
+    case REG4908_SWITCH_REVISION:
+        return ((uint32_t)SF2_TOP_REV << 16) | SF2_CORE_REV;
+    case REG4908_PHY_REVISION:
+        return SF2_PHY_REV;
+    case REG4908_SWITCH_CNTRL:
+        return s->reg_switch_cntrl;
+    case REG4908_SPHY_CNTRL:
+        return s->reg_sphy_cntrl;
+    default:
+        if (roff < sizeof(s->regfile)) {
+            return s->regfile[roff / 4];
+        }
+        qemu_log_mask(LOG_UNIMP,
+                      "bcm4916-sf2: unhandled read @0x%" HWADDR_PRIx "\n", addr);
+        return 0;
+    }
+}
+
+static void sf2_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    Bcm4916Sf2State *s = opaque;
+
+    if (addr < SF2_CORE_SIZE) {
+        /* CORE writes: accept silently (config), nothing to model yet. */
+        return;
+    }
+
+    hwaddr roff = addr - SF2_REG_BASE;
+    switch (roff) {
+    case REG4908_SWITCH_CNTRL:
+        s->reg_switch_cntrl = val;
+        break;
+    case REG4908_SPHY_CNTRL:
+        s->reg_sphy_cntrl = val;
+        break;
+    case REG4908_SWITCH_REVISION:
+    case REG4908_PHY_REVISION:
+        /* read-only */
+        break;
+    default:
+        if (roff < sizeof(s->regfile)) {
+            s->regfile[roff / 4] = val;
+        } else {
+            qemu_log_mask(LOG_UNIMP,
+                          "bcm4916-sf2: unhandled write @0x%" HWADDR_PRIx
+                          " = 0x%" PRIx64 "\n", addr, val);
+        }
+    }
+}
+
+static const MemoryRegionOps sf2_ops = {
+    .read = sf2_read,
+    .write = sf2_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+};
+
+static void bcm4916_sf2_reset(DeviceState *dev)
+{
+    Bcm4916Sf2State *s = BCM4916_SF2(dev);
+    s->reg_switch_cntrl = 0;
+    s->reg_sphy_cntrl = 0;
+    memset(s->regfile, 0, sizeof(s->regfile));
+}
+
+static void bcm4916_sf2_init(Object *obj)
+{
+    Bcm4916Sf2State *s = BCM4916_SF2(obj);
+    memory_region_init_io(&s->iomem, obj, &sf2_ops, s,
+                          TYPE_BCM4916_SF2, SF2_WINDOW_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+}
+
+static const VMStateDescription vmstate_bcm4916_sf2 = {
+    .name = TYPE_BCM4916_SF2,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(reg_switch_cntrl, Bcm4916Sf2State),
+        VMSTATE_UINT32(reg_sphy_cntrl, Bcm4916Sf2State),
+        VMSTATE_UINT32_ARRAY(regfile, Bcm4916Sf2State, 0x110 / 4),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static void bcm4916_sf2_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->desc = "BCM4916 Starfighter-2 switch core (bcm_sf2/b53)";
+    dc->vmsd = &vmstate_bcm4916_sf2;
+    device_class_set_legacy_reset(dc, bcm4916_sf2_reset);
+}
+
+/* ------------------------------------------------------------------ */
+/* UNIMAC MDIO master + fake PHYs                                      */
+/* ------------------------------------------------------------------ */
+
+#define TYPE_BCM4916_MDIO "bcm4916-mdio"
+OBJECT_DECLARE_SIMPLE_TYPE(Bcm4916MdioState, BCM4916_MDIO)
+
+/* mdio-bcm-unimac register block (drivers/net/mdio/mdio-bcm-unimac.c) */
+#define MDIO_CMD          0x00
+#define  MDIO_START_BUSY  (1u << 29)
+#define  MDIO_READ_FAIL   (1u << 28)
+#define  MDIO_RD          (2u << 26)
+#define  MDIO_WR          (1u << 26)
+#define  MDIO_PMD_SHIFT   21
+#define  MDIO_PMD_MASK    0x1f
+#define  MDIO_REG_SHIFT   16
+#define  MDIO_REG_MASK    0x1f
+#define  MDIO_DATA_MASK   0xffff
+#define MDIO_CFG          0x04
+
+#define MDIO_WINDOW_SIZE  0x8   /* matches bcm4908.dtsi mdio reg = <... 0x8> */
+
+#define MDIO_NUM_PHYS     32
+
+/* C22 register ids */
+#define MII_BMCR    0x00
+#define MII_BMSR    0x01
+#define MII_PHYID1  0x02
+#define MII_PHYID2  0x03
+
+/*
+ * PHY map for GT-BE98 (re-notes/bcm4916-regmap.md). We model the internal
+ * EGPHYs and the external PHYs at their real MDIO addresses with their real
+ * 32-bit PHY IDs (PHYID1<<16 | PHYID2):
+ *   addr 2  internal EGPHY (eth2, first-light target) id 0x359050e0
+ *   addr 9  external 10G BCM84891 (eth0)              id 0x359050e1
+ *   addr 21 external multigig PHY (eth3)              id 0x35905081
+ *   addr 1,3,4 the other internal EGPHYs (quad)       id 0x359050e0
+ * Any other address reads back 0xffff (no PHY) -> phylib treats as absent.
+ */
+typedef struct {
+    uint8_t addr;
+    uint32_t phy_id;   /* 22-bit OUI + model/rev, as read via PHYID1/2 */
+} Bcm4916PhyDesc;
+
+static const Bcm4916PhyDesc bcm4916_phys[] = {
+    { 1,  0x359050e0 },
+    { 2,  0x359050e0 },   /* eth2 first-light EGPHY */
+    { 3,  0x359050e0 },
+    { 4,  0x359050e0 },
+    { 9,  0x359050e1 },   /* eth0 external 10G */
+    { 21, 0x35905081 },   /* eth3 external multigig */
+};
+
+struct Bcm4916MdioState {
+    SysBusDevice parent_obj;
+    MemoryRegion iomem;
+    uint32_t cmd;
+    uint32_t cfg;
+    /* per-PHY C22 register file (only used regs are meaningful) */
+    uint16_t phy_regs[MDIO_NUM_PHYS][32];
+    bool phy_present[MDIO_NUM_PHYS];
+};
+
+static uint16_t mdio_phy_read(Bcm4916MdioState *s, int pa, int reg)
+{
+    if (pa >= MDIO_NUM_PHYS || !s->phy_present[pa]) {
+        return 0xffff;   /* no PHY here */
+    }
+    return s->phy_regs[pa][reg & 0x1f];
+}
+
+static void mdio_phy_write(Bcm4916MdioState *s, int pa, int reg, uint16_t val)
+{
+    if (pa >= MDIO_NUM_PHYS || !s->phy_present[pa]) {
+        return;
+    }
+    /* BMCR writes: keep BMSR link state coherent enough for genphy. */
+    s->phy_regs[pa][reg & 0x1f] = val;
+}
+
+static uint64_t mdio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Bcm4916MdioState *s = opaque;
+    switch (addr) {
+    case MDIO_CMD:
+        /* synchronous model: start/busy is always already clear on read */
+        return s->cmd & ~MDIO_START_BUSY;
+    case MDIO_CFG:
+        return s->cfg;
+    default:
+        return 0;
+    }
+}
+
+static void mdio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    Bcm4916MdioState *s = opaque;
+    switch (addr) {
+    case MDIO_CFG:
+        s->cfg = val;
+        break;
+    case MDIO_CMD: {
+        int pa  = (val >> MDIO_PMD_SHIFT) & MDIO_PMD_MASK;
+        int reg = (val >> MDIO_REG_SHIFT) & MDIO_REG_MASK;
+
+        /*
+         * unimac_mdio_start() reads CMD, ORs in START_BUSY, writes it back,
+         * then polls for START_BUSY to clear and reads the low 16 bits as
+         * data. So the *transaction* is the prior CMD write that set RD/WR;
+         * the start-busy write just kicks it. Handle both: if RD/WR bits are
+         * present, perform the access now and stash the result in cmd.
+         */
+        if (val & MDIO_RD) {
+            uint16_t data = mdio_phy_read(s, pa, reg);
+            s->cmd = (val & ~(MDIO_DATA_MASK | MDIO_START_BUSY)) | data;
+            if (!s->phy_present[pa]) {
+                s->cmd |= MDIO_READ_FAIL;
+            }
+        } else if (val & MDIO_WR) {
+            mdio_phy_write(s, pa, reg, val & MDIO_DATA_MASK);
+            s->cmd = val & ~MDIO_START_BUSY;
+        } else {
+            /* a bare start-busy kick after a previous RD/WR cmd: rerun it */
+            uint32_t prev = s->cmd;
+            int ppa  = (prev >> MDIO_PMD_SHIFT) & MDIO_PMD_MASK;
+            int preg = (prev >> MDIO_REG_SHIFT) & MDIO_REG_MASK;
+            if (prev & MDIO_RD) {
+                uint16_t data = mdio_phy_read(s, ppa, preg);
+                s->cmd = (prev & ~(MDIO_DATA_MASK | MDIO_START_BUSY)) | data;
+                if (!s->phy_present[ppa]) {
+                    s->cmd |= MDIO_READ_FAIL;
+                }
+            } else {
+                s->cmd = prev & ~MDIO_START_BUSY;
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps mdio_ops = {
+    .read = mdio_read,
+    .write = mdio_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
+static void mdio_init_phy(Bcm4916MdioState *s, uint8_t addr, uint32_t id)
+{
+    if (addr >= MDIO_NUM_PHYS) {
+        return;
+    }
+    s->phy_present[addr] = true;
+    s->phy_regs[addr][MII_PHYID1] = (id >> 16) & 0xffff;
+    s->phy_regs[addr][MII_PHYID2] = id & 0xffff;
+    /* BMSR: 0x796d = 100/10 caps + autoneg-complete (bit5) + link-up (bit2)
+     * + extended-status/autoneg-capable. Good enough for genphy to read
+     * "link up, autoneg done". */
+    s->phy_regs[addr][MII_BMSR]   = 0x796d;
+    /* BMCR: autoneg enabled */
+    s->phy_regs[addr][MII_BMCR]   = 0x1000;
+}
+
+static void bcm4916_mdio_reset(DeviceState *dev)
+{
+    Bcm4916MdioState *s = BCM4916_MDIO(dev);
+    int i;
+    s->cmd = 0;
+    s->cfg = 0;
+    memset(s->phy_regs, 0, sizeof(s->phy_regs));
+    memset(s->phy_present, 0, sizeof(s->phy_present));
+    for (i = 0; i < ARRAY_SIZE(bcm4916_phys); i++) {
+        mdio_init_phy(s, bcm4916_phys[i].addr, bcm4916_phys[i].phy_id);
+    }
+}
+
+static void bcm4916_mdio_realize_init(Object *obj)
+{
+    Bcm4916MdioState *s = BCM4916_MDIO(obj);
+    memory_region_init_io(&s->iomem, obj, &mdio_ops, s,
+                          TYPE_BCM4916_MDIO, MDIO_WINDOW_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+}
+
+static const VMStateDescription vmstate_bcm4916_mdio = {
+    .name = TYPE_BCM4916_MDIO,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(cmd, Bcm4916MdioState),
+        VMSTATE_UINT32(cfg, Bcm4916MdioState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static void bcm4916_mdio_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->desc = "BCM4916 UNIMAC MDIO master + fake PHYs";
+    dc->vmsd = &vmstate_bcm4916_mdio;
+    device_class_set_legacy_reset(dc, bcm4916_mdio_reset);
+}
+
+/* ------------------------------------------------------------------ */
+
+static const TypeInfo bcm4916_types[] = {
+    {
+        .name          = TYPE_BCM4916_SF2,
+        .parent        = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(Bcm4916Sf2State),
+        .instance_init = bcm4916_sf2_init,
+        .class_init    = bcm4916_sf2_class_init,
+    },
+    {
+        .name          = TYPE_BCM4916_MDIO,
+        .parent        = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(Bcm4916MdioState),
+        .instance_init = bcm4916_mdio_realize_init,
+        .class_init    = bcm4916_mdio_class_init,
+    },
+};
+
+DEFINE_TYPES(bcm4916_types)

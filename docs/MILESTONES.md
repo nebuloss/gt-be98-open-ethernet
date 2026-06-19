@@ -35,10 +35,13 @@ emulation, **[RE]** inferred from reverse-engineering, or **[REF]** from mainlin
   present → netboot viable; serial `ttyAMA0,115200` (UART header pinout undocumented → find on board);
   dual A/B slots, running slot2. **⚠ slot1 commit flag = 0 (UNCOMMITTED)** — no known-good fallback yet.
 
-## M2 — DTS + MAC bring-up (PRIME DIRECTIVE)
-- [ ] bcm4916.dtsi + gt-be98.dts
-- [ ] bcm4908_enet extended for BCM4916 MAC deltas
-- [ ] ONE port: link + ping  (QEMU first, then device with recovery armed + user go-ahead)
+## M2 — DTS + control-plane bring-up (in QEMU)  ⏳ in progress
+Scope refined by the XRDP finding: the datapath (Runner) is M5; M2 = the CONTROL plane
+(DTS + MDIO/PHY/switch management) proven under QEMU.
+- [ ] `dts/bcm4916.dtsi` + `dts/gt-be98.dts` (from FDT regmap + 4916 behnd SDK dts; pin SF2 core base)
+- [ ] QEMU SF2/MDIO device-model (chip-ID + MDIO + fake PHYs at real IDs) so b53/bcm_sf2 probe
+- [ ] mainline b53/bcm_sf2 + phylib bind a `brcm,bcm4916-switch` and read PHY/link state under QEMU
+- [ ] (datapath/ping deferred to the Runner work — needs M5)
 
 ## M3 — Switch (DSA)
 - [ ] b53/bcm_sf2 for the internal switch; LAN ports up + bridged

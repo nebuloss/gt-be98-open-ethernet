@@ -1,0 +1,178 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * gt-be98.dts - ASUS GT-BE98 (Broadcom BCM4916 / "bcm96813")
+ *
+ * Board-level device tree for the gt-be98-open-ethernet effort: enables the
+ * four wired Ethernet ports and their PHYs on top of bcm4916.dtsi.
+ *
+ * Topology (all [FDT]+[SDK] confirmed, see re-notes/bcm4916-regmap.md and the
+ * 4916 SDK GT-BE98.dts):
+ *   wan = eth0 : SF2 port#5, XPORT -> external 10G BCM84891 @ MDIO 9
+ *   lan = eth1 : SF2 port#6, XPORT -> serdes0, 10GBase-R fixed-link @ MDIO 7
+ *   lan = eth2 : SF2 port#1, UNIMAC gmii -> internal EGPHY @ MDIO 2 (1G)
+ *   lan = eth3 : SF2 port#7, XPORT -> serdes1 @ MDIO 8 -> ext PHY @ MDIO 21
+ *
+ * NOTE on the SDK GT-BE98.dts: it labels eth1's serdes0 device an "RTL8372"
+ * and eth3's cascade an "BCM84891L"; the topology (which serdes/MDIO addr maps
+ * to which logical port) matches the regmap exactly. We model eth1 as a fixed
+ * 10GBase-R link (no MDIO-addressable copper PHY) per config-xfi="10GBase-R".
+ *
+ * PUBLIC-SAFE: no real unit MAC, no internal hosts/IPs/paths.
+ */
+
+/dts-v1/;
+
+#include "bcm4916.dtsi"
+
+/ {
+	model = "ASUS GT-BE98";
+	compatible = "asus,gt-be98", "brcm,bcm4916", "brcm,bcm6813", "brcm,bcmbca";
+
+	aliases {
+		serial0 = &uart0;
+		ethernet0 = &unimac;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		/* console=ttyAMA0,115200 [SDK GT-BE98 bootargs] */
+	};
+
+	/*
+	 * GT-BE98 ships 2 GiB DDR4 [SDK GT-BE98.dts memcfg: BP_DDR_TOTAL_SIZE_2048MB].
+	 * Base 0x0; the bootloader passes the authoritative size/reservations.
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x0 0x0 0x80000000>;	/* 2 GiB [SDK]; TODO: confirm reserved regions */
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+/* ---- MDIO PHYs ------------------------------------------------------------ */
+
+&mdio {
+	status = "okay";
+};
+
+/* eth2: internal 1G EGPHY @ MDIO 2 (first-light target). [FDT][SDK] */
+&phy_gphy1 {
+	status = "okay";
+};
+
+/*
+ * eth0: external 10G copper PHY (BCM84891) @ MDIO 9 on XPORT mac0.
+ * BCM84891 binds mainline drivers/net/phy/bcm84881.c (compatible by PHY id,
+ * but add an explicit ethernet-phy-id for clarity). PHY id 0x359050e1 [recon].
+ * TODO: confirm bcm84881 driver drives the 84891 variant; the FDT also needs
+ * ethphytop xphy0-enabled to release this PHY from reset.
+ */
+&phy_xphy {
+	compatible = "ethernet-phy-id3590.50e1",	/* [recon] BCM84891 */
+		     "ethernet-phy-ieee802.3-c45";
+	status = "okay";
+};
+
+/*
+ * eth1: serdes0 10GBase-R, fixed link (no addressable copper PHY).
+ * Stock: phy-fixed + config-xfi="10GBase-R" [SDK GT-BE98 phy_serdes0].
+ */
+&phy_serdes0 {
+	/* phy-fixed; config-xfi "10GBase-R" [SDK] - modeled via port fixed-link */
+	status = "okay";
+};
+
+/*
+ * eth3: serdes1 @ MDIO 8 cascaded to an external multigig PHY @ MDIO 21.
+ * Add the cascade PHY node on the bus. PHY id 0x35905081 [recon].
+ */
+&mdio {
+	phy_cascade1: ethernet-phy@21 {
+		reg = <21>;
+		compatible = "ethernet-phy-id3590.5081",	/* [recon] ext multigig PHY */
+			     "ethernet-phy-ieee802.3-c45";
+		status = "okay";
+	};
+};
+
+&phy_serdes1 {
+	phy-handle = <&phy_cascade1>;	/* serdes1 -> cascade ext PHY @21 [FDT][SDK] */
+	status = "okay";
+};
+
+/* ---- Switch ports --------------------------------------------------------- */
+
+&switch0 {
+	status = "okay";
+};
+
+/* eth2 = port#1, internal GPHY, 1G. [FDT][SDK] */
+&switch0 {
+	ports {
+		port@1 {
+			label = "eth2";
+			status = "okay";
+		};
+
+		/* eth0 = port#5, external 10G copper (WAN). [FDT][SDK] */
+		port@5 {
+			label = "eth0";
+			status = "okay";
+		};
+
+		/*
+		 * eth1 = port#6, serdes0 10GBase-R fixed link. [FDT][SDK]
+		 * No addressable copper PHY -> use fixed-link instead of phy-handle.
+		 */
+		port@6 {
+			/delete-property/ phy-handle;
+			label = "eth1";
+			phy-mode = "10gbase-r";
+			status = "okay";
+			fixed-link {
+				speed = <10000>;
+				full-duplex;
+			};
+		};
+
+		/* eth3 = port#7, serdes1 -> cascade ext multigig PHY @21. [FDT][SDK] */
+		port@7 {
+			label = "eth3";
+			status = "okay";
+		};
+	};
+};
+
+/* ---- Top-level PHY mux / EGPHY power ------------------------------------- */
+
+/*
+ * Release the internal EGPHYs and the external xphy from reset.
+ * [SDK GT-BE98: &ethphytop { xphy0-enabled; status="okay"; }]
+ */
+&ethphytop {
+	/* xphy0-enabled [SDK] */
+	status = "okay";
+};
+
+&egphy {
+	status = "okay";
+};
+
+/* ---- MAC cores ------------------------------------------------------------ */
+
+&unimac {
+	/*
+	 * Device WAN MAC placeholder. The real per-unit MAC is provisioned by the
+	 * bootloader (board NVRAM/OTP); do NOT hardcode a real unit MAC.
+	 * 60:cf:84 is the ASUS OUI; the low 3 bytes are zeroed here on purpose.
+	 */
+	local-mac-address = [60 cf 84 00 00 00];	/* PLACEHOLDER - bootloader overrides */
+	status = "okay";
+};
+
+&xport {
+	status = "okay";
+};

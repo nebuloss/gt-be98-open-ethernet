@@ -1,0 +1,256 @@
+# BCM4916 / GT-BE98 control-plane wiring for QEMU 10.0.0 (Stage 2).
+# Apply inside the qemu-10.0.0 source tree on the build host:
+#   patch -p1 < bcm4916-qemu-virt.patch
+# Then copy device-model/bcm4916_sf2.c to hw/net/bcm4916_sf2.c and rebuild
+# (configure --target-list=aarch64-softmmu; ninja qemu-system-aarch64).
+# Run with the env var QEMU_BCM4916=1 to enable the device on -machine virt.
+
+--- a/hw/arm/virt.c	2025-04-22 20:26:10.000000000 +0000
++++ b/hw/arm/virt.c	2026-06-19 16:37:02.033027105 +0000
+@@ -2103,6 +2103,218 @@
+     }
+ }
+ 
++
++/*
++ * BCM4916 / GT-BE98 control-plane model (gt-be98-open-ethernet).
++ * Enabled when the environment variable QEMU_BCM4916 is set. Instantiates the
++ * SF2 switch core + UNIMAC MDIO master at fixed MMIO bases in the free window
++ * between VIRT_MMIO and VIRT_PLATFORM_BUS, and emits matching FDT nodes into
++ * the auto-generated device tree so a stock mainline kernel binds bcm_sf2/b53
++ * + mdio-bcm-unimac + phylib without an external -dtb.
++ *
++ * Reg layout mirrors mainline arch/arm64/.../bcmbca/bcm4908.dtsi.
++ */
++#define BCM4916_SF2_BASE   0x0a800000
++#define BCM4916_MDIO_BASE  0x0a900000
++
++static void create_bcm4916(VirtMachineState *vms)
++{
++    MachineState *ms = MACHINE(vms);
++    DeviceState *sf2, *mdio;
++    char *node, *mdio_node, *phy_node;
++    uint32_t mdio_ph, phy2_ph, phy9_ph, phy21_ph;
++    uint32_t gem_ph;
++    DeviceState *gem;
++    const char sf2_compat[] = "brcm,bcm4908-switch";
++    const char mdio_compat[] = "brcm,unimac-mdio";
++
++    if (!getenv("QEMU_BCM4916")) {
++        return;
++    }
++
++    /* --- SF2 switch core --- */
++    sf2 = qdev_new("bcm4916-sf2");
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(sf2), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(sf2), 0, BCM4916_SF2_BASE);
++
++    /* --- UNIMAC MDIO master --- */
++    mdio = qdev_new("bcm4916-mdio");
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(mdio), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(mdio), 0, BCM4916_MDIO_BASE);
++
++    /* --- FDT: MDIO bus + PHY children --- */
++    mdio_ph = qemu_fdt_alloc_phandle(ms->fdt);
++    phy2_ph = qemu_fdt_alloc_phandle(ms->fdt);
++    phy9_ph = qemu_fdt_alloc_phandle(ms->fdt);
++    phy21_ph = qemu_fdt_alloc_phandle(ms->fdt);
++
++    mdio_node = g_strdup_printf("/mdio@%x", BCM4916_MDIO_BASE);
++    qemu_fdt_add_subnode(ms->fdt, mdio_node);
++    qemu_fdt_setprop(ms->fdt, mdio_node, "compatible",
++                     mdio_compat, sizeof(mdio_compat));
++    qemu_fdt_setprop_sized_cells(ms->fdt, mdio_node, "reg",
++                                 2, BCM4916_MDIO_BASE, 2, 0x8);
++    qemu_fdt_setprop_string(ms->fdt, mdio_node, "reg-names", "mdio");
++    qemu_fdt_setprop_cell(ms->fdt, mdio_node, "#address-cells", 1);
++    qemu_fdt_setprop_cell(ms->fdt, mdio_node, "#size-cells", 0);
++    qemu_fdt_setprop_cell(ms->fdt, mdio_node, "phandle", mdio_ph);
++
++    phy_node = g_strdup_printf("%s/ethernet-phy@2", mdio_node);
++    qemu_fdt_add_subnode(ms->fdt, phy_node);
++    qemu_fdt_setprop_cell(ms->fdt, phy_node, "reg", 2);
++    qemu_fdt_setprop_cell(ms->fdt, phy_node, "phandle", phy2_ph);
++    g_free(phy_node);
++
++    phy_node = g_strdup_printf("%s/ethernet-phy@9", mdio_node);
++    qemu_fdt_add_subnode(ms->fdt, phy_node);
++    qemu_fdt_setprop_cell(ms->fdt, phy_node, "reg", 9);
++    qemu_fdt_setprop_cell(ms->fdt, phy_node, "phandle", phy9_ph);
++    g_free(phy_node);
++
++    phy_node = g_strdup_printf("%s/ethernet-phy@15", mdio_node); /* 21 = 0x15 */
++    qemu_fdt_add_subnode(ms->fdt, phy_node);
++    qemu_fdt_setprop_cell(ms->fdt, phy_node, "reg", 21);
++    qemu_fdt_setprop_cell(ms->fdt, phy_node, "phandle", phy21_ph);
++    g_free(phy_node);
++
++    /*
++     * DSA needs a CPU-port conduit: a real netdev referenced by the CPU port's
++     * "ethernet" phandle. virt has no built-in platform MAC, so instantiate a
++     * Cadence GEM (mainline "macb"/cdns,gem driver) as the conduit and wire the
++     * SF2 CPU port (port@8) to it. This lets dsa_register_switch() complete and
++     * phylib enumerate the switch PHYs on the unimac-mdio bus.
++     */
++#define BCM4916_GEM_BASE  0x0a700000
++#define BCM4916_GEM_IRQ   182
++    gem_ph = qemu_fdt_alloc_phandle(ms->fdt);
++    gem = qdev_new("cadence_gem");
++    qemu_configure_nic_device(gem, true, NULL);
++    object_property_set_int(OBJECT(gem), "revision", 0x10070109, &error_fatal);
++    object_property_set_int(OBJECT(gem), "phy-addr", 0, &error_fatal);
++    object_property_set_int(OBJECT(gem), "num-priority-queues", 1, &error_fatal);
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(gem), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(gem), 0, BCM4916_GEM_BASE);
++    sysbus_connect_irq(SYS_BUS_DEVICE(gem), 0,
++                       qdev_get_gpio_in(vms->gic, BCM4916_GEM_IRQ));
++    {
++        char *gnode = g_strdup_printf("/ethernet@%x", BCM4916_GEM_BASE);
++        const char gem_compat[] = "cdns,gem";
++        qemu_fdt_add_subnode(ms->fdt, gnode);
++        qemu_fdt_setprop(ms->fdt, gnode, "compatible",
++                         gem_compat, sizeof(gem_compat));
++        qemu_fdt_setprop_sized_cells(ms->fdt, gnode, "reg",
++                                     2, BCM4916_GEM_BASE, 2, 0x1000);
++        qemu_fdt_setprop_cell(ms->fdt, gnode, "interrupt-parent",
++                              vms->gic_phandle);
++        qemu_fdt_setprop_cells(ms->fdt, gnode, "interrupts",
++                               GIC_FDT_IRQ_TYPE_SPI, BCM4916_GEM_IRQ,
++                               GIC_FDT_IRQ_FLAGS_LEVEL_HI);
++        qemu_fdt_setprop_cells(ms->fdt, gnode, "clocks",
++                               vms->clock_phandle, vms->clock_phandle);
++        qemu_fdt_setprop(ms->fdt, gnode, "clock-names",
++                         "pclk\0hclk", sizeof("pclk\0hclk"));
++        qemu_fdt_setprop_string(ms->fdt, gnode, "phy-mode", "rgmii-id");
++        qemu_fdt_setprop_cell(ms->fdt, gnode, "phandle", gem_ph);
++        {
++            char *gfl = g_strdup_printf("%s/fixed-link", gnode);
++            qemu_fdt_add_subnode(ms->fdt, gfl);
++            qemu_fdt_setprop_cell(ms->fdt, gfl, "speed", 1000);
++            qemu_fdt_setprop(ms->fdt, gfl, "full-duplex", NULL, 0);
++            g_free(gfl);
++        }
++        g_free(gnode);
++    }
++
++    /* --- FDT: SF2 switch node with 6 reg regions + ports --- */
++    node = g_strdup_printf("/ethernet-switch@%x", BCM4916_SF2_BASE);
++    qemu_fdt_add_subnode(ms->fdt, node);
++    qemu_fdt_setprop(ms->fdt, node, "compatible",
++                     sf2_compat, sizeof(sf2_compat));
++    /* 6 reg tuples (addr/size) relative to the single MMIO window base */
++    {
++        uint64_t b = BCM4916_SF2_BASE;
++        qemu_fdt_setprop_sized_cells(ms->fdt, node, "reg",
++            2, b + 0x00000, 2, 0x40000,   /* core */
++            2, b + 0x40000, 2, 0x00110,   /* reg */
++            2, b + 0x40340, 2, 0x00030,   /* intrl2_0 */
++            2, b + 0x40380, 2, 0x00030,   /* intrl2_1 */
++            2, b + 0x40600, 2, 0x00034,   /* fcb */
++            2, b + 0x40800, 2, 0x00208);  /* acb */
++    }
++    qemu_fdt_setprop(ms->fdt, node, "reg-names",
++        "core\0reg\0intrl2_0\0intrl2_1\0fcb\0acb",
++        sizeof("core\0reg\0intrl2_0\0intrl2_1\0fcb\0acb"));
++    qemu_fdt_setprop_cell(ms->fdt, node, "brcm,num-gphy", 5);
++    qemu_fdt_setprop_cell(ms->fdt, node, "interrupt-parent", vms->gic_phandle);
++    qemu_fdt_setprop_cells(ms->fdt, node, "interrupts",
++                           GIC_FDT_IRQ_TYPE_SPI, 180, GIC_FDT_IRQ_FLAGS_LEVEL_HI,
++                           GIC_FDT_IRQ_TYPE_SPI, 181, GIC_FDT_IRQ_FLAGS_LEVEL_HI);
++    qemu_fdt_setprop_cells(ms->fdt, node, "dsa,member", 0, 0);
++
++    {
++        char *ports = g_strdup_printf("%s/ports", node);
++        char *port;
++        qemu_fdt_add_subnode(ms->fdt, ports);
++        qemu_fdt_setprop_cell(ms->fdt, ports, "#address-cells", 1);
++        qemu_fdt_setprop_cell(ms->fdt, ports, "#size-cells", 0);
++
++        /* port@1 -> eth2 internal EGPHY @ mdio addr 2 (first-light target) */
++        port = g_strdup_printf("%s/port@1", ports);
++        qemu_fdt_add_subnode(ms->fdt, port);
++        qemu_fdt_setprop_cell(ms->fdt, port, "reg", 1);
++        qemu_fdt_setprop_string(ms->fdt, port, "label", "eth2");
++        qemu_fdt_setprop_string(ms->fdt, port, "phy-mode", "gmii");
++        qemu_fdt_setprop_cell(ms->fdt, port, "phy-handle", phy2_ph);
++        g_free(port);
++
++        /* port@5 -> eth0 external 10G @ mdio addr 9 */
++        port = g_strdup_printf("%s/port@5", ports);
++        qemu_fdt_add_subnode(ms->fdt, port);
++        qemu_fdt_setprop_cell(ms->fdt, port, "reg", 5);
++        qemu_fdt_setprop_string(ms->fdt, port, "label", "eth0");
++        qemu_fdt_setprop_string(ms->fdt, port, "phy-mode", "gmii");
++        qemu_fdt_setprop_cell(ms->fdt, port, "phy-handle", phy9_ph);
++        g_free(port);
++
++        /* port@7 -> RGMII (satisfies bcm_sf2 BCM4908 crossbar_setup;
++         * avoids the "Invalid port mode" WARN). No PHY: fixed-link. */
++        port = g_strdup_printf("%s/port@7", ports);
++        qemu_fdt_add_subnode(ms->fdt, port);
++        qemu_fdt_setprop_cell(ms->fdt, port, "reg", 7);
++        qemu_fdt_setprop_string(ms->fdt, port, "phy-mode", "rgmii");
++        {
++            char *fl7 = g_strdup_printf("%s/fixed-link", port);
++            qemu_fdt_add_subnode(ms->fdt, fl7);
++            qemu_fdt_setprop_cell(ms->fdt, fl7, "speed", 1000);
++            qemu_fdt_setprop(ms->fdt, fl7, "full-duplex", NULL, 0);
++            g_free(fl7);
++        }
++        g_free(port);
++
++        /* port@8 -> CPU/IMP fixed-link (imp_port for BCM4908-class SF2) */
++        port = g_strdup_printf("%s/port@8", ports);
++        qemu_fdt_add_subnode(ms->fdt, port);
++        qemu_fdt_setprop_cell(ms->fdt, port, "reg", 8);
++        qemu_fdt_setprop_string(ms->fdt, port, "phy-mode", "internal");
++        qemu_fdt_setprop_cell(ms->fdt, port, "ethernet", gem_ph);
++        {
++            char *fl = g_strdup_printf("%s/fixed-link", port);
++            qemu_fdt_add_subnode(ms->fdt, fl);
++            qemu_fdt_setprop_cell(ms->fdt, fl, "speed", 1000);
++            qemu_fdt_setprop(ms->fdt, fl, "full-duplex", NULL, 0);
++            g_free(fl);
++        }
++        g_free(port);
++        g_free(ports);
++    }
++
++    info_report("bcm4916: SF2 switch @0x%x, UNIMAC MDIO @0x%x mapped + FDT emitted",
++                BCM4916_SF2_BASE, BCM4916_MDIO_BASE);
++
++    g_free(node);
++    g_free(mdio_node);
++}
++
+ static void machvirt_init(MachineState *machine)
+ {
+     VirtMachineState *vms = VIRT_MACHINE(machine);
+@@ -2438,6 +2650,8 @@
+ 
+     create_platform_bus(vms);
+ 
++    create_bcm4916(vms);
++
+     if (machine->nvdimms_state->is_enabled) {
+         const struct AcpiGenericAddress arm_virt_nvdimm_acpi_dsmio = {
+             .space_id = AML_AS_SYSTEM_MEMORY,
+--- a/hw/arm/Kconfig	2025-04-22 20:26:10.000000000 +0000
++++ b/hw/arm/Kconfig	2026-06-19 16:36:01.965063590 +0000
+@@ -12,6 +12,7 @@
+     imply TPM_TIS_I2C
+     imply NVDIMM
+     imply IOMMUFD
++    select CADENCE # bcm4916 conduit (cadence_gem)
+     select ARM_GIC
+     select ACPI
+     select ARM_SMMUV3
+--- a/hw/net/meson.build	2025-04-22 20:26:11.000000000 +0000
++++ b/hw/net/meson.build	2026-06-19 16:26:37.109185367 +0000
+@@ -72,3 +72,6 @@
+ system_ss.add(files('rocker/rocker-hmp-cmds.c'))
+ 
+ subdir('can')
++
++# BCM4916 / GT-BE98 control-plane model (gt-be98-open-ethernet)
++system_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('bcm4916_sf2.c'))
