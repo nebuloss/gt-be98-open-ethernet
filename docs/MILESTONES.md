@@ -67,7 +67,9 @@ GT-BE98 device tree end-to-end in emulation. Remaining wired work is the datapat
 "Full features: 10G with no CPU overload" → the Runner MUST do fast-path forward/NAT/QoS in HW.
 - [ ] Bring up the Runner: load microcode (⚠ 4916 microcode is PROPRIETARY/non-redistributable — see
       `re-notes/runner-microcode-and-cpuring.md`; user must extract from own rdpa.ko) + init FPM/SBPM/BBH
-- [ ] CPU host-ring slow-path (RX/TX rings, NAPI on SPI 75–107) — exception/control traffic
+- [~] CPU host-ring slow-path — **ABI recovered** (`re-notes/xrdp-datapath-abi.md`): XRDP regmap +
+      ring/FPM descriptors pinned (FPM + ring caller are GPL!). Ready to implement RX/TX + NAPI on SPI
+      75–107. Remaining RE: host CPU_RX_DESCRIPTOR word0/1/3, CPU-TX doorbell, data_path_init values.
 - [ ] Flow-acceleration control plane: flow learning → cmdlist actions → Runner tables (the hard part)
 - [ ] 10G line-rate forward/NAT offloaded, CPU idle — the deliverable
 - ★ CORRECTED: the 4916 Runner microcode is **PROPRIETARY/non-redistributable** (256KB inside rdpa.ko,
