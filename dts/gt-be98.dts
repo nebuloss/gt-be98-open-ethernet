@@ -103,6 +103,17 @@
 	status = "okay";
 };
 
+/* ---- Runner CPU conduit --------------------------------------------------- */
+
+/*
+ * Enable the XRDP Runner CPU-port conduit (the DSA master netdev that fronts
+ * switch0's CPU/IMP port). brcm,runner-emulated is inherited from the dtsi so
+ * this binds against the QEMU Runner model with no proprietary microcode.
+ */
+&runner {
+	status = "okay";
+};
+
 /* ---- Switch ports --------------------------------------------------------- */
 
 &switch0 {

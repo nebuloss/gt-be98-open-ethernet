@@ -316,7 +316,7 @@
 			port@8 {
 				reg = <8>;		/* TODO: confirm IMP/CPU port index */
 				phy-mode = "internal";	/* TODO confirm */
-				ethernet = <&unimac>;	/* TODO confirm CPU-port MAC */
+				ethernet = <&runner>;	/* CPU port conduit = Runner netdev */
 				fixed-link {
 					speed = <1000>;
 					full-duplex;
@@ -506,9 +506,33 @@
 	 *   queue0..31 = GIC_SPI 0x4b..0x6a (75..106), contiguous, level-high
 	 * TODO: full runner/RDPA datapath model (re-notes open-question #2).
 	 */
-	rdpa: runner@82000000 {
-		compatible = "brcm,rdpa";	/* TODO: no mainline driver (closed datapath) */
-		reg = <0x0 0x82000000 0x0 0x00caf004>;	/* [FDT][SDK] */
-		status = "disabled";
+	runner: runner@82000000 {
+		/*
+		 * Open XRDP "Runner" CPU-port conduit (slow-path datapath).
+		 * Bound by driver/runner/bcm4916_runner.c. This netdev is the
+		 * DSA conduit (master) for switch0's CPU/IMP port - it replaces
+		 * the Cadence GEM stand-in used in the earlier control-plane
+		 * QEMU harness with the real Runner CPU-ring datapath.
+		 *
+		 * reg = the whole rdpa window (the driver derives FPM/RNR/BBH/...
+		 * block bases by offset, ABI sec 1.1). [FDT][SDK]
+		 *
+		 * Datapath IRQs (ABI bring-up step 11) [FDT]:
+		 *   queue0..31 = GIC_SPI 75..106, fpm = GIC_SPI 107, level-high.
+		 * Only queue0 is wired for the dumb-pipe v1 slow path; more can be
+		 * added as RX queues are split out.
+		 *
+		 * brcm,runner-emulated: present => skip the proprietary Runner
+		 * microcode load (QEMU Runner model path). Remove on real HW once a
+		 * licensed microcode image is available. (Equivalent module param:
+		 * runner_emulated=1.)
+		 */
+		compatible = "brcm,bcm4916-runner";
+		reg = <0x0 0x82000000 0x0 0x00caf004>;	/* [FDT][SDK] rdpa window */
+		interrupt-names = "queue0", "fpm";
+		interrupts = <GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH>,	/* queue0 [FDT] */
+			     <GIC_SPI 107 IRQ_TYPE_LEVEL_HIGH>;	/* fpm    [FDT] */
+		brcm,runner-emulated;	/* QEMU Runner model: no proprietary microcode */
+		status = "disabled";	/* board dts enables; pairs with switch0 CPU port */
 	};
 };
