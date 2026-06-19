@@ -72,7 +72,12 @@ GT-BE98 device tree end-to-end in emulation. Remaining wired work is the datapat
       moves MAC↔CPU both directions, packet-proven** (tcpdump). ABI fully recovered
       (`re-notes/xrdp-datapath-abi.md`). Gaps: DSA user-port needs ≥2KB FPM chunk (512B caps MTU);
       IRQ-name quirk; PSRAM/RNR-MEM offsets still shared placeholders (pin from device).
-- [ ] Flow-acceleration control plane: flow learning → cmdlist actions → Runner tables (the hard part)
+- [~] Flow-acceleration control plane — **ABI RE'd** (`re-notes/xrdp-offload-abi.md`): NAT-C table +
+      context entry + XPE cmdlist opcodes + flow-program path pinned from the unstripped 6813 cmdlist
+      objects. Open design = mainline nf_flow_table → action translator → clean-room cmdlist builder →
+      NAT-C writer (mtk_ppe analogy). Phase1 (L2+VLAN) concrete; Phase2 (NAT 10G) spec'd, very-hard.
+      Remaining: exact 6813 context offsets + NAT-C hash polynomial + operand bit-packing (read-only
+      device NAT-C dump resolves).
 - [ ] 10G line-rate forward/NAT offloaded, CPU idle — the deliverable
 - ★ CORRECTED: the 4916 Runner microcode is **PROPRIETARY/non-redistributable** (256KB inside rdpa.ko,
   license=Proprietary, taint P; absent from the 4916 GPL SDK). The Runner is mandatory (no HW bypass),
