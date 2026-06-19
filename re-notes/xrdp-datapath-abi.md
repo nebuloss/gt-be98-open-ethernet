@@ -380,6 +380,158 @@ and programs the egress BBH/MAC DMA. GPL helper to model: `rdpa_cpu_send_sysb_fp
 
 ---
 
+## 5bis. Slow-path gaps RESOLVED (second RE pass — all `[KO]` from rdpa.ko aarch64)
+
+This pass closes the three gaps flagged in sec 6. Method: rdpa.ko is **ELF64 aarch64, not
+stripped**. The on-box objdump is x86-only (can't disasm aarch64), so disasm is via r2 on the RE
+container using `io.va=false` + paddr (file offset = `.text` file-off `0x80` + symbol value), and
+relocs read from `r2 ir` (ADD_32/ADD_64 page+lo12 relocs annotate every adrp/add → symbol). `[KO]`
+
+### G1. Host `CPU_RX_DESCRIPTOR` = `PROCESSING_RX_DESCRIPTOR`, 16 B / 4 words, big-endian — RESOLVED `[KO][SDK]`
+
+There is **no separate host CPU_RX_DESCRIPTOR dumper** in 4916 rdpa.ko; the host RX data-ring
+entry **is** the `PROCESSING_RX_DESCRIPTOR`. Confirmed two ways:
+- **GPL `[SDK]`**: `enet/impl7/enet_ring.c` `#include <rdp_cpu_ring_defs.h>`, uses
+  `CPU_RX_DESCRIPTOR`, ownership poll `swap4bytes(p->word2) & 0x80000000` (bit31 of word2 =
+  MSB post-swap), and parses via `rdpa_cpu_rx_pd_get(p_desc, info)` into `rdpa_cpu_rx_info_t`
+  (`{void*data; u16 data_offset; u16 size; reason/dest_ssid; wl_metadata; csum_verified; ...}`).
+- **`[KO]`**: `cpu_ring_shell_print_pd` (rdpa.ko `.text` 0x96d50) reads the live ring entry with
+  `ldp x9,x10,[x0]; rev32 x9; rev32 x10` -> **16 bytes, byte-swapped per 32-bit word** (big-endian
+  in DDR, ARM host LE -> swap each word). 4 words = 16 B.
+
+**Exact bitfields** decoded from the auto-generated printer `dump_RDD_PROCESSING_RX_DESCRIPTOR`
+(rdpa.ko `.text` 0x84a90), which loads each field straight from `[descriptor + byte_off]`
+big-endian then `rev16`/`rev32` + `ubfx`/`and`. Field-name strings at `.rodata` 0x1a95b8+. The
+**byte offset is authoritative** (the `ldr/ldrh/ldrb [x21+off]`); bit positions are within the
+host-order (post-rev) value:
+
+| # | field | load (byte off) | width/bits (post-rev) | meaning for slow path |
+|---|---|---|---|---|
+| 1 | `pd_info` | `ldr  +0` rev32 | full 32 | word0 raw (composite; see #2-#8 overlay) |
+| 2 | `serial_num` | `ldrh +4` rev16 | bits[6:15] w10 | (PON serial; ignore on Eth) |
+| 3 | `ploam` | `ldrb +5` | bit5 | PLOAM (PON; ignore) |
+| 4 | `ingress_cong` | `ldrb +5` | bit4 | ingress congestion flag |
+| 5 | `abs_or_dsl` | `ldrb +5` | bit3 | **buffer mode: 1=ABS (DDR addr) / 0=FPM token** |
+| 6 | `l3_packet` | `ldrb +5` | bit2 | L3 packet |
+| 7 | `error_type_or_cpu_tx` | `ldr  +4` rev32 | bits[14:17] w4 | error type / cpu-tx code |
+| 8 | **`packet_length`** | `ldrh +6` rev16 | `&0x3fff` bits[0:13] w14 | **RX payload length** |
+| 9 | `error` | `ldrb +8` | bit7 | error flag |
+| 10 | `target_mem_1` | `ldrb +8` | bit6 | target-mem hi bit |
+| 11 | `cong_state` | `ldrb +8` | bits[4:5] w2 | congestion state |
+| 12 | `is_emac` | `ldrb +8` | bit3 | EMAC(UNIMAC) vs XPORT ingress |
+| 13 | **`ingress_vport_or_flow`** | `ldrh +8` rev16 | bits[3:10] w8 | **source vport/flow -> netdev** |
+| 14 | `bn1_last_or_abs1` | `ldr  +8` rev32 | `&0x7ffff` bits[0:18] w19 | **2nd buffer-number / abs1** (multi-buf) |
+| 15 | `agg_pd` | `ldrb +0xc` | bit7 | aggregated-PD flag |
+| 16 | `target_mem_0` | `ldrb +0xc` | bit6 | target-mem lo bit |
+| 17 | **`payload_offset_sop`** | `ldr  +0xc` rev32 | `&0x3fffffff` bits[0:29] w30 | **SOP / payload offset + buffer ptr/token** |
+
+Notes for the open driver poll loop:
+- **ownership** = bit31 of **word2** (bytes 8-11) **post-swap** (GPL-confirmed; this is the
+  `error/target_mem_1/cong_state/is_emac` byte at +8 in big-endian — i.e. the MSB of the swapped
+  word2). Poll `swap4(word2) & 0x80000000`; host re-arms by setting it (`rdpa_cpu_ring_rest_desc`).
+- **buffer pointer / FPM token** lives in **word3** (bytes 12-15) overlaid with
+  `payload_offset_sop` (`abs_or_dsl`/`bn1_last_or_abs1` select ABS-DDR-addr vs FPM-token mode),
+  read via the GPL inline `rdpa_cpu_ring_get_data_ptr(p_desc)` (in `rdp_cpu_ring_inline.h`).
+- **reason** is not a descriptor bitfield in this layout — it's implicit in *which queue* the
+  packet landed (the reason->queue trap table, sec 3.5) and surfaced via `rdpa_cpu_rx_pd_get`
+  into `info->reason`. So a slow-path RX needs only: `packet_length` (#8), `ingress_vport_or_flow`
+  (#13 -> netdev), `payload_offset_sop` (#17), and the word3 buffer ptr/token + ownership bit.
+
+Endianness reminder: descriptor is **big-endian in DDR**; ARM host must `swap4bytes` each 32-bit
+word before applying the bit positions above (the table positions are post-swap / host-order).
+
+### G2. CPU-TX "doorbell" = SRAM index write, NOT an MMIO register — RESOLVED `[KO]`
+
+Decoded from `rdpa_cpu_send_pbuf` (rdpa.ko `.text` 0x6140) -> the FPM/token TX-ring send body
+(0x6508-0x6594). There is **no MMIO doorbell write** on CPU-TX. The sequence is:
+
+1. `madd ring = ring_id*0x88 + base` — the per-ring TX descriptor struct (**stride 0x88 bytes**).
+2. `ldr x8,[ring+0x78]` = ptr to the **local write-index**; `ldr x0,[ring+0x18]` = ring data base
+   (Runner SRAM); `ldrh w7,[x8]` = current write_idx.
+3. `ubfiz x9 = w7<<4` (**entry stride 16 B**); `add slot = base + idx*16`.
+4. `ldp x9,x10,[desc]; rev32 x9; rev32 x10; stp x9,x10,[slot]` — **write the 16-byte big-endian
+   `RING_CPU_TX_DESCRIPTOR` (sec 2.2) into the ring slot** (byte-swapped to BE).
+5. `add w7,w7,1; and w7,w7,mask (ring depth-1); strh w7,[x8]` — advance local write_idx.
+6. **`dmb oshst`** (0x6548) — ordering barrier before publishing the index.
+7. **Publish loop** (0x6564-0x6590): for each of up to 8 Runner cores, write the new write_idx as
+   a **big-endian u16** (`rev16 w7`) to `rdp_runner_core_addr[core] +
+   RDD_CPU_TX_RING_INDICES_VALUES_TABLE` offset (a `0xffffff` sentinel in the per-core address
+   array marks "core not serving this ring" -> skipped). i.e. the host bumps the
+   `CPU_TX_RING_INDICES_VALUES_TABLE` shadow in **each serving core's SRAM**; the Runner CPU-TX
+   thread **polls** that index. **The index write IS the doorbell.**
+
+So both directions are SRAM/DDR-poll based, no per-packet MMIO kick. (The DQM `0x82c80034`
++ `DQM_DQMOL_PUSHTOKEN_REG` is only used by `bcm_dqm_cli_test`, a CLI tool, and by the QM/forwarding
+fast path — **not** by the host CPU-TX-ring send.) `[KO]` *Correction to sec 6 INFERRED item.*
+The earlier-noted `rnr_regs_cfg_cpu_wakeup` / `dsptchr_wakeup_control_wkup_req` registers are
+RNR-thread-wakeup/dispatcher controls used during init and by flush tasks — **not** the per-packet
+TX path. (Unverified: whether a slower fallback/MCORE send variant uses an explicit wakeup; the
+main `rdpa_cpu_send_pbuf` path does not.)
+
+### G3. `data_path_init` ordered init sequence — RESOLVED (concrete order + UBUS values) `[KO]`
+
+Decoded the ordered `ag_drv_*`/`drv_*` calls of `_data_path_init` (rdpa.ko `.text` 0x931d0,
+exported wrapper `data_path_init` @ 0x94d40) via its ADD_32 call relocs in address order. The
+**concrete ordered write sequence** (an implementer can replay top-to-bottom):
+
+1. `drv_hash_init` — flow-hash engine (fast path; skip for dumb-pipe v1).
+2. **UBUS_SLV address-decode windows** — the Runner's view of the SoC. Concrete values `[KO]`
+   (decoded from `mov w0,#imm` immediates, as unsigned 32-bit):
+   - `ubus_slv_device_0_start = 0x82A00000`, `device_0_end = 0x82C00000` (FPM window)
+   - `device_1_start = 0x82C00000`, `device_1_end = 0x82C80000` (QM window)
+   - `device_2_start = 0x82C80000`, `device_2_end = 0x82D00000` (DQM window)
+   - `vpb_start = 0x82700000`, `vpb_end = 0x82900000` (RNR_MEM/per-core SRAM)
+   - `apb_start = 0x82900000`, `apb_end = 0x82A00000` (SBPM/DMA/BBH window)
+   - `ubus_mstr_hyst_ctrl = 2` for masters 0,1,2.
+3. `bdmf_alloc` xN + `memcpy` of a `0x90`-stride port-profile table indexed by `[arg+0xe4]`;
+   `lookup_bbh_tx_bufsz_by_fpm_bufsz`, `mpm_ebuf_info_get` (buffer-size derivation).
+4. `ag_drv_qm_global_cfg_aggregation_ctrl_get` (read QM agg state).
+5. `ag_drv_bbh_tx_common_configurations_general_cfg_set` (BBH-TX common cfg).
+6. `drv_cnpl_data_path_init` (counter/policer block).
+7. `drv_rnr_cores_addr_init` -> `rnr_regs_cfg_gen_cfg_set` (per-core base/general cfg),
+   `get_dynamic_code_start/end_address`, `rnr_regs_cfg_fit_fail_cfg_set`.
+8. `drv_mpm_init` + `mpm_runner_xon_xoff_thld_set` (MPM packet-memory + flow-control thresholds).
+9. `drv_xpm_common_update_pool_size`, `update_rdp_fpm_resources`,
+   `ag_drv_fpm_fpm_bb_misc_get/_set` (**FPM pool sizing / bus-bridge misc**).
+10. `drv_qm_update_queue_tables` (QM queue tables).
+11. **`drv_rnr_load_microcode` + `drv_rnr_load_prediction`** (load the 8x32 KB inst + 8x1 KB pred;
+    both loaders just `_xrdp__memset` then block-copy into RNR_INST/RNR_PRED windows — sec 1.1
+    step 7). *(Proprietary microcode = sec 0 blocker.)*
+12. `drv_rnr_set_sch_cfg` + `rnr_regs_cfg_sch_cfg_set` (Runner scheduler cfg).
+13. `data_path_runner_common_init`, `drv_rnr_quad_profiling_quad_init`,
+    `rnr_quad_general_config_dma_arb_cfg_get` (quad/common Runner cfg).
+14. **SBPM init**: `ag_drv_sbpm_regs_init_free_list_set` + `drv_sbpm_runner_sp_set`
+    (free-list seed + Runner source-port map).
+15. **`bbh_rx_init`** (@0x94e50) -> `bbh_rx_cfg` — per-port BBH RX. The full BBH-RX accessor surface
+    actually written `[KO]`: `general_configuration_enable_set`, `flow_ctrl_timer_set`,
+    `flow_ctrl_rnr_en_set`, `sdma_config_set`, `sdma_bb_id_set`, `pkt_size0..3_set`,
+    `pattern_en_set`/`pattern_recog_set`, `min/max_pkt_sel_flows_0_15`/`16_31_set`,
+    `pkt_sel_group_0/1_set`, `general_configuration_clk_gate_cntrl_set`, `crcomitdis_set`,
+    `ploam_en_set`, `user_priority3_en_set`. (Per-port ordered *values* still need per-call disasm
+    — accessor set + order pinned; exact register values are the one remaining deep-RE item.)
+16. **DMA/SDMA engines** (the 3 BBH<->DDR DMAs): `ag_drv_dma_config_target_mem_set`,
+    `num_of_reads_set`, `u_thresh_set`, `pri_set`, `weight_set`, `periph_source_set`,
+    `ubus_dpids_set`, later `num_of_writes_set`, `max_otf_set`, `ubus_credits_set`,
+    `psram_base_set`.
+17. `data_path_natc_init` (NAT-C; fast path — skip for dumb-pipe v1).
+18. **MAC/port datapath glue**: `unimac_misc_..._ext_cfg1_set`, `unimac_rdp_frm_length_set`,
+    `bbh_tx_lan_configurations_txthresh_set`; **10G XLMAC**: `xlif0/1_tx_if_urun_port_enable_set`,
+    `tx_if_tx_threshold_set`, `rx_if_if_dis_set`, `tx_if_if_enable_set`.
+19. `rdd_buffer_congestion_mgt_init` (buffer-congestion mgmt RDD tables).
+20. `rnr_quad_ext_flowctrl_config_token_val_set`, `rnr_quad_general_config_dma_arb_cfg_set`
+    (DMA arbitration / flow-control tokens).
+21. **Dispatcher reorder**: `ag_drv_dsptchr_reorder_cfg_dsptchr_reordr_cfg_get/_set`.
+22. **Enable**: `ag_drv_qm_enable_ctrl_set`, `ag_drv_ubus_mstr_en_set`, `ag_drv_tcam_op_set`.
+23. **SBPM thresholds**: `drv_sbpm_thr_ug0_get/_set`, `drv_sbpm_thr_ug1_get/_set`.
+24. **QM aggregation enable**: `qm_global_cfg_aggregation_ctrl_set` + `..._ctrl2_set`.
+
+(NB: the reason->CPU-queue trap table, sec 3.5, is programmed separately by `cpu_reason_cfg_rdd_ex`
+/ `cpu_rxq_cfg_*`, not inside `data_path_init`; CPU rings/feed/recycle are set up by the
+`rdpa_cpu` rxq attribute handlers — `rdpa_cpu_rxq_feed_and_recycle_data_init` @0x9eb0,
+`..._int_init` @0x9fc0.) `[KO]`
+
+---
+
 ## 6. STATUS: pinned vs inferred vs UNKNOWN
 
 **PINNED from binary `[KO]`:** all block bases/strides (sec 1.1); register-descriptor struct +
@@ -393,23 +545,29 @@ math + pool sizes (sec 3.1); RX ownership-bit poll model + endian swap + re-arm 
 caller API (`runner_get_pkt_from_ring`, `create_ring`, `rdpa_cpu_ring_rest_desc`,
 `rdpa_cpu_ring_not_empty`).
 
-**INFERRED:** UBUS/address-decode + dispatcher exact init order (step 2/5); "trap-everything"
-reason-table contents (step 10); TX DQM doorbell exact register (the DQM base is pinned at
-`0x82c80034`, the doorbell field within it is not yet decoded).
+**INFERRED:** "trap-everything" reason-table contents (step 10); per-port BBH-RX *register values*
+(the accessor set + call order are now pinned, sec 5bis G3 step 15; only the immediates are not
+individually disassembled); dispatcher credit/VIQ *values* per port/queue.
 
-**STILL UNKNOWN / needs deeper RE:**
-1. **Host `CPU_RX_DESCRIPTOR` exact word0/1/3 bitfields on 4916** — `rdp_cpu_ring_defs.h` is
-   absent from the 4916 GPL SDK; only the ownership bit + buffer ptr are GPL-confirmed (sec 2.4).
-   Decode the rest from `rdpa_cpu_rx_pd_get` in `rdpa.ko` (or map onto `PROCESSING_RX_DESCRIPTOR`
-   sec 2.3). *Resolves: exact RX field offsets for the poll loop.*
-2. **CPU-TX doorbell register** within DQM (`0x82c80034`) — decode `ag_drv_dqm_*` /
-   `_rdp_cpu_tx_ring_indices_alloc`.
-3. **Per-port BBH RX/TX full init sequence** — many `*_REG` offsets are decodable (the `+0x08`
-   field) but the ordered write sequence + values come from `xrdp_drv_bbh_rx_ag.c` /
-   `data_path_init.c` in rdpa.ko (disasm the init functions).
-4. **Dispatcher credit/VIQ values** per port/queue.
-5. **Microcode load sequence details** (CNTXT/MEM seeding, core enable order) — disasm
-   `drv_rnr_load_microcode`.
+**RESOLVED in the 2nd pass (sec 5bis), formerly UNKNOWN:**
+- ~~Host `CPU_RX_DESCRIPTOR` word0/1/3 bitfields~~ -> **G1**: full 17-field, byte-precise, 16 B /
+  4-word big-endian layout from `dump_RDD_PROCESSING_RX_DESCRIPTOR` + `cpu_ring_shell_print_pd`.
+- ~~CPU-TX doorbell register~~ -> **G2**: there is **no MMIO doorbell**; CPU-TX kick = bumping the
+  `CPU_TX_RING_INDICES_VALUES_TABLE` write_idx (big-endian u16) in each serving Runner core's SRAM
+  after a `dmb oshst` (from `rdpa_cpu_send_pbuf` @0x6140). The DQM `0x82c80034` is fast-path/CLI only.
+- ~~`data_path_init` ordered init values~~ -> **G3**: full 24-step ordered `ag_drv_*`/`drv_*` call
+  sequence + concrete UBUS_SLV decode-window addresses; microcode loaders = memset+block-copy.
+
+**STILL UNKNOWN / needs deeper RE or live observation:**
+1. **Per-port BBH RX/TX exact register VALUES** — accessor set + call order pinned (G3 step 15/16);
+   the individual immediates (per-port `sdma_config`, `pkt_size`, `flow_ctrl_timer`,
+   `min/max_pkt_sel_flows`, BBH-TX `q2rnr`/`rnrcfg`) need per-`bl` disasm or live FDT/regdump read.
+2. **Dispatcher credit/VIQ values** per port/queue (the reorder cfg is pinned; the credit table
+   immediates are not).
+3. **Microcode load fine detail** (CNTXT/MEM seeding values, exact core-enable order) — the loaders
+   are memset+blockcopy (G3 step 11) but the post-load core-enable handshake is not disassembled.
+4. **Live confirmation** of the RX ownership re-arm + feed/recycle interplay under traffic — pure
+   binary RE pins the layout; a read-only on-device regdump/ftrace would validate timing/IRQ wiring.
 
 **Offload entry points seen in passing (NOT this pass — for the offload-ABI follow-up):**
 NAT-C engine @ `0x82950000` (`NATC_TBL`/`NATC_KEY`/`NATC_DDR_CFG`), HASH @ `0x82920000`,
