@@ -35,13 +35,19 @@ emulation, **[RE]** inferred from reverse-engineering, or **[REF]** from mainlin
   present → netboot viable; serial `ttyAMA0,115200` (UART header pinout undocumented → find on board);
   dual A/B slots, running slot2. **⚠ slot1 commit flag = 0 (UNCOMMITTED)** — no known-good fallback yet.
 
-## M2 — DTS + control-plane bring-up (in QEMU)  ⏳ in progress
+## M2 — DTS + control-plane bring-up (in QEMU)  ✅ mostly done
 Scope refined by the XRDP finding: the datapath (Runner) is M5; M2 = the CONTROL plane
 (DTS + MDIO/PHY/switch management) proven under QEMU.
-- [ ] `dts/bcm4916.dtsi` + `dts/gt-be98.dts` (from FDT regmap + 4916 behnd SDK dts; pin SF2 core base)
-- [ ] QEMU SF2/MDIO device-model (chip-ID + MDIO + fake PHYs at real IDs) so b53/bcm_sf2 probe
-- [ ] mainline b53/bcm_sf2 + phylib bind a `brcm,bcm4916-switch` and read PHY/link state under QEMU
-- [ ] (datapath/ping deferred to the Runner work — needs M5)
+- [x] `dts/bcm4916.dtsi` + `dts/gt-be98.dts` — compiles clean (dtc, 5911B); SF2 core base
+      pinned 0x837ff000 (SDK 6813_map_part.h)
+- [x] QEMU SF2/MDIO device-model (`qemu/device-model/bcm4916_sf2.c` + virt.c patch) — chip-ID +
+      UNIMAC-MDIO state machine + fake PHYs returning the real Broadcom IDs
+- [x] **mainline b53/bcm_sf2 + phylib complete a full DSA bring-up under QEMU**, reading the real
+      PHY IDs (0x359050e0/e1, 0x35905081) via the modeled MDIO — verified boot log (qemu/README)
+- [ ] Reconcile: repo DTS uses placeholder `brcm,bcm4916-switch`; QEMU test used mainline
+      `brcm,bcm4908-switch`. Next: driver patches (b53 BCM4916_DEVICE_ID + bcm_sf2 of_data/of_match)
+      so our actual DTS binds, + a real BROADCOM_PHY table match for the 4916 PHY IDs.
+- [ ] (real datapath/ping deferred to the Runner work — needs M5; QEMU conduit is a stand-in GEM)
 
 ## M3 — Switch (DSA)
 - [ ] b53/bcm_sf2 for the internal switch; LAN ports up + bridged
