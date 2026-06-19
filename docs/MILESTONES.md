@@ -11,13 +11,13 @@ emulation, **[RE]** inferred from reverse-engineering, or **[REF]** from mainlin
 - Builds only on dev-build via `rtk`. Never build on dev-code.
 - Never `git add -A`; never commit secrets/firmware blobs.
 
-## M1 — Recon + recovery  ⏳ in progress
+## M1 — Recon + recovery  ✅ done
 - [x] Read-only RE of live device: topology mapped → `re-notes/device-recon.md`
 - [x] Gather RE inputs: 18 stock `.ko`s + live FDT tar staged to the RE container `/opt/re-bins` (bootloader=mtd1, located not dumped)
 - [x] Mainline-source survey (v7.1) → `docs/mainline-survey.md` (reuse map + prime-directive change list)
 - [x] Recovery path designed (internal notes, not published) — NOT exercised; needs user/physical action
-- [ ] **Extract BCM4916 reg/IRQ/topology from live FDT + bcm_enet.ko** (RE) — unblocks the DTS  ⏳ NEXT
-- [ ] Mainline aarch64 cross-toolchain + bcmbca defconfig on dev-build
+- [x] Extract BCM4916 reg/IRQ/topology from live FDT + bcm_enet.ko → `re-notes/bcm4916-regmap.md` (+ XRDP pivot)
+- [x] Mainline aarch64 cross-toolchain (gcc 14.2) + mainline v7.1 build on dev-build
 
 ### M1 key findings
 - **Datapath:** `bcm_enet` v7.0 presents eth0..eth3 off an **on-SoC SF2 switch** w/ embedded quad-GPHY +
@@ -56,18 +56,25 @@ GT-BE98 device tree end-to-end in emulation. Remaining wired work is the datapat
 ## M3 — Switch (DSA)
 - [ ] b53/bcm_sf2 for the internal switch; LAN ports up + bridged
 
-## M4 — Multi-gig / 10G PHY
-- [ ] BCM84891 10G PHY driver; 10G + 2.5G ports
+## M4 — Multi-gig / 10G PHY  ⏳ control-plane done
+- [x] 10G PHY driver for eth0 (`driver/mainline-patches/0004`): ID 0x359050e1 = BCM4916 integrated
+      **XPHY** ("XPHY4916_X"), not standalone BCM84891. Binds under QEMU as "Broadcom BCM4916 10G XPHY"
+      (reads VEND1 0x400d per GPL SDK). eth3's real BCM84891L (0x35905081) already in bcm84881.c.
+- [ ] Live 10G link not provable in QEMU (modeled MAC is 1G-class; real 10G needs the Runner/crossbar)
+- [ ] 2.5G ports / serdes config (later)
 
 ## M5 — Runner/RDPA HW offload  ★ NOW THE GOAL (user re-scope 2026-06-19)
 "Full features: 10G with no CPU overload" → the Runner MUST do fast-path forward/NAT/QoS in HW.
-- [ ] Bring up the Runner: load GPL microcode (`request_firmware`), init FPM/SBPM/BBH pools
+- [ ] Bring up the Runner: load microcode (⚠ 4916 microcode is PROPRIETARY/non-redistributable — see
+      `re-notes/runner-microcode-and-cpuring.md`; user must extract from own rdpa.ko) + init FPM/SBPM/BBH
 - [ ] CPU host-ring slow-path (RX/TX rings, NAPI on SPI 75–107) — exception/control traffic
 - [ ] Flow-acceleration control plane: flow learning → cmdlist actions → Runner tables (the hard part)
 - [ ] 10G line-rate forward/NAT offloaded, CPU idle — the deliverable
-- Note: Runner firmware is GPLv2-redistributable (so still "fully open"); but the offload control
-  plane (rdpa core / cmdlist) is stock-taint **(P) proprietary** → feasibility of an open
-  reconstruction is the key open question (under study). Likely the multi-person-year core.
+- ★ CORRECTED: the 4916 Runner microcode is **PROPRIETARY/non-redistributable** (256KB inside rdpa.ko,
+  license=Proprietary, taint P; absent from the 4916 GPL SDK). The Runner is mandatory (no HW bypass),
+  so a fully-open AND shippable datapath is impossible today — realistic = open driver + user extracts
+  microcode from their OWN rdpa.ko, or drive the closed Runner via mainline netfilter flowtable. The
+  offload control plane (rdpa core / cmdlist) is also proprietary → clean-room = the multi-person-year core.
 
 ### Re-scope note
 The Runner is now central, NOT out-of-scope. All M1–M4 foundation work still applies — it's the

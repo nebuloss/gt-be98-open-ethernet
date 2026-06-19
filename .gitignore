@@ -44,3 +44,6 @@ secrets*
 *.swp
 *~
 .DS_Store
+
+# Local harness config (not published)
+.claude/
