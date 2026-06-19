@@ -6,7 +6,9 @@
  * Starfighter-2 switch via the bcm_sf2 / b53 DSA drivers and enumerate the
  * internal PHYs via mdio-bcm-unimac + phylib.
  *
- *   TYPE_BCM4916_SF2   - the SF2 switch core (compatible "brcm,bcm4908-switch")
+ *   TYPE_BCM4916_SF2   - the SF2 switch core (compatible "brcm,bcm4916-switch",
+ *                        bound by the bcm_sf2 BCM4916 of_match added in
+ *                        driver/mainline-patches/)
  *   TYPE_BCM4916_MDIO  - the UNIMAC MDIO master (compatible "brcm,unimac-mdio")
  *
  * WHY model the BCM4908 SF2 layout rather than the raw 4916 FDT?

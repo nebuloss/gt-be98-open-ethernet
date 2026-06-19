@@ -1,0 +1,66 @@
+From 4614cfbc52737a937012adf93bcdc063374480af Mon Sep 17 00:00:00 2001
+From: be98 <be98@local>
+Date: Fri, 19 Jun 2026 16:50:45 +0000
+Subject: [PATCH] net: phy: broadcom: add BCM4916 internal EGPHY (0x359050e0)
+
+Add an EXACT-match entry for the Broadcom BCM4916 internal 1G EGPHY
+(PHY ID 0x359050e0, ASUS GT-BE98 eth2). An exact match is required
+because the model field (0x359050e) is shared with the external 10G PHY
+0x359050e1, so a model-mask entry would wrongly claim the 10G PHY too.
+The EGPHY is a standard Broadcom GPHY and reuses bcm54xx_config_init.
+---
+ drivers/net/phy/broadcom.c | 18 ++++++++++++++++++
+ include/linux/brcmphy.h    |  1 +
+ 2 files changed, 19 insertions(+)
+
+diff --git a/drivers/net/phy/broadcom.c b/drivers/net/phy/broadcom.c
+index d1a4edb34..a02c38813 100644
+--- a/drivers/net/phy/broadcom.c
++++ b/drivers/net/phy/broadcom.c
+@@ -1465,6 +1465,23 @@ static int bcm54xx_disable_autonomous_eee(struct phy_device *phydev)
+ 
+ static struct phy_driver broadcom_drivers[] = {
+ {
++	/*
++	 * BCM4916 (ASUS GT-BE98) internal 1G EGPHY. EXACT match: the model
++	 * field (0x359050e) is shared with the external 10G PHY 0x359050e1,
++	 * so a model-mask entry would wrongly claim the 10G PHY too.
++	 */
++	PHY_ID_MATCH_EXACT(PHY_ID_BCM4916_EGPHY),
++	.name		= "Broadcom BCM4916 EGPHY",
++	/* PHY_GBIT_FEATURES */
++	.get_sset_count	= bcm_phy_get_sset_count,
++	.get_strings	= bcm_phy_get_strings,
++	.get_stats	= bcm54xx_get_stats,
++	.probe		= bcm54xx_phy_probe,
++	.config_init	= bcm54xx_config_init,
++	.config_intr	= bcm_phy_config_intr,
++	.handle_interrupt = bcm_phy_handle_interrupt,
++	.link_change_notify	= bcm54xx_link_change_notify,
++}, {
+ 	PHY_ID_MATCH_MODEL(PHY_ID_BCM5411),
+ 	.name		= "Broadcom BCM5411",
+ 	/* PHY_GBIT_FEATURES */
+@@ -1754,6 +1771,7 @@ static struct phy_driver broadcom_drivers[] = {
+ module_phy_driver(broadcom_drivers);
+ 
+ static const struct mdio_device_id __maybe_unused broadcom_tbl[] = {
++	{ PHY_ID_MATCH_EXACT(PHY_ID_BCM4916_EGPHY) },
+ 	{ PHY_ID_MATCH_MODEL(PHY_ID_BCM5411) },
+ 	{ PHY_ID_MATCH_MODEL(PHY_ID_BCM5421) },
+ 	{ PHY_ID_MATCH_MODEL(PHY_ID_BCM54210E) },
+diff --git a/include/linux/brcmphy.h b/include/linux/brcmphy.h
+index 174687c4c..c6cd6e5c1 100644
+--- a/include/linux/brcmphy.h
++++ b/include/linux/brcmphy.h
+@@ -54,6 +54,7 @@
+ #define PHY_ID_BCM7439_2		0xae025080
+ #define PHY_ID_BCM7445			0x600d8510
+ #define PHY_ID_BCM7712			0x35905330
++#define PHY_ID_BCM4916_EGPHY		0x359050e0
+ 
+ #define PHY_ID_BCM_CYGNUS		0xae025200
+ #define PHY_ID_BCM_OMEGA		0xae025100
+-- 
+2.47.3
+

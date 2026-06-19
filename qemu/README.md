@@ -31,24 +31,33 @@ Interactive (no timeout): `~/.../qemu/scripts/run-virt-baseline.sh` then
 
 ---
 
-## Stage 2 STATUS: DONE — full DSA probe + PHY enumeration under QEMU
+## Stage 2 STATUS: DONE — DSA probe binds as **BCM4916** + EGPHY driver match
 
 A custom `qemu-system-aarch64` (built from `~/qemu-src/qemu-10.0.0` on dev-build)
-now models the BCM4916 SF2 switch + UNIMAC MDIO control plane well enough that a
-**stock mainline kernel fully probes the switch via `bcm_sf2`/`b53` and phylib
-enumerates the PHYs** — no external `-dtb`, no driver patches.
+models the BCM4916 SF2 switch + UNIMAC MDIO control plane well enough that a
+mainline kernel **fully probes the switch via `bcm_sf2`/`b53` and phylib
+enumerates the PHYs** — no external `-dtb`.
 
-Verified boot log (mainline v7.1, `QEMU_BCM4916=1`):
+As of the `driver/mainline-patches/` work the harness now emits OUR
+`brcm,bcm4916-switch` compatible and the kernel binds it **as BCM4916** (was
+BCM4908). The internal 1G EGPHY also matches a real Broadcom PHY driver. This
+requires the three mainline patches in `driver/mainline-patches/` applied to the
+kernel; an unpatched stock kernel would not bind `brcm,bcm4916-switch`.
+
+Verified boot log (patched mainline v7.1/7.2-era, `QEMU_BCM4916=1`):
 ```
 unimac-mdio a900000.mdio: Broadcom UniMAC MDIO bus
-brcm-sf2 a800000.ethernet-switch: found switch: BCM4908, rev 0
+brcm-sf2 a800000.ethernet-switch: found switch: BCM4916, rev 0
 macb a700000.ethernet eth1: Cadence GEM ... (DSA CPU-port conduit)
 brcm-sf2 ...: Link is Up - 1Gbps/Full
-brcm-sf2 ... eth2: PHY [a900000.mdio--1:02] driver [Generic PHY]
+brcm-sf2 ... eth2: PHY [a900000.mdio--1:02] driver [Broadcom BCM4916 EGPHY]
 brcm-sf2 ... eth0: PHY [a900000.mdio--1:09] driver [Generic PHY]
 DSA: tree 0 setup
 brcm-sf2 ...: Starfighter 2 top: 0.53, core: 0.06, IRQs: 19, 20
 ```
+(`found switch: BCM4916` and `driver [Broadcom BCM4916 EGPHY]` are the new
+results vs the earlier stock-kernel boot, which showed `BCM4908` and
+`Generic PHY`.)
 sysfs confirms phylib read the REAL Broadcom PHY IDs through the modelled MDIO:
 ```
 a900000.mdio--1:02 phy_id=0x359050e0   # eth2 internal EGPHY
@@ -59,6 +68,7 @@ a900000.mdio--1:15 phy_id=0x35905081   # eth3 ext multigig (addr 21)
 ### Run command (on dev-build)
 ```bash
 # kernel needs DSA/B53/SF2/UNIMAC-MDIO/MACB built-in (see "kernel config" below)
+# AND the driver/mainline-patches/ applied (so brcm,bcm4916-switch binds).
 QEMU_BCM4916=1 ~/qemu-src/qemu-10.0.0/build/qemu-system-aarch64 \
   -machine virt -cpu cortex-a53 -smp 4 -m 1024 \
   -kernel ~/mainline/arch/arm64/boot/Image \
@@ -72,13 +82,14 @@ default, so plain `virt` is undisturbed). Note: this custom build has the slirp
 using it, or rebuild QEMU with `--enable-slirp`.
 
 ### What is modelled (device source: `device-model/bcm4916_sf2.c`)
-- **SF2 switch core** (`TYPE_BCM4916_SF2`, DT `brcm,bcm4908-switch`): the 6
-  reg regions (core/reg/intrl2_0/intrl2_1/fcb/acb) per mainline `bcm4908.dtsi`.
-  Backs `REG_SWITCH_REVISION`/`REG_PHY_REVISION` and `CORE_IMP0_PRT_ID`; all
-  other CORE page-register accesses read 0 / accept writes (enough for
-  `b53_switch_init`). The chip ID is NOT register-read — `bcm_sf2` hardcodes it
-  from the DT compatible (`pdata->chip_id = BCM4908_DEVICE_ID`), so `b53` skips
-  `b53_switch_detect`.
+- **SF2 switch core** (`TYPE_BCM4916_SF2`, DT `brcm,bcm4916-switch`): the 6
+  reg regions (core/reg/intrl2_0/intrl2_1/fcb/acb) per mainline `bcm4908.dtsi`
+  (the 4916 SF2 core is register-compatible with 4908). Backs
+  `REG_SWITCH_REVISION`/`REG_PHY_REVISION` and `CORE_IMP0_PRT_ID`; all other CORE
+  page-register accesses read 0 / accept writes (enough for `b53_switch_init`).
+  The chip ID is NOT register-read — `bcm_sf2` hardcodes it from the DT
+  compatible (`pdata->chip_id = BCM4916_DEVICE_ID` via the of_match added in
+  `driver/mainline-patches/`), so `b53` skips `b53_switch_detect`.
 - **UNIMAC MDIO master** (`TYPE_BCM4916_MDIO`, DT `brcm,unimac-mdio`): the
   CMD/CFG register block + C22 state machine + a fake-PHY register file that
   returns the real Broadcom PHY IDs (addr 2/9/21) and BMSR link-up.
@@ -94,9 +105,11 @@ using it, or rebuild QEMU with `--enable-slirp`.
 `m` while `HSR=m`).
 
 ### Honest gaps / TODO
-- PHYs attach as **Generic PHY** (phylib read a valid ID but no BROADCOM_PHY
-  table entry matched these exact IDs in this kernel) — enumeration succeeds,
-  which is the Stage-2 goal; specific-driver bind is not required for probe.
+- The internal 1G EGPHY (`0x359050e0`, eth2) now binds the **Broadcom BCM4916
+  EGPHY** driver (patch 0003). The external 10G PHY (`0x359050e1`, BCM84891,
+  eth0) still attaches as **Generic PHY** — supporting it is a non-trivial C45
+  PHY effort, deliberately deferred (see `driver/mainline-patches/README.md`).
+  Enumeration succeeds either way, which is the Stage-2 goal.
 - No real datapath: the CPU conduit is a stand-in Cadence GEM, not the real
   UNIMAC/XPORT/Runner. No frames traverse the switch (that is Stage 3+).
 - The SF2 core base on the real 4916 is still unknown (FDT hides it behind
@@ -201,7 +214,7 @@ SoC = 4× Cortex-A53 (matches `-cpu cortex-a53 -smp 4`).
 - `scripts/build-initramfs.sh` — build the busybox aarch64 initramfs (dev-build).
 - `scripts/run-virt-baseline.sh` — Stage 0 baseline boot + pass/fail check.
 - `device-model/bcm4916_sf2.c` — Stage 2 device model: SF2 switch core
-  (`brcm,bcm4908-switch`) + UNIMAC MDIO master (`brcm,unimac-mdio`) with fake
+  (`brcm,bcm4916-switch`) + UNIMAC MDIO master (`brcm,unimac-mdio`) with fake
   PHYs. **Built + working** (probes under the custom QEMU; see Stage 2 STATUS).
 - `device-model/bcm4916-qemu-virt.patch` — the `hw/arm/virt.c` +
   `hw/arm/Kconfig` + `hw/net/meson.build` changes that wire the device into the

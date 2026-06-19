@@ -1,0 +1,63 @@
+From f408fdba439bbe6e7a04b9083e7ea3a0725f2ae0 Mon Sep 17 00:00:00 2001
+From: be98 <be98@local>
+Date: Fri, 19 Jun 2026 16:50:45 +0000
+Subject: [PATCH] net: dsa: b53: add BCM4916 chip support
+
+Add a BCM4916_DEVICE_ID (0x4916) and a chip-info row for the Broadcom
+BCM4916 SoC (e.g. ASUS GT-BE98). The integrated Starfighter-2 switch is
+the same SF2-class layout as the BCM4908 (5 internal GPHY ports + 10G
+crossbar port 7 + IMP port 8), so the chip row is cloned from BCM4908.
+
+The chip ID is supplied by bcm_sf2 from the DT compatible
+(brcm,bcm4916-switch); b53 therefore skips MDIO chip detection.
+---
+ drivers/net/dsa/b53/b53_common.c | 20 ++++++++++++++++++++
+ drivers/net/dsa/b53/b53_priv.h   |  1 +
+ 2 files changed, 21 insertions(+)
+
+diff --git a/drivers/net/dsa/b53/b53_common.c b/drivers/net/dsa/b53/b53_common.c
+index 3f5b95927..5833c4a86 100644
+--- a/drivers/net/dsa/b53/b53_common.c
++++ b/drivers/net/dsa/b53/b53_common.c
+@@ -3044,6 +3044,26 @@ static const struct b53_chip_data b53_switch_chips[] = {
+ 		.jumbo_size_reg = B53_JUMBO_MAX_SIZE,
+ 		.arl_ops = &b53_arl_ops_95,
+ 	},
++	{
++		/*
++		 * BCM4916 (e.g. ASUS GT-BE98): same SF2-class integrated
++		 * switch layout as BCM4908 (5 internal GPHY ports + 10G
++		 * crossbar port 7 + IMP port 8). Cloned from the BCM4908
++		 * row; revisit if a register delta is found.
++		 */
++		.chip_id = BCM4916_DEVICE_ID,
++		.dev_name = "BCM4916",
++		.vlans = 4096,
++		.enabled_ports = 0x1bf,
++		.arl_bins = 4,
++		.arl_buckets = 256,
++		.imp_port = 8,
++		.vta_regs = B53_VTA_REGS,
++		.duplex_reg = B53_DUPLEX_STAT_GE,
++		.jumbo_pm_reg = B53_JUMBO_PORT_MASK,
++		.jumbo_size_reg = B53_JUMBO_MAX_SIZE,
++		.arl_ops = &b53_arl_ops_95,
++	},
+ 	{
+ 		.chip_id = BCM7445_DEVICE_ID,
+ 		.dev_name = "BCM7445",
+diff --git a/drivers/net/dsa/b53/b53_priv.h b/drivers/net/dsa/b53/b53_priv.h
+index cd27a7344..e0d7f1e2a 100644
+--- a/drivers/net/dsa/b53/b53_priv.h
++++ b/drivers/net/dsa/b53/b53_priv.h
+@@ -73,6 +73,7 @@ struct b53_arl_ops {
+ 
+ enum {
+ 	BCM4908_DEVICE_ID = 0x4908,
++	BCM4916_DEVICE_ID = 0x4916,
+ 	BCM5325_DEVICE_ID = 0x25,
+ 	BCM5365_DEVICE_ID = 0x65,
+ 	BCM5389_DEVICE_ID = 0x89,
+-- 
+2.47.3
+

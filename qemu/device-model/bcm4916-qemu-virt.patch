@@ -33,7 +33,7 @@
 +    uint32_t mdio_ph, phy2_ph, phy9_ph, phy21_ph;
 +    uint32_t gem_ph;
 +    DeviceState *gem;
-+    const char sf2_compat[] = "brcm,bcm4908-switch";
++    const char sf2_compat[] = "brcm,bcm4916-switch";
 +    const char mdio_compat[] = "brcm,unimac-mdio";
 +
 +    if (!getenv("QEMU_BCM4916")) {
