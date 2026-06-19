@@ -11,6 +11,13 @@ Module.symvers
 *.dtb
 *.dtbo
 
+# QEMU artifacts — staged on dev-build (~/qemu-be98), never committed here
+*.cpio
+*.cpio.gz
+Image
+boot.log
+qemu/**/build/
+
 # RE binaries / firmware dumps — staged on CT 310 (/opt/re-bins), not in git
 re-bins/
 *.bin
