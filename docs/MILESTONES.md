@@ -44,10 +44,14 @@ Scope refined by the XRDP finding: the datapath (Runner) is M5; M2 = the CONTROL
       UNIMAC-MDIO state machine + fake PHYs returning the real Broadcom IDs
 - [x] **mainline b53/bcm_sf2 + phylib complete a full DSA bring-up under QEMU**, reading the real
       PHY IDs (0x359050e0/e1, 0x35905081) via the modeled MDIO — verified boot log (qemu/README)
-- [ ] Reconcile: repo DTS uses placeholder `brcm,bcm4916-switch`; QEMU test used mainline
-      `brcm,bcm4908-switch`. Next: driver patches (b53 BCM4916_DEVICE_ID + bcm_sf2 of_data/of_match)
-      so our actual DTS binds, + a real BROADCOM_PHY table match for the 4916 PHY IDs.
+- [x] Driver patches (`driver/mainline-patches/`): b53 `BCM4916_DEVICE_ID` + bcm_sf2
+      `brcm,bcm4916-switch` of_match + broadcom.c EGPHY 0x359050e0 → **our DTS binds as BCM4916**
+      under QEMU (`found switch: BCM4916`; eth2 PHY driver = "Broadcom BCM4916 EGPHY"). Verified.
+- [ ] eth0 10G PHY (BCM84891, 0x359050e1) — real driver non-trivial, deferred (currently Generic PHY)
 - [ ] (real datapath/ping deferred to the Runner work — needs M5; QEMU conduit is a stand-in GEM)
+
+**M2 control plane: DONE under QEMU.** The open switch/MDIO/PHY management stack binds the real
+GT-BE98 device tree end-to-end in emulation. Remaining wired work is the datapath (the Runner) = M5.
 
 ## M3 — Switch (DSA)
 - [ ] b53/bcm_sf2 for the internal switch; LAN ports up + bridged
