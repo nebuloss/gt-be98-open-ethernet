@@ -1,0 +1,33 @@
+# Build artifacts — builds happen on dev-build, never committed here
+*.o
+*.ko
+*.ko.cmd
+*.mod
+*.mod.c
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+*.dtb
+*.dtbo
+
+# RE binaries / firmware dumps — staged on CT 310 (/opt/re-bins), not in git
+re-bins/
+*.bin
+*.elf
+*.img
+!qemu/**/*.elf.note   # allow small annotated notes if any
+
+# Secrets / local
+*.local
+*-psk*
+*.key
+*.pem
+secrets*
+
+# Editor / OS
+.serena/
+.vscode/
+*.swp
+*~
+.DS_Store
