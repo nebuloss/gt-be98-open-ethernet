@@ -1,40 +1,56 @@
-# BCM4916 / GT-BE98 control-plane wiring for QEMU 10.0.0 (Stage 2).
+# BCM4916 / GT-BE98 control-plane + datapath wiring for QEMU 10.0.0.
 # Apply inside the qemu-10.0.0 source tree on the build host:
 #   patch -p1 < bcm4916-qemu-virt.patch
-# Then copy device-model/bcm4916_sf2.c to hw/net/bcm4916_sf2.c and rebuild
-# (configure --target-list=aarch64-softmmu; ninja qemu-system-aarch64).
+# Then copy device-model/bcm4916_sf2.c     to hw/net/bcm4916_sf2.c
+#       and device-model/bcm4916_runner.c  to hw/net/bcm4916_runner.c
+# and rebuild (configure --target-list=aarch64-softmmu; ninja qemu-system-aarch64).
 # Run with the env var QEMU_BCM4916=1 to enable the device on -machine virt.
+#
+# Stage 3 change vs the Stage 2 patch: create_bcm4916() now instantiates the
+# real TYPE_BCM4916_RUNNER datapath device (DT "brcm,bcm4916-runner") at the
+# rdpa window 0x82000000, wires its queue0 (SPI 75) + fpm (SPI 107) IRQs, emits
+# the matching FDT node, points the SF2 DSA CPU/IMP port at it (ethernet=&runner)
+# instead of the stand-in Cadence GEM, and attaches the runner as a NIC so a
+# -netdev backend can inject/emit frames.
 
 --- a/hw/arm/virt.c	2025-04-22 20:26:10.000000000 +0000
-+++ b/hw/arm/virt.c	2026-06-19 16:37:02.033027105 +0000
-@@ -2103,6 +2103,218 @@
++++ b/hw/arm/virt.c	2026-06-19 21:00:00.000000000 +0000
+@@ -2103,6 +2103,233 @@
      }
  }
  
 +
 +/*
-+ * BCM4916 / GT-BE98 control-plane model (gt-be98-open-ethernet).
++ * BCM4916 / GT-BE98 control-plane + datapath model (gt-be98-open-ethernet).
 + * Enabled when the environment variable QEMU_BCM4916 is set. Instantiates the
-+ * SF2 switch core + UNIMAC MDIO master at fixed MMIO bases in the free window
-+ * between VIRT_MMIO and VIRT_PLATFORM_BUS, and emits matching FDT nodes into
-+ * the auto-generated device tree so a stock mainline kernel binds bcm_sf2/b53
-+ * + mdio-bcm-unimac + phylib without an external -dtb.
++ * SF2 switch core + UNIMAC MDIO master + XRDP "Runner" CPU-conduit at fixed
++ * MMIO bases, and emits matching FDT nodes into the auto-generated device tree
++ * so a stock mainline kernel (+ driver/mainline-patches + driver/runner) binds
++ * bcm_sf2/b53 + mdio-bcm-unimac + phylib + the open Runner conduit without an
++ * external -dtb.
 + *
-+ * Reg layout mirrors mainline arch/arm64/.../bcmbca/bcm4908.dtsi.
++ * The Runner netdev is the DSA CPU-port conduit (replaces the Stage 2 Cadence
++ * GEM stand-in). Attach a backend with e.g.
++ *   -netdev user,id=rnet -nic ... (the runner NIC binds the first -netdev/-nic)
++ * or explicitly via the auto-created NIC.
 + */
-+#define BCM4916_SF2_BASE   0x0a800000
-+#define BCM4916_MDIO_BASE  0x0a900000
++#define BCM4916_SF2_BASE     0x0a800000
++#define BCM4916_MDIO_BASE    0x0a900000
++#define BCM4916_RUNNER_BASE  0x82000000UL   /* rdpa window (ABI 1.1) */
++#define BCM4916_RUNNER_SIZE  0x00caf004UL
++#define BCM4916_RUNNER_Q0    75             /* GIC SPI queue0 (RX) */
++#define BCM4916_RUNNER_FPM   107            /* GIC SPI fpm */
 +
 +static void create_bcm4916(VirtMachineState *vms)
 +{
 +    MachineState *ms = MACHINE(vms);
-+    DeviceState *sf2, *mdio;
++    DeviceState *sf2, *mdio, *runner;
 +    char *node, *mdio_node, *phy_node;
 +    uint32_t mdio_ph, phy2_ph, phy9_ph, phy21_ph;
-+    uint32_t gem_ph;
-+    DeviceState *gem;
++    uint32_t runner_ph;
 +    const char sf2_compat[] = "brcm,bcm4916-switch";
 +    const char mdio_compat[] = "brcm,unimac-mdio";
++    const char runner_compat[] = "brcm,bcm4916-runner";
 +
 +    if (!getenv("QEMU_BCM4916")) {
 +        return;
@@ -49,6 +65,24 @@
 +    mdio = qdev_new("bcm4916-mdio");
 +    sysbus_realize_and_unref(SYS_BUS_DEVICE(mdio), &error_fatal);
 +    sysbus_mmio_map(SYS_BUS_DEVICE(mdio), 0, BCM4916_MDIO_BASE);
++
++    /* --- XRDP Runner CPU-conduit (DSA conduit netdev) --- */
++    runner = qdev_new("bcm4916-runner");
++    /*
++     * Peer the Runner NIC with a -netdev id=rnet if present (the Stage 3
++     * datapath test backend); otherwise fall back to a default -nic match.
++     */
++    if (qemu_find_netdev("rnet")) {
++        qdev_prop_set_string(runner, "netdev", "rnet");
++    } else {
++        qemu_configure_nic_device(runner, true, NULL);
++    }
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(runner), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(runner), 0, BCM4916_RUNNER_BASE);
++    sysbus_connect_irq(SYS_BUS_DEVICE(runner), 0,
++                       qdev_get_gpio_in(vms->gic, BCM4916_RUNNER_Q0));
++    sysbus_connect_irq(SYS_BUS_DEVICE(runner), 1,
++                       qdev_get_gpio_in(vms->gic, BCM4916_RUNNER_FPM));
 +
 +    /* --- FDT: MDIO bus + PHY children --- */
 +    mdio_ph = qemu_fdt_alloc_phandle(ms->fdt);
@@ -85,52 +119,31 @@
 +    qemu_fdt_setprop_cell(ms->fdt, phy_node, "phandle", phy21_ph);
 +    g_free(phy_node);
 +
-+    /*
-+     * DSA needs a CPU-port conduit: a real netdev referenced by the CPU port's
-+     * "ethernet" phandle. virt has no built-in platform MAC, so instantiate a
-+     * Cadence GEM (mainline "macb"/cdns,gem driver) as the conduit and wire the
-+     * SF2 CPU port (port@8) to it. This lets dsa_register_switch() complete and
-+     * phylib enumerate the switch PHYs on the unimac-mdio bus.
-+     */
-+#define BCM4916_GEM_BASE  0x0a700000
-+#define BCM4916_GEM_IRQ   182
-+    gem_ph = qemu_fdt_alloc_phandle(ms->fdt);
-+    gem = qdev_new("cadence_gem");
-+    qemu_configure_nic_device(gem, true, NULL);
-+    object_property_set_int(OBJECT(gem), "revision", 0x10070109, &error_fatal);
-+    object_property_set_int(OBJECT(gem), "phy-addr", 0, &error_fatal);
-+    object_property_set_int(OBJECT(gem), "num-priority-queues", 1, &error_fatal);
-+    sysbus_realize_and_unref(SYS_BUS_DEVICE(gem), &error_fatal);
-+    sysbus_mmio_map(SYS_BUS_DEVICE(gem), 0, BCM4916_GEM_BASE);
-+    sysbus_connect_irq(SYS_BUS_DEVICE(gem), 0,
-+                       qdev_get_gpio_in(vms->gic, BCM4916_GEM_IRQ));
++    /* --- FDT: Runner CPU-conduit node (the DSA conduit) --- */
++    runner_ph = qemu_fdt_alloc_phandle(ms->fdt);
 +    {
-+        char *gnode = g_strdup_printf("/ethernet@%x", BCM4916_GEM_BASE);
-+        const char gem_compat[] = "cdns,gem";
-+        qemu_fdt_add_subnode(ms->fdt, gnode);
-+        qemu_fdt_setprop(ms->fdt, gnode, "compatible",
-+                         gem_compat, sizeof(gem_compat));
-+        qemu_fdt_setprop_sized_cells(ms->fdt, gnode, "reg",
-+                                     2, BCM4916_GEM_BASE, 2, 0x1000);
-+        qemu_fdt_setprop_cell(ms->fdt, gnode, "interrupt-parent",
++        char *rnode = g_strdup_printf("/runner@%lx",
++                                      (unsigned long)BCM4916_RUNNER_BASE);
++        qemu_fdt_add_subnode(ms->fdt, rnode);
++        qemu_fdt_setprop(ms->fdt, rnode, "compatible",
++                         runner_compat, sizeof(runner_compat));
++        qemu_fdt_setprop_sized_cells(ms->fdt, rnode, "reg",
++                                     2, BCM4916_RUNNER_BASE,
++                                     2, BCM4916_RUNNER_SIZE);
++        qemu_fdt_setprop(ms->fdt, rnode, "reg-names", "rdpa", sizeof("rdpa"));
++        qemu_fdt_setprop(ms->fdt, rnode, "interrupt-names",
++                         "queue0\0fpm", sizeof("queue0\0fpm"));
++        qemu_fdt_setprop_cell(ms->fdt, rnode, "interrupt-parent",
 +                              vms->gic_phandle);
-+        qemu_fdt_setprop_cells(ms->fdt, gnode, "interrupts",
-+                               GIC_FDT_IRQ_TYPE_SPI, BCM4916_GEM_IRQ,
++        qemu_fdt_setprop_cells(ms->fdt, rnode, "interrupts",
++                               GIC_FDT_IRQ_TYPE_SPI, BCM4916_RUNNER_Q0,
++                               GIC_FDT_IRQ_FLAGS_LEVEL_HI,
++                               GIC_FDT_IRQ_TYPE_SPI, BCM4916_RUNNER_FPM,
 +                               GIC_FDT_IRQ_FLAGS_LEVEL_HI);
-+        qemu_fdt_setprop_cells(ms->fdt, gnode, "clocks",
-+                               vms->clock_phandle, vms->clock_phandle);
-+        qemu_fdt_setprop(ms->fdt, gnode, "clock-names",
-+                         "pclk\0hclk", sizeof("pclk\0hclk"));
-+        qemu_fdt_setprop_string(ms->fdt, gnode, "phy-mode", "rgmii-id");
-+        qemu_fdt_setprop_cell(ms->fdt, gnode, "phandle", gem_ph);
-+        {
-+            char *gfl = g_strdup_printf("%s/fixed-link", gnode);
-+            qemu_fdt_add_subnode(ms->fdt, gfl);
-+            qemu_fdt_setprop_cell(ms->fdt, gfl, "speed", 1000);
-+            qemu_fdt_setprop(ms->fdt, gfl, "full-duplex", NULL, 0);
-+            g_free(gfl);
-+        }
-+        g_free(gnode);
++        /* QEMU Runner model => skip the proprietary microcode load */
++        qemu_fdt_setprop(ms->fdt, rnode, "brcm,runner-emulated", NULL, 0);
++        qemu_fdt_setprop_cell(ms->fdt, rnode, "phandle", runner_ph);
++        g_free(rnode);
 +    }
 +
 +    /* --- FDT: SF2 switch node with 6 reg regions + ports --- */
@@ -138,7 +151,6 @@
 +    qemu_fdt_add_subnode(ms->fdt, node);
 +    qemu_fdt_setprop(ms->fdt, node, "compatible",
 +                     sf2_compat, sizeof(sf2_compat));
-+    /* 6 reg tuples (addr/size) relative to the single MMIO window base */
 +    {
 +        uint64_t b = BCM4916_SF2_BASE;
 +        qemu_fdt_setprop_sized_cells(ms->fdt, node, "reg",
@@ -184,8 +196,7 @@
 +        qemu_fdt_setprop_cell(ms->fdt, port, "phy-handle", phy9_ph);
 +        g_free(port);
 +
-+        /* port@7 -> RGMII (satisfies bcm_sf2 BCM4908 crossbar_setup;
-+         * avoids the "Invalid port mode" WARN). No PHY: fixed-link. */
++        /* port@7 -> RGMII (satisfies bcm_sf2 BCM4908 crossbar_setup) */
 +        port = g_strdup_printf("%s/port@7", ports);
 +        qemu_fdt_add_subnode(ms->fdt, port);
 +        qemu_fdt_setprop_cell(ms->fdt, port, "reg", 7);
@@ -199,12 +210,12 @@
 +        }
 +        g_free(port);
 +
-+        /* port@8 -> CPU/IMP fixed-link (imp_port for BCM4908-class SF2) */
++        /* port@8 -> CPU/IMP port; conduit = the Runner netdev */
 +        port = g_strdup_printf("%s/port@8", ports);
 +        qemu_fdt_add_subnode(ms->fdt, port);
 +        qemu_fdt_setprop_cell(ms->fdt, port, "reg", 8);
 +        qemu_fdt_setprop_string(ms->fdt, port, "phy-mode", "internal");
-+        qemu_fdt_setprop_cell(ms->fdt, port, "ethernet", gem_ph);
++        qemu_fdt_setprop_cell(ms->fdt, port, "ethernet", runner_ph);
 +        {
 +            char *fl = g_strdup_printf("%s/fixed-link", port);
 +            qemu_fdt_add_subnode(ms->fdt, fl);
@@ -216,8 +227,9 @@
 +        g_free(ports);
 +    }
 +
-+    info_report("bcm4916: SF2 switch @0x%x, UNIMAC MDIO @0x%x mapped + FDT emitted",
-+                BCM4916_SF2_BASE, BCM4916_MDIO_BASE);
++    info_report("bcm4916: SF2 @0x%x, MDIO @0x%x, Runner @0x%lx mapped + FDT emitted",
++                BCM4916_SF2_BASE, BCM4916_MDIO_BASE,
++                (unsigned long)BCM4916_RUNNER_BASE);
 +
 +    g_free(node);
 +    g_free(mdio_node);
@@ -226,7 +238,7 @@
  static void machvirt_init(MachineState *machine)
  {
      VirtMachineState *vms = VIRT_MACHINE(machine);
-@@ -2438,6 +2650,8 @@
+@@ -2438,6 +2665,8 @@
  
      create_platform_bus(vms);
  
@@ -235,22 +247,13 @@
      if (machine->nvdimms_state->is_enabled) {
          const struct AcpiGenericAddress arm_virt_nvdimm_acpi_dsmio = {
              .space_id = AML_AS_SYSTEM_MEMORY,
---- a/hw/arm/Kconfig	2025-04-22 20:26:10.000000000 +0000
-+++ b/hw/arm/Kconfig	2026-06-19 16:36:01.965063590 +0000
-@@ -12,6 +12,7 @@
-     imply TPM_TIS_I2C
-     imply NVDIMM
-     imply IOMMUFD
-+    select CADENCE # bcm4916 conduit (cadence_gem)
-     select ARM_GIC
-     select ACPI
-     select ARM_SMMUV3
 --- a/hw/net/meson.build	2025-04-22 20:26:11.000000000 +0000
-+++ b/hw/net/meson.build	2026-06-19 16:26:37.109185367 +0000
-@@ -72,3 +72,6 @@
++++ b/hw/net/meson.build	2026-06-19 21:00:00.000000000 +0000
+@@ -72,3 +72,7 @@
  system_ss.add(files('rocker/rocker-hmp-cmds.c'))
  
  subdir('can')
 +
-+# BCM4916 / GT-BE98 control-plane model (gt-be98-open-ethernet)
++# BCM4916 / GT-BE98 control-plane + datapath model (gt-be98-open-ethernet)
 +system_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('bcm4916_sf2.c'))
++system_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('bcm4916_runner.c'))

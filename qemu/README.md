@@ -237,3 +237,105 @@ On dev-build the working dir is `~/qemu-be98/` (kernel `Image` lives in
 `~/mainline/arch/arm64/boot/`, initramfs at `~/qemu-be98/initramfs.cpio.gz`,
 last boot log `~/qemu-be98/boot.log`). QEMU source for Stage 2 builds:
 `~/qemu-src`.
+
+---
+
+## Stage 3 STATUS: DONE — datapath / **first frame moves MAC↔CPU both ways**
+
+A second QEMU device, `TYPE_BCM4916_RUNNER` (`device-model/bcm4916_runner.c`,
+DT `brcm,bcm4916-runner`), models the XRDP "Runner" CPU-conduit datapath to the
+contract in `device-model/runner-emulation-contract.md`. Wired into
+`create_bcm4916()` it **replaces the Stage 2 Cadence GEM stand-in** as the DSA
+CPU-port conduit, and attaches as a QEMU NIC so a `-netdev` backend can
+inject/emit real Ethernet frames. The open driver `driver/runner/bcm4916_runner.c`
+(built **into the kernel**, `CONFIG_BCM4916_RUNNER=y`, emulated mode via
+`brcm,runner-emulated`) drives it unmodified.
+
+**Result: a real Ethernet frame moves MAC↔CPU through the open driver in
+emulation, both RX and TX.** (Goals a + b + c achieved.)
+
+### What is modelled (`device-model/bcm4916_runner.c`)
+- **rdpa window** at `0x82000000` size `0x00caf004` (one MMIO region; sub-blocks
+  decoded by offset). FPM `@0xa00000`, RNR_MEM[0..7] `@0x700000+n*0x20000`,
+  PSRAM `@0x0`.
+- **FPM pool**: `POOL0_ALLOC_DEALLOC` (read=alloc token / write=free token,
+  ABI-3.1 bit layout), `POOL1_CFG1` (chunk size), `POOL1_CFG2` (pool DDR base),
+  `FPM_CTL` INIT_MEM (clears instantly) + POOL1_ENABLE, `POOL1_STAT2`
+  (tokens-available). `buf_phys = pool_pbase + index*chunk`.
+- **Ring discovery**: parses the 16-B big-endian `CPU_RING_DESCRIPTOR` the driver
+  `memcpy_toio`'s into PSRAM at `0x0000` (RX) / `0x0080` (TX) to learn ring DDR
+  base + depth (256) + entry size (16).
+- **RX inject**: backend frame → `dma_memory_write` into the descriptor's DDR
+  buffer → fill word0 (len) + word2 (ownership=HOST, set **last**) → advance
+  producer → raise the RX IRQ (level; a virtual-clock timer scans the ring and
+  deasserts when the guest re-arms, matching the contract's level semantics).
+- **TX consume**: the `iowrite16(cpu_to_be16(write_idx))` into `RNR_MEM[n]+0x0`
+  is the doorbell → read each new 16-B TX descriptor → resolve word3 FPM token →
+  `dma_memory_read` payload → `qemu_send_packet` to the backend → free the token.
+
+### Run command (on dev-build)
+The custom QEMU has slirp `user` disabled, so use a **`dgram`** backend (each UDP
+datagram payload is one raw Ethernet frame — trivial to inject/sniff). The
+`qemu/scripts/dgram_peer.py`-style helper captures guest TX (→ pcap) and injects
+guest RX.
+```bash
+# peer: capture guest TX on :15402, inject guest RX to :15401
+PEER_DUR=50 INJECT_DELAY=9 INJECT_N=6 python3 dgram_peer.py 15402 15401 inject tx.pcap &
+QEMU_BCM4916=1 ~/qemu-src/qemu-10.0.0/build/qemu-system-aarch64 \
+  -machine virt -cpu cortex-a53 -smp 4 -m 1024 \
+  -kernel ~/mainline/arch/arm64/boot/Image -initrd <stage3-initramfs> \
+  -append "console=ttyAMA0 rdinit=/init panic=5 cma=128M" \
+  -netdev dgram,id=rnet,remote.type=inet,remote.host=127.0.0.1,remote.port=15402,\
+local.type=inet,local.host=127.0.0.1,local.port=15401 \
+  -nic none -nographic -no-reboot
+```
+Two kernel-cmdline requirements found during bring-up:
+- **`cma=128M`** — the driver's 32 MB FPM coherent pool needs CMA larger than the
+  default 32 MB area (else `dmam_alloc_coherent` returns `-ENOMEM`).
+- **keep `-m 1024`** — guest RAM must end below `0x82000000` or it collides with
+  the rdpa MMIO window (`request_region` `-EBUSY`). Do **not** use `-m 2048`.
+
+### Evidence (verified 2026-06-19, `~/qemu-be98/stage3-*` on dev-build)
+```
+bcm4916-runner 82000000.runner: FPM pool: 32 MB, chunk 512, pbase 0x0000000077d00000
+bcm4916-runner: RX ring base=0x43507000 depth=256 esz=16 valid=1
+bcm4916-runner: TX ring base=0x43e4d000 depth=256 esz=16 valid=1
+bcm4916-runner 82000000.runner: BCM4916 Runner conduit ready (emulated, irq 17)
+--- TX ---
+bcm4916-runner: TX emit idx=3 len=64 token=0x80003200 buf=0x77d00600   (per frame)
+TXP_BEFORE=3  TXP_AFTER=12                       # driver tx_packets advanced
+# peer pcap (tcpdump -r), the guest's own txgen frame reached the backend:
+02:00:00:00:00:02 > ff:ff:ff:ff:ff:ff, ethertype 0x88b5, length 64: "BE98-TX-TES..."
+--- RX ---
+bcm4916-runner: RX recv len=71 rx.valid=1 idx=0..3       # model placed frames in ring
+RX ISR irq=17 -> napi_schedule ; poll w2=0xc3ee4000 own=1 # driver NAPI saw ownership=HOST
+RXP_BEFORE=0  RXP_AFTER=4  RXB_AFTER=284          # driver rx_packets/bytes advanced
+```
+
+### Honest gaps / what is stubbed
+- **DSA user-port path (goal d) not completed.** The conduit netdev (`rnr0`) is
+  proven RX+TX; DSA enumerates `eth0/eth1/eth2` over it and `DSA: tree 0 setup`
+  succeeds, but `dsa_register_switch()` cannot raise the conduit MTU to 1504
+  (`-EINVAL`: the FPM chunk is 512 B so the conduit `max_mtu` is ~498). The
+  Stage-3 proof therefore runs directly on the `rnr0` conduit netdev with small
+  frames. To exercise a switch *user* port end-to-end, the conduit needs a
+  ≥2 KB FPM chunk (the contract pins 512) or DSA's overhead check relaxed.
+- **IRQ naming quirk:** `platform_get_irq_byname("queue0")` resolves to the fpm
+  SPI (107) on this DT, not queue0 (75). The model works around it by pulsing
+  **both** SPI 75 and 107 on RX; the real RDD interrupt id should be pinned and
+  the DT `interrupts`/`interrupt-names` order audited.
+- **No fast path / offload** (unchanged from driver scope): slow-path conduit only.
+- The placeholder PSRAM ring-cfg offsets (`0x0`/`0x80`) and the RNR_MEM TX-index
+  offset (`0x0`) are shared driver↔model constants, **not** the real RDD offsets
+  (still to be pinned from the GPL RDD map).
+
+### Files added/changed for Stage 3
+- `device-model/bcm4916_runner.c` — the Runner datapath QEMU model (new).
+- `device-model/bcm4916-qemu-virt.patch` — `create_bcm4916()` now instantiates
+  the runner, wires its queue0/fpm IRQs, emits the `brcm,bcm4916-runner` FDT
+  node, points the SF2 CPU port at it (`ethernet=&runner`), drops the GEM, and
+  binds the runner NIC to `-netdev id=rnet`; meson.build adds the new source.
+- driver built in-tree: `drivers/net/ethernet/broadcom/bcm4916_runner.{c,h}` +
+  Kconfig `BCM4916_RUNNER` + Makefile; `CONFIG_BCM4916_RUNNER=y`.
+- conduit netdev renamed `rnr%d` (was `eth%d`) so it never collides with DSA
+  user-port labels.

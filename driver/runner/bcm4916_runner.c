@@ -559,6 +559,13 @@ static int runner_probe(struct platform_device *pdev)
 	ndev->max_mtu = p->chunk_size - ETH_HLEN;
 	eth_hw_addr_random(ndev);
 
+	/*
+	 * Name the conduit "rnr%d" so it never collides with the DSA user-port
+	 * netdev labels (eth0/eth2/...) the switch driver registers; otherwise
+	 * the default "eth%d" allocation races the DSA ports (-EEXIST).
+	 */
+	strscpy(ndev->name, "rnr%d", IFNAMSIZ);
+
 	if (p->rx_irq > 0) {
 		ret = devm_request_irq(dev, p->rx_irq, runner_rx_isr, 0,
 				       DRV_NAME, p);
