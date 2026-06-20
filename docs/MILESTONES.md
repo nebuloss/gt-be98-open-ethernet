@@ -63,7 +63,7 @@ GT-BE98 device tree end-to-end in emulation. Remaining wired work is the datapat
 - [ ] Live 10G link not provable in QEMU (modeled MAC is 1G-class; real 10G needs the Runner/crossbar)
 - [ ] 2.5G ports / serdes config (later)
 
-## M5 — Runner/RDPA HW offload  ★ NOW THE GOAL (user re-scope 2026-06-19)
+## M5 — Runner/RDPA HW offload  ★ THE GOAL — ALL PHASES PROVEN IN EMULATION
 "Full features: 10G with no CPU overload" → the Runner MUST do fast-path forward/NAT/QoS in HW.
 - [ ] Bring up the Runner: load microcode (⚠ 4916 microcode is PROPRIETARY/non-redistributable — see
       `re-notes/runner-microcode-and-cpuring.md`; user must extract from own rdpa.ko) + init FPM/SBPM/BBH
@@ -72,12 +72,17 @@ GT-BE98 device tree end-to-end in emulation. Remaining wired work is the datapat
       moves MAC↔CPU both directions, packet-proven** (tcpdump). ABI fully recovered
       (`re-notes/xrdp-datapath-abi.md`). Gaps: DSA user-port needs ≥2KB FPM chunk (512B caps MTU);
       IRQ-name quirk; PSRAM/RNR-MEM offsets still shared placeholders (pin from device).
-- [~] Flow-acceleration control plane — **ABI RE'd** (`re-notes/xrdp-offload-abi.md`): NAT-C table +
-      context entry + XPE cmdlist opcodes + flow-program path pinned from the unstripped 6813 cmdlist
-      objects. Open design = mainline nf_flow_table → action translator → clean-room cmdlist builder →
-      NAT-C writer (mtk_ppe analogy). Phase1 (L2+VLAN) concrete; Phase2 (NAT 10G) spec'd, very-hard.
-      Remaining: exact 6813 context offsets + NAT-C hash polynomial + operand bit-packing (read-only
-      device NAT-C dump resolves).
+- [x] Flow-acceleration control plane — **ABI RE'd + live-confirmed** (`re-notes/xrdp-offload-abi.md`,
+      `live-flow-dump.md`).
+- [x] **Offload Phase 1 (L2+VLAN) — WORKS in emulation**: open cmdlist builder + context + NAT-C writer
+      + nf_flow_table hook; QEMU proves first-pkt→CPU→program→subsequent pkts HW-forwarded, CPU bypassed
+      (`re-notes/offload-phase1-status.md`).
+- [x] **Offload Phase 2 (L3+NAT/NAPT) — WORKS in emulation**: TTL-dec + IP/port rewrite + csum cmdlist;
+      QEMU proves a NAT'd flow HW-forwarded with correct SNAT+csum, CPU bypassed, pcap-verified
+      (`re-notes/offload-phase2-status.md`).
+- Remaining for HW: exact 6813 context byte-offsets + NAT-C key/hash + ADD-opcode operand packing are
+  driver↔model PLACEHOLDERS (pin from device/xpe_api.o RE); live conntrack/MASQUERADE trigger needs a
+  2-port topo; IPv6 + next-hop MAC rewrite + CNPL stats TODO.
 - [ ] 10G line-rate forward/NAT offloaded, CPU idle — the deliverable
 - ★ CORRECTED: the 4916 Runner microcode is **PROPRIETARY/non-redistributable** (256KB inside rdpa.ko,
   license=Proprietary, taint P; absent from the 4916 GPL SDK). The Runner is mandatory (no HW bypass),
