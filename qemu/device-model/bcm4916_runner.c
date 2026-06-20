@@ -94,15 +94,19 @@
 #define  NATC_CMD_ADD            3
 #define  NATC_CMD_DEL            4
 
-/* context-entry byte offsets (matches flow_offload.h CTX_OFF_*) */
+/* context-entry byte offsets (matches flow_offload.h CTX_OFF_*).
+ * cmdlist offset corrected to 24 from the live capture (real silicon: GPL
+ * FC_UCAST_FLOW_CONTEXT_ENTRY_STRUCT has command_list @ struct byte 24;
+ * re-notes/stock-watch-capture.md sec 2). XPE_CMDLIST_MAX = 80. */
 #define CTX_OFF_FLAGS            8
 #define  CTX_FLAG_IS_L2_ACCEL    (1u << 4)
 #define CTX_OFF_VPORT            12
-#define CTX_OFF_CMDLIST_OFF      16
-#define CTX_OFF_CMDLIST_DLEN     96
-#define CTX_OFF_CMDLIST_LEN      97
-#define CTX_OFF_VALID            98
-#define CTX_ENTRY_MAX            128
+#define CTX_OFF_CMDLIST_OFF      24
+#define XPE_CMDLIST_MAX_M        80
+#define CTX_OFF_CMDLIST_DLEN     (CTX_OFF_CMDLIST_OFF + XPE_CMDLIST_MAX_M + 0) /* 104 */
+#define CTX_OFF_CMDLIST_LEN      (CTX_OFF_CMDLIST_OFF + XPE_CMDLIST_MAX_M + 1) /* 105 */
+#define CTX_OFF_VALID            (CTX_OFF_CMDLIST_OFF + XPE_CMDLIST_MAX_M + 2) /* 106 */
+#define CTX_ENTRY_MAX            124
 
 /* XPE opcodes (matches cmdlist.h; opcode = cmd_word >> 26) */
 #define XPE_OP_MCOPY             0x13   /* INSERT (VLAN push) */
@@ -378,13 +382,19 @@ static void natc_compute_key(const uint8_t *frame, size_t len, uint8_t key[16])
 
 /*
  * Compute the 16-byte L3 IPv4 5-tuple key from a received frame, EXACTLY as the
- * driver's xrdp_build_key does for an is_routed flow (flow_offload.c):
- *   w0 = ORIGINAL src IP; w1 = ORIGINAL dst IP;
- *   w2 = sport<<16 | dport; w3 = ip_proto<<24 | vport<<4 | 0x1.
+ * driver's xrdp_build_key does for an is_routed flow (flow_offload.c). The w[3]
+ * byte layout was PINNED from live silicon (re-notes/stock-watch-capture.md
+ * sec 1): w[3] = ToS<<24 | 0x28<<16 | flags<<8 | 0x68, where ToS is the IP ToS
+ * byte and flags bit7=direction(us), bit6=tcp_pure_ack.
+ *   w0 = ORIGINAL src IP; w1 = ORIGINAL dst IP; w2 = sport<<16 | dport;
+ *   key[12]=ToS, key[13]=0x28 (proto/key-class), key[14]=dir|ack, key[15]=0x68.
  * The key is the ORIGINAL (ingress) tuple - the lookup runs before the cmdlist
  * rewrites the packet. Returns false if the frame is not parseable IPv4 TCP/UDP.
  * Assumes an untagged IPv4 frame (ethertype 0x0800 at [12:13], IHL=5).
  */
+#define NATC_L3_KEY_CLASS_BYTE_M  0x28
+#define NATC_L3_KEY_TRAILER_M     0x68
+#define NATC_L3_KEY_DIR_US_M      (1u << 7)
 static bool natc_compute_l3_key(const uint8_t *frame, size_t len, uint8_t key[16])
 {
     uint16_t ethertype;
@@ -418,11 +428,13 @@ static bool natc_compute_l3_key(const uint8_t *frame, size_t len, uint8_t key[16
     key[4] = ip[16]; key[5] = ip[17]; key[6] = ip[18]; key[7] = ip[19];
     /* w2 = sport<<16 | dport (l4[0..3]) */
     key[8] = l4[0]; key[9] = l4[1]; key[10] = l4[2]; key[11] = l4[3];
-    /* w3 = proto<<24 | vport<<4 | 0x1  (vport=0) */
-    key[12] = proto;
-    key[13] = 0x00;
-    key[14] = 0x00;
-    key[15] = 0x01;
+    /* w3 = ToS<<24 | key-class<<16 | flags<<8 | trailer (live-pinned layout).
+     * ToS = IP ToS byte (ip[1]); selftest has tcp_pure_ack=0, dir=us. */
+    key[12] = ip[1];                      /* ToS/DSCP */
+    key[13] = NATC_L3_KEY_CLASS_BYTE_M;   /* proto/key-class (0x28) */
+    key[14] = NATC_L3_KEY_DIR_US_M;       /* dir=us, tcp_pure_ack=0 */
+    key[15] = NATC_L3_KEY_TRAILER_M;      /* ingress-vport/valid trailer (0x68) */
+    (void)proto;
     return true;
 }
 

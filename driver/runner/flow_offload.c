@@ -184,26 +184,50 @@ void xrdp_build_ctx(const struct xrdp_flow *f, const struct xpe_cmdlist *cl,
  *
  * L3/NAT (routed, is_routed=1) - open IPv4 5-tuple key class. The key is the
  * ORIGINAL (pre-NAT) tuple, since the lookup happens on ingress before the
- * cmdlist rewrites the packet (matches the stock ucast key = ingress 5-tuple):
- *   w[0] = ORIGINAL source IP (be)
- *   w[1] = ORIGINAL dest   IP (be)
- *   w[2] = ORIGINAL sport<<16 | ORIGINAL dport
- *   w[3] = ip_proto<<24 | ingress_vport<<4 | 0x1 (L3 key-class marker)
+ * cmdlist rewrites the packet (matches the stock ucast key = ingress 5-tuple).
+ *
+ * Byte layout PINNED from live silicon (re-notes/stock-watch-capture.md sec 1,
+ * captured via tools/stock-watch on real stock flows):
+ *   key[0..3]   = ORIGINAL source IP (be)         -> w[0]
+ *   key[4..7]   = ORIGINAL dest   IP (be)         -> w[1]
+ *   key[8..9]   = ORIGINAL src port (be)          -> w[2] high half
+ *   key[10..11] = ORIGINAL dst port (be)          -> w[2] low  half
+ *   key[12]     = ToS                             -> w[3] byte 0 (MSB)
+ *   key[13]     = proto/key-class byte (0x28 obs) -> w[3] byte 1
+ *   key[14]     = dir(bit7) | tcp_pure_ack(bit6)  -> w[3] byte 2
+ *   key[15]     = ingress-vport / trailer (0x68)  -> w[3] byte 3 (LSB)
+ *
+ * NB earlier the driver packed ip_proto in the MSB of w[3]; the live capture
+ * shows the MSB is ToS, not proto. proto + key-class live in byte 13. The exact
+ * proto/vport encoding of bytes 13/15 is per-table (stock used a fixed key-class
+ * for the eth0 upstream TCP table); we reproduce the observed constants and pass
+ * ToS + the pure-ack/direction flags through, which is what splits the HW flows.
  *
  * Stored big-endian (ABI sec 1.1: key is rev32 / big-endian).
  */
+#define NATC_L3_KEY_CLASS_BYTE	0x28	/* key[13]: proto(TCP)+key-class (live) */
+#define NATC_L3_KEY_TRAILER	0x68	/* key[15]: ingress-vport/valid trailer (live) */
+#define NATC_L3_KEY_DIR_US	BIT(7)	/* key[14] bit7: direction = upstream */
+#define NATC_L3_KEY_PURE_ACK	BIT(6)	/* key[14] bit6: tcp_pure_ack */
 void xrdp_build_key(const struct xrdp_flow *f, struct natc_key *key)
 {
 	u32 w0, w1, w2, w3;
 
 	if (f->is_routed) {
-		/* L3 IPv4 5-tuple key (original/ingress tuple) */
+		/* L3 IPv4 5-tuple key (original/ingress tuple). Byte layout pinned
+		 * from live silicon (re-notes/stock-watch-capture.md sec 1):
+		 *   w[3] = ToS<<24 | key-class<<16 | flags<<8 | trailer  */
+		u8 k14 = NATC_L3_KEY_DIR_US |
+			 (f->tcp_pure_ack ? NATC_L3_KEY_PURE_ACK : 0);
+
 		w0 = be32_to_cpu(f->ip_sa);
 		w1 = be32_to_cpu(f->ip_da);
 		w2 = ((u32)be16_to_cpu(f->l4_sport) << 16) |
 		     be16_to_cpu(f->l4_dport);
-		w3 = ((u32)f->ip_proto << 24) |
-		     ((f->ingress_vport & 0xfff) << 4) | 0x1;
+		w3 = ((u32)f->ip_tos << 24) |
+		     ((u32)NATC_L3_KEY_CLASS_BYTE << 16) |
+		     ((u32)k14 << 8) |
+		     NATC_L3_KEY_TRAILER;
 	} else {
 		w0 = (f->mac_da[0] << 24) | (f->mac_da[1] << 16) |
 		     (f->mac_da[2] << 8)  |  f->mac_da[3];

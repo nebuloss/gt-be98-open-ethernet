@@ -77,21 +77,33 @@ struct natc_key {
 };
 
 /* ------------------------------------------------------------------------- *
- * FC_UCAST_FLOW_CONTEXT_ENTRY (the NAT-C result). ABI sec 1.3 + live dump.
+ * FC_UCAST_FLOW_CONTEXT_ENTRY (the NAT-C result).
  *
- * Layout follows the RDP-impl2 template (xrdp-offload-abi.md sec 1.3) with the
- * live-confirmed XRDP fields. Multi-byte fields are stored BIG-ENDIAN (Runner
- * is BE) by the builder. The cmdlist is embedded inline at +16.
+ * REAL SILICON LAYOUT (pinned): the GPL FC_UCAST_FLOW_CONTEXT_ENTRY_STRUCT
+ * (rdd_data_structures_auto.h, BCM6813, big-endian) is a 124-byte packed
+ * BITFIELD struct with command_list[100] at struct byte 24, and the cmdlist
+ * length carried in the WORD-1 bitfield `command_list_length_32` (32-bit-word
+ * units), NOT a flat cmd_list_data_length byte. The live capture
+ * (re-notes/stock-watch-capture.md sec 2) confirms it byte-for-byte
+ * (cmdlist body @ +24..+51 of the FC_UCAST struct, gdx_ctx_data @ struct +14).
+ *
+ * EMULATION CONTRACT (below): the open driver and the QEMU Runner model share a
+ * simplified FLAT-BYTE view of the entry so the model can decode what the driver
+ * stages without reimplementing the BE bitfield packer. The ONE field that must
+ * match real silicon for a real-HW bring-up is the cmdlist offset, which is now
+ * 24 (was 16). The remaining CTX_OFF_* are a driver<->model private contract;
+ * a real-silicon builder must instead emit the GPL bitfield struct.
  * ------------------------------------------------------------------------- */
-#define XPE_CTX_CMDLIST_OFF	16
-#define XPE_CTX_ENTRY_MAX	(XPE_CTX_CMDLIST_OFF + XPE_CMDLIST_MAX_BYTES + 16)
+#define XPE_CTX_CMDLIST_OFF	24	/* real: command_list @ struct byte 24 */
+#define XPE_CTX_ENTRY_MAX	124	/* real: FC_UCAST_FLOW_CONTEXT_ENTRY = 124 B */
 
 struct fc_ucast_ctx {
 	u8	buf[XPE_CTX_ENTRY_MAX];
 	u16	len;		/* total context bytes */
 };
 
-/* context byte offsets (template; ABI UNKNOWN #1 for real silicon) */
+/* context byte offsets (driver<->QEMU-model contract; real layout = GPL
+ * bitfield struct, see stock-watch-capture.md sec 2). */
 #define CTX_OFF_FLAGS		8	/* byte: bit7 mcast,b5 is_routed,b4 is_l2_accel */
 #define  CTX_FLAG_MCAST		BIT(7)
 #define  CTX_FLAG_IS_ROUTED	BIT(5)
@@ -100,9 +112,11 @@ struct fc_ucast_ctx {
 #define CTX_OFF_VPORT		12	/* byte: egress vport */
 #define CTX_OFF_SERVICE_Q	13	/* byte: service_queue_id */
 #define CTX_OFF_IS_HW_CSO	14	/* byte: bit0 is_hw_cso */
-#define CTX_OFF_CMDLIST_DLEN	96	/* u8 : cmd_list_data_length (bytes) */
-#define CTX_OFF_CMDLIST_LEN	97	/* u8 : cmd_list_length (aligned) */
-#define CTX_OFF_VALID		98	/* u8 : valid flag */
+/* the two cmdlist length fields live AFTER the 100-byte command_list region
+ * (contract bytes; real silicon uses command_list_length_32 in WORD 1). */
+#define CTX_OFF_CMDLIST_DLEN	(XPE_CTX_CMDLIST_OFF + XPE_CMDLIST_MAX_BYTES + 0)
+#define CTX_OFF_CMDLIST_LEN	(XPE_CTX_CMDLIST_OFF + XPE_CMDLIST_MAX_BYTES + 1)
+#define CTX_OFF_VALID		(XPE_CTX_CMDLIST_OFF + XPE_CMDLIST_MAX_BYTES + 2)
 
 /* ------------------------------------------------------------------------- *
  * Packet byte offsets (from SOP) for an UNTAGGED IPv4 frame, used by the NAT
@@ -134,6 +148,8 @@ struct xrdp_flow {
 
 	/* --- L3/L4 5-tuple key (Phase 2 routed/NAT path) --- */
 	u8	ip_proto;	/* IPPROTO_TCP / IPPROTO_UDP */
+	u8	ip_tos;		/* match ToS/DSCP (live key byte 12; splits HW flows) */
+	bool	tcp_pure_ack;	/* live key byte 14 bit6 (TCP ack-prioritisation flow) */
 	__be32	ip_sa;		/* match (original) source IP */
 	__be32	ip_da;		/* match (original) dest   IP */
 	__be16	l4_sport;	/* match (original) source port */
