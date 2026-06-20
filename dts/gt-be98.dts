@@ -1,9 +1,21 @@
 // SPDX-License-Identifier: (GPL-2.0+ OR MIT)
 /*
- * gt-be98.dts - ASUS GT-BE98 (Broadcom BCM4916 / "bcm96813")
+ * gt-be98.dts - ASUS GT-BE98 (Broadcom BCM4916 / "bcm6813")
  *
- * Board-level device tree for the gt-be98-open-ethernet effort: enables the
- * four wired Ethernet ports and their PHYs on top of bcm4916.dtsi.
+ * Board-level device tree for the gt-be98-open-ethernet effort.
+ *
+ * REBASED (2026-06) onto the UPSTREAM mainline SoC dtsi:
+ *   - dts/bcm6813.dtsi      : VERBATIM copy of mainline
+ *                             arch/arm64/boot/dts/broadcom/bcmbca/bcm6813.dtsi
+ *                             (CPUs/PSCI, GIC-400, arch timer, PMU, clocks,
+ *                              PL011 uart0, hsspi, nand). BCM4916 == BCM6813 die.
+ *   - dts/bcm4916-enet.dtsi : our open Ethernet/switch/MDIO/PHY/MAC/Runner
+ *                             overlay (none of this is in upstream).
+ *   - this file             : GT-BE98 board specifics (model/memory/chosen) +
+ *                             enabling the four wired ports and their PHYs.
+ *
+ * When built in-tree, replace the bcm6813.dtsi include with the in-tree path;
+ * the vendored copy exists so this builds standalone with cpp+dtc.
  *
  * Topology (all [FDT]+[SDK] confirmed, see re-notes/bcm4916-regmap.md and the
  * 4916 SDK GT-BE98.dts):
@@ -12,17 +24,13 @@
  *   lan = eth2 : SF2 port#1, UNIMAC gmii -> internal EGPHY @ MDIO 2 (1G)
  *   lan = eth3 : SF2 port#7, XPORT -> serdes1 @ MDIO 8 -> ext PHY @ MDIO 21
  *
- * NOTE on the SDK GT-BE98.dts: it labels eth1's serdes0 device an "RTL8372"
- * and eth3's cascade an "BCM84891L"; the topology (which serdes/MDIO addr maps
- * to which logical port) matches the regmap exactly. We model eth1 as a fixed
- * 10GBase-R link (no MDIO-addressable copper PHY) per config-xfi="10GBase-R".
- *
  * PUBLIC-SAFE: no real unit MAC, no internal hosts/IPs/paths.
  */
 
 /dts-v1/;
 
-#include "bcm4916.dtsi"
+#include "bcm6813.dtsi"
+#include "bcm4916-enet.dtsi"
 
 / {
 	model = "ASUS GT-BE98";
@@ -107,8 +115,8 @@
 
 /*
  * Enable the XRDP Runner CPU-port conduit (the DSA master netdev that fronts
- * switch0's CPU/IMP port). brcm,runner-emulated is inherited from the dtsi so
- * this binds against the QEMU Runner model with no proprietary microcode.
+ * switch0's CPU/IMP port). brcm,runner-emulated is inherited from the overlay
+ * so this binds against the QEMU Runner model with no proprietary microcode.
  */
 &runner {
 	status = "okay";

@@ -19,7 +19,7 @@ packets to/from the CPU. *Then* the switch (DSA), multi-port, the 10G PHY.
 
 | Layer  | Mainline base                         | BCM4916 work                                    |
 |--------|---------------------------------------|-------------------------------------------------|
-| DTS    | `ARCH_BCMBCA` (`.../bcmbca/`)         | new `bcm4916.dtsi` + `gt-be98.dts`              |
+| DTS    | upstream `bcm6813.dtsi` (`.../bcmbca/`) | `bcm4916-enet.dtsi` overlay + `gt-be98.dts`   |
 | MAC    | `bcm4908_enet` (UNIMAC-style)         | extend; RE the BCM4916 register deltas          |
 | Switch | `b53` / `bcm_sf2` DSA                 | internal + external (2.5G) switch               |
 | PHY    | `mdio-bcm-unimac` + new BCM84891 drv  | 10G NBASE-T PHY (mainline coverage partial)     |
@@ -40,7 +40,7 @@ A broken Ethernet driver disconnects the device entirely (no WiFi-style fallback
 ## Layout
 
 - `driver/`   — the open MAC / DSA / PHY driver sources (out-of-tree build for iteration)
-- `dts/`      — `bcm4916.dtsi`, `gt-be98.dts`, bindings
+- `dts/`      — `bcm6813.dtsi` (vendored upstream SoC base), `bcm4916-enet.dtsi` (open Ethernet overlay), `gt-be98.dts`, bindings
 - `docs/`     — design notes, port/PHY/switch topology, recovery procedures
 - `re-notes/` — reverse-engineering findings (register maps, MDIO layout, serdes config)
 - `qemu/`     — `qemu-system-aarch64` BCM4916 machine/device-model for safe host-side iteration
