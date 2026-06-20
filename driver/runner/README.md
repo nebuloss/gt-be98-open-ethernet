@@ -15,30 +15,40 @@ CPU-ring datapath.
 
 **Slow path** — CPU-forwarded frames (RX trap-to-host + host TX) — **plus
 Phase-1 L2/VLAN HW flow-offload**. The offload fast path (NAT-C connection table
-+ XPE cmdlist + `FC_UCAST_FLOW_CONTEXT_ENTRY`) is now implemented for the
-**L2 bridge + VLAN** case (`is_l2_accel`): a flow-miss traps to the CPU, the
-driver learns it via the flowtable and programs one NAT-C entry, and every
-subsequent packet hits NAT-C and is forwarded by the Runner without the CPU.
-L3 + NAT (routed/NAPT) is **Phase 2** — explicitly rejected (`-EOPNOTSUPP`) and
-left as cmdlist stubs (`xpe_cmd_decrement_8` / `_replace_32` / `_apply_icsum_16`)
-so the `addIpv4Commands` sequence slots in next. See
-`re-notes/offload-phase1-status.md`.
++ XPE cmdlist + `FC_UCAST_FLOW_CONTEXT_ENTRY`) is implemented for BOTH:
+- **Phase 1 — L2 bridge + VLAN** (`is_l2_accel`): VLAN push/pop/mangle.
+- **Phase 2 — L3 route + NAT/NAPT** (`is_routed`): the line-rate-NAT path —
+  IPv4 TTL decrement, source/dest IP rewrite (SNAT/DNAT), L4 source/dest port
+  rewrite (NAPT), and IP + TCP/UDP incremental checksum fixups, emitted as the
+  RE'd `addIpv4Commands` cmdlist sequence (dec-TTL → IP-replace → IP-icsum →
+  L4-replace → L4-icsum).
+
+In both cases a flow-miss traps to the CPU, the driver learns it via the
+flowtable and programs one NAT-C entry, and every subsequent packet hits NAT-C
+and is forwarded by the Runner (Phase 2: with the packet rewritten) without the
+CPU. See `re-notes/offload-phase1-status.md` and `offload-phase2-status.md`.
+IPv6 NAT is still rejected (as in mtk).
 
 ### Offload files
 - `cmdlist.{c,h}` — open XPE (XRDP Packet Engine) cmdlist builder: emits 16-bit
-  big-endian command words (opcode = word>>26), Phase-1 L2 ops (VLAN
-  push/pop/mangle + NOP). Clean-room from the RE'd opcode encoding.
-- `flow_offload.{c,h}` — the `FC_UCAST_FLOW_CONTEXT_ENTRY` builder, the 16-byte
-  masked BE NAT-C key builder, and the nf_flow_table / `TC_SETUP_FT` offload
-  block (flow_block_cb + FLOW_CLS_REPLACE/DESTROY/STATS), modelled on
-  mainline `mtk_ppe_offload.c`.
+  big-endian command words (opcode = word>>26). Phase-1 L2 ops (VLAN
+  push/pop/mangle + NOP) and Phase-2 L3/NAT ops (`decrement_8`, `replace_32`,
+  `replace_16`, `apply_icsum_16`). Clean-room from the RE'd opcode encoding.
+- `flow_offload.{c,h}` — the `FC_UCAST_FLOW_CONTEXT_ENTRY` builder (L2 + routed),
+  the 16-byte masked BE NAT-C key builder (L2 tuple + L3 5-tuple), the L2 and
+  NAT cmdlist builders, the `FLOW_ACTION_MANGLE`/5-tuple parse, and the
+  nf_flow_table / `TC_SETUP_FT` offload block (flow_block_cb +
+  FLOW_CLS_REPLACE/DESTROY/STATS), modelled on mainline `mtk_ppe_offload.c`.
 - NAT-C connection-table I/O (`xrdp_natc_add/del/stats`) lives in
   `bcm4916_runner.c` (it owns the MMIO window); `.ndo_setup_tc` +
   `NETIF_F_HW_TC` register the offload block on the conduit.
 
-A debugfs trigger `…/bcm4916-runner/offload_selftest` (`echo "<vlan_op> <vid>"`)
-programs one L2 flow through the real builders + NAT-C add path (the QEMU
-offload proof). vlan_op: 0=plain L2, 1=push, 2=pop, 3=mangle.
+Two debugfs triggers (the QEMU offload proofs):
+- `…/bcm4916-runner/offload_selftest` (`echo "<vlan_op> <vid>"`) — one L2 flow.
+  vlan_op: 0=plain L2, 1=push, 2=pop, 3=mangle.
+- `…/bcm4916-runner/offload_nat_selftest` (`echo go`) — one routed IPv4
+  SNAT+NAPT flow (LAN→WAN masquerade, TEST-NET addresses), through the real
+  Phase-2 builders + NAT-C add path.
 
 ## What it does
 

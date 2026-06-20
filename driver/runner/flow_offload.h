@@ -96,6 +96,7 @@ struct fc_ucast_ctx {
 #define  CTX_FLAG_MCAST		BIT(7)
 #define  CTX_FLAG_IS_ROUTED	BIT(5)
 #define  CTX_FLAG_IS_L2_ACCEL	BIT(4)
+#define  CTX_FLAG_IS_NAT	BIT(3)	/* open: NAT/NAPT rewrite present (model hint) */
 #define CTX_OFF_VPORT		12	/* byte: egress vport */
 #define CTX_OFF_SERVICE_Q	13	/* byte: service_queue_id */
 #define CTX_OFF_IS_HW_CSO	14	/* byte: bit0 is_hw_cso */
@@ -103,14 +104,50 @@ struct fc_ucast_ctx {
 #define CTX_OFF_CMDLIST_LEN	97	/* u8 : cmd_list_length (aligned) */
 #define CTX_OFF_VALID		98	/* u8 : valid flag */
 
-/* resolved Phase-1 flow description handed to the context/cmdlist builder */
+/* ------------------------------------------------------------------------- *
+ * Packet byte offsets (from SOP) for an UNTAGGED IPv4 frame, used by the NAT
+ * cmdlist builder + the QEMU interpreter. ETH header = 14 bytes; IPv4 header
+ * follows. (Tagged frames shift by VLAN_HLEN; Phase 2 self-test uses untagged.)
+ * ------------------------------------------------------------------------- */
+#define L2_HLEN			14	/* DA(6)+SA(6)+ethertype(2) */
+#define IP4_OFF_TTL		(L2_HLEN + 8)	/* 22: IPv4 TTL byte */
+#define IP4_OFF_CSUM		(L2_HLEN + 10)	/* 24: IPv4 header checksum */
+#define IP4_OFF_SADDR		(L2_HLEN + 12)	/* 26: IPv4 source address */
+#define IP4_OFF_DADDR		(L2_HLEN + 16)	/* 30: IPv4 dest address */
+#define IP4_HLEN		20	/* assume no IP options (offload fast path) */
+#define L4_OFF_SPORT		(L2_HLEN + IP4_HLEN + 0)	/* 34 */
+#define L4_OFF_DPORT		(L2_HLEN + IP4_HLEN + 2)	/* 36 */
+#define TCP_OFF_CSUM		(L2_HLEN + IP4_HLEN + 16)	/* 50 */
+#define UDP_OFF_CSUM		(L2_HLEN + IP4_HLEN + 6)	/* 40 */
+
+/* resolved flow description handed to the context/cmdlist builder */
 struct xrdp_flow {
-	/* L2 key */
+	/* --- flow class --- */
+	bool	is_routed;	/* L3 route + NAT/NAPT (Phase 2) vs pure L2 */
+
+	/* L2 key (Phase 1 bridge path) */
 	u8	mac_da[ETH_ALEN];
 	u8	mac_sa[ETH_ALEN];
 	__be16	ethertype;
 	u16	ingress_vport;
 	u16	vlan_in;	/* match VID (0 = untagged) */
+
+	/* --- L3/L4 5-tuple key (Phase 2 routed/NAT path) --- */
+	u8	ip_proto;	/* IPPROTO_TCP / IPPROTO_UDP */
+	__be32	ip_sa;		/* match (original) source IP */
+	__be32	ip_da;		/* match (original) dest   IP */
+	__be16	l4_sport;	/* match (original) source port */
+	__be16	l4_dport;	/* match (original) dest   port */
+
+	/* --- NAT rewrite (post-translation tuple; from FLOW_ACTION_MANGLE) --- */
+	bool	nat_sip;	/* rewrite source IP   (SNAT) */
+	__be32	nat_sip_val;
+	bool	nat_dip;	/* rewrite dest   IP   (DNAT) */
+	__be32	nat_dip_val;
+	bool	nat_sport;	/* rewrite source port (SNAPT) */
+	__be16	nat_sport_val;
+	bool	nat_dport;	/* rewrite dest   port (DNAPT) */
+	__be16	nat_dport_val;
 
 	/* egress */
 	u16	egress_vport;
@@ -130,11 +167,19 @@ struct xrdp_flow {
 /* Build the L2 cmdlist for a resolved flow (VLAN push/pop/mangle + end). */
 void xrdp_build_l2_cmdlist(const struct xrdp_flow *f, struct xpe_cmdlist *cl);
 
-/* Build the FC_UCAST_FLOW_CONTEXT_ENTRY (is_l2_accel=1) embedding the cmdlist. */
+/*
+ * Build the L3/NAT cmdlist for a routed flow (Phase 2): the RE'd addIpv4Commands
+ * order (xrdp-offload-abi.md sec 2.4a) - dec-TTL, IP SA/DA replace + IP icsum,
+ * L4 sport/dport replace + L4 icsum.
+ */
+void xrdp_build_nat_cmdlist(const struct xrdp_flow *f, struct xpe_cmdlist *cl);
+
+/* Build the FC_UCAST_FLOW_CONTEXT_ENTRY embedding the cmdlist (is_l2_accel or
+ * is_routed per f->is_routed). */
 void xrdp_build_ctx(const struct xrdp_flow *f, const struct xpe_cmdlist *cl,
 		    struct fc_ucast_ctx *ctx);
 
-/* Build the 16-byte masked big-endian NAT-C key from the L2 tuple. */
+/* Build the 16-byte masked big-endian NAT-C key (L2 tuple or L3 5-tuple). */
 void xrdp_build_key(const struct xrdp_flow *f, struct natc_key *key);
 
 #endif /* _BCM4916_FLOW_OFFLOAD_H_ */

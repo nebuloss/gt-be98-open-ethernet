@@ -200,6 +200,10 @@ int  xrdp_offload_setup_tc(struct xrdp_offload *o, struct net_device *dev,
 			   enum tc_setup_type type, void *type_data);
 int  xrdp_offload_selftest(struct xrdp_offload *o, const u8 *mac_da,
 			   const u8 *mac_sa, int vlan_op, u16 vid);
+int  xrdp_offload_nat_selftest(struct xrdp_offload *o,
+			       __be32 ip_sa, __be32 ip_da,
+			       __be16 l4_sport, __be16 l4_dport, u8 ip_proto,
+			       __be32 nat_sip, __be16 nat_sport);
 
 /* bcm4916_runner.c - NAT-C connection-table I/O (owns the MMIO window) */
 int  xrdp_natc_add(struct xrdp_offload *o, const struct natc_key *key,

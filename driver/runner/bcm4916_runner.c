@@ -44,6 +44,7 @@
 #include <linux/firmware.h>
 #include <linux/delay.h>
 #include <linux/byteorder/generic.h>
+#include <linux/in.h>
 #include <linux/debugfs.h>
 
 #include "bcm4916_runner.h"
@@ -582,11 +583,58 @@ static const struct file_operations runner_selftest_fops = {
 	.write	= runner_selftest_write,
 };
 
+/*
+ * Routed/NAT offload self-test (Phase 2). Writing any non-empty string to
+ * .../offload_nat_selftest programs one routed IPv4 SNAT+NAPT flow whose
+ * ORIGINAL 5-tuple matches the frames the NAT peer injects, so subsequent
+ * frames HIT NAT-C and are rewritten + forwarded in HW. The flow models a
+ * LAN->WAN masquerade: original src 192.0.2.10:4096 -> dst 198.51.100.20:80
+ * (TCP), rewritten source 203.0.113.5:5000 (post-SNAT WAN side).
+ * (Addresses are TEST-NET/documentation ranges - public-safe.)
+ */
+#define NAT_ST_ORIG_SIP		0xc000020aU	/* 192.0.2.10  */
+#define NAT_ST_ORIG_DIP		0xc6336414U	/* 198.51.100.20 */
+#define NAT_ST_ORIG_SPORT	4096
+#define NAT_ST_ORIG_DPORT	80
+#define NAT_ST_NAT_SIP		0xcb007105U	/* 203.0.113.5 */
+#define NAT_ST_NAT_SPORT	5000
+
+static ssize_t runner_nat_selftest_write(struct file *file,
+					 const char __user *ubuf,
+					 size_t count, loff_t *ppos)
+{
+	struct runner_priv *p = file->private_data;
+	int ret;
+
+	ret = xrdp_offload_nat_selftest(&p->offload,
+					htonl(NAT_ST_ORIG_SIP),
+					htonl(NAT_ST_ORIG_DIP),
+					htons(NAT_ST_ORIG_SPORT),
+					htons(NAT_ST_ORIG_DPORT),
+					IPPROTO_TCP,
+					htonl(NAT_ST_NAT_SIP),
+					htons(NAT_ST_NAT_SPORT));
+	if (ret < 0) {
+		dev_err(p->dev, "NAT offload self-test failed: %d\n", ret);
+		return ret;
+	}
+	dev_info(p->dev, "NAT offload self-test OK (cmdlist %d data bytes)\n",
+		 ret);
+	return count;
+}
+
+static const struct file_operations runner_nat_selftest_fops = {
+	.open	= simple_open,
+	.write	= runner_nat_selftest_write,
+};
+
 static void runner_debugfs_init(struct runner_priv *p)
 {
 	p->dbg = debugfs_create_dir(DRV_NAME, NULL);
 	debugfs_create_file("offload_selftest", 0200, p->dbg, p,
 			    &runner_selftest_fops);
+	debugfs_create_file("offload_nat_selftest", 0200, p->dbg, p,
+			    &runner_nat_selftest_fops);
 }
 
 /* ============================ netdev / probe ============================ */

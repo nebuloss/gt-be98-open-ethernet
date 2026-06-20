@@ -409,7 +409,6 @@ MOVE=0x2c, NOP=0x3f).
 - NAT-C key layout, context byte offsets, and the indirect-register / PSRAM
   staging offsets are **driver↔model CONTRACT placeholders**, not pinned 6813
   silicon values — the proof is internally consistent but not silicon-accurate.
-- Phase 2 (L3 + NAT) not modelled.
 
 ### Files added/changed for Stage 4
 - `device-model/bcm4916_runner.c` — NAT-C table + key/cmdlist + HIT-bypass (ext).
@@ -417,3 +416,84 @@ MOVE=0x2c, NOP=0x3f).
   (offload glue) — in-tree composite `bcm4916-runner.ko`.
 - `qemu/scripts/`-style helper `offload_peer.py` + `init-offload.sh` (on
   dev-build under `~/qemu-be98/`).
+
+---
+
+## Stage 5 STATUS: DONE — **L3 route + NAT/NAPT HW flow-offload (Phase 2) proven**
+
+The Runner model now executes the **L3/NAT cmdlist** (not just VLAN edits): on a
+routed NAT-C hit it runs `decrement_8` (TTL), `replace_32` (IP SA/DA),
+`replace_16` (L4 port) and `apply_icsum_16` (IP + TCP/UDP checksum) on the frame,
+then forwards the **rewritten** frame out the egress backend with the CPU RX
+ring untouched. This is the line-rate-NAT fast path.
+
+**Result: first packet of a routed IPv4 flow MISSES → CPU; the open driver
+programs a NAT-C entry with `is_routed=1` + the NAT cmdlist; subsequent packets
+HIT → forwarded in HW with the source IP + port rewritten, TTL decremented and
+IP+TCP checksums correct, CPU bypassed.** An independent peer + `tcpdump`
+verified the rewritten 5-tuple and both checksums on the egress pcap. Full design
++ evidence: `re-notes/offload-phase2-status.md`.
+
+### What is modelled (added to `device-model/bcm4916_runner.c`)
+- `natc_compute_l3_key`: builds the IPv4 5-tuple key from a received frame (same
+  packing as the driver); RX tries the L2 key, then the L3 key.
+- `natc_run_cmdlist` extended: ADD (TTL −1), REPLACE-32 (IP NAT), REPLACE-16 (L4
+  port NAPT), ICSUM (full ones-complement recompute of IP + TCP/UDP csum incl.
+  pseudo-header). REPLACE disambiguated by the `nbytes` operand.
+- HIT-NAT path: run the NAT cmdlist + `qemu_send_packet` the rewritten frame,
+  CPU ring untouched; logs the rewritten src/port/TTL + csums.
+
+### Run (on dev-build)
+```bash
+# peer injects real IPv4/TCP frames, verifies the NAT rewrite + checksums
+PEER_DUR=40 python3 ~/qemu-be98/nat_offload_peer.py 15412 15411 nat-offload-tx.pcap &
+QEMU_BCM4916=1 ~/qemu-src/qemu-10.0.0/build/qemu-system-aarch64 \
+  -machine virt -cpu cortex-a53 -smp 4 -m 1024 \
+  -kernel ~/mainline/arch/arm64/boot/Image -initrd ~/qemu-be98/nat-offload-initramfs.cpio.gz \
+  -append "console=ttyAMA0 rdinit=/init panic=5 cma=128M be98_auto=poweroff" \
+  -netdev dgram,id=rnet,remote.type=inet,remote.host=127.0.0.1,remote.port=15412,\
+local.type=inet,local.host=127.0.0.1,local.port=15411 \
+  -nic none -nographic -no-reboot
+```
+The NAT initramfs `/init` (`init-nat-offload.sh`) brings `rnr0` up, lets the peer
+inject MISS frames, then `echo go > …/offload_nat_selftest` programs the routed
+SNAT+NAPT NAT-C entry, then the peer injects HIT frames.
+
+### Evidence (dev-build `~/qemu-be98/nat-EVIDENCE.log` / `nat-peer.log`)
+```
+NAT-C MISS -> CPU slow path, misses=1 .. 7                       # before programming
+NAT-C ADD idx=0 key=c000020ac63364141000005006000001 is_l2_accel=0 cmdlist_dlen=28
+NAT-C ADD idx=0 cmdlist=[ 68 58 08 00 60 68 00 04 cb 00 71 05   # dec-TTL, SNAT IP,
+                          d8 60 10 00 60 88 00 02 13 88         #   IP csum, NAPT port,
+                          d8 c8 10 00 fc 00 ]                   #   TCP csum, NOP
+NAT-C HIT idx=0 (routed/NAT) -> HW forward, len 71->71, hits=1 .. 4 (CPU bypassed)
+  NAT rewrite: src 203.0.113.5:5000 TTL=63  ipcsum=0x14a8 l4csum=0x4cf9
+RXP_AFTER_HIT=0                                                  # conduit CPU rx did NOT advance
+[nat-peer] RX-from-guest src=203.0.113.5:5000 dst=198.51.100.20:80 ttl=63 ipcsum=OK tcpcsum=OK NAT-VERIFIED (x4)
+[nat-peer] TOTAL from guest=4 IPv4-forwarded=4 NAT-VERIFIED=4
+# tcpdump -nr nat-offload-tx.pcap : IP 203.0.113.5.5000 > 198.51.100.20.80 ... (x4)
+```
+cmdlist decodes EXACTLY to the addIpv4Commands order (ABI §2.4a): ADD=0x1a
+(decrement_8), REPLACE=0x18 (replace_32 nbytes=4 / replace_16 nbytes=2),
+ICSUM=0x36, NOP=0x3f. The Phase-1 L2/VLAN self-test was re-run on the same build
+with no regression.
+
+### Honest gaps (Stage 5)
+- Same debugfs-vs-live-conntrack gap as Stage 4: the `FLOW_ACTION_MANGLE` +
+  routed parse is implemented + compiles, but a true conntrack-NAT flowtable
+  trigger needs `NF_FLOW_TABLE` + MASQUERADE + a 2-port routing topology not
+  hosted by the single-NIC emulation. See `re-notes/offload-phase2-status.md` §6.
+- ICSUM is modelled as a full recompute (HW does the RFC-1624 incremental delta;
+  identical on-wire result). cmdlist assumes IHL=5 (no IP options). IPv6 NAT not
+  done. Routed egress L2-MAC rewrite (next-hop) not yet emitted. CNPL stats stub.
+- 6813 context byte offsets / NAT-C key+hash remain CONTRACT placeholders
+  (UNKNOWN #1/#5); the ADD opcode value + operand bit-packing are INFER
+  (UNKNOWN #3) — driver and model agree, real silicon needs the xpe_api.o RE.
+
+### Files added/changed for Stage 5
+- `device-model/bcm4916_runner.c` — L3 5-tuple key + NAT cmdlist interpreter
+  (ADD/REPLACE-32/REPLACE-16/ICSUM) + HIT-NAT-bypass forward (ext).
+- `driver/runner/{cmdlist,flow_offload}.{c,h}` + `bcm4916_runner.{c,h}` — Phase-2
+  NAT builders, parse, routed self-test, `offload_nat_selftest` debugfs trigger.
+- `qemu/scripts/nat_offload_peer.py` + `init-nat-offload.sh` (on dev-build under
+  `~/qemu-be98/`).

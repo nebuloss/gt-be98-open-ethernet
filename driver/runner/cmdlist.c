@@ -7,19 +7,32 @@
  * proprietary cmdlist.ko code is copied; only the documented bit layout is used.
  *
  * Phase 1 implements the L2/VLAN primitives (REPLACE-bits for VLAN VID/PCP edit,
- * INSERT/DELETE for VLAN push/pop, and the NOP terminator). The Phase-2 L3/NAT
- * primitives are present as stubs so addIpv4Commands-style sequences can slot in
- * later (xrdp-offload-abi.md sec 2.4a) without restructuring.
+ * INSERT/DELETE for VLAN push/pop, and the NOP terminator).
  *
- * COMMAND WORD ENCODING (Phase 1, the bits below bit 26 are the open driver's
- * own packing of the documented operand fields - offset8 / position / width;
- * the exact stock sub-opcode bit math is UNKNOWN #3 in the ABI doc and is
- * re-derivable from xpe_api.o. The QEMU model decodes the SAME packing, so the
- * driver<->model pair is self-consistent; real silicon needs the pinned packing.)
+ * Phase 2 adds the L3/NAT primitives per the RE'd addIpv4Commands sequence
+ * (xrdp-offload-abi.md sec 2.4a): decrement_8 (TTL) -> replace_32 (IP SA/DA NAT)
+ * -> apply_icsum_16 (IP csum) -> replace_16 (L4 sport/dport NAPT) ->
+ * apply_icsum_16 (L4 csum). The opcodes used are the pinned ADD/REPLACE/ICSUM
+ * (sec 2.2). decrement_8 is encoded as ADD(-1) on an 8-bit field; the open
+ * driver's ADD opcode value is XPE_OP_ADD (see cmdlist.h) - the exact stock ADD
+ * numeric opcode is INFER in the ABI doc (sec 2.2 "ADD ~0x18 group"); the QEMU
+ * model decodes the SAME value, so the driver<->model pair is self-consistent.
+ *
+ * COMMAND WORD ENCODING (the bits below bit 26 are the open driver's own packing
+ * of the documented operand fields - offset8 / position / width; the exact stock
+ * sub-opcode bit math is UNKNOWN #3 in the ABI doc and is re-derivable from
+ * xpe_api.o. The QEMU model decodes the SAME packing, so the driver<->model pair
+ * is self-consistent; real silicon needs the pinned packing.)
  *
  *   word0 (command): [31:26]=opcode  [25:18]=offset8  [17:13]=position
  *                    [12:8]=width    [7:0]=nbytes (for insert/delete)
- *   word1 (data, when present): the 16-bit immediate (BE)
+ *   word1 (data, when present): the 16-bit immediate (BE); replace_32 emits TWO
+ *                    data words (high half then low half).
+ *
+ * ICSUM (incremental ones-complement checksum) carries no inline data: the
+ * Runner recomputes the checksum delta from the field(s) the preceding
+ * replace/decrement touched. We encode the L4 csum offset in the offset8 field
+ * so the model (and real HW) knows which checksum to fix.
  */
 
 #include <linux/kernel.h>
@@ -94,20 +107,56 @@ void xpe_cmd_end(struct xpe_cmdlist *cl)
 }
 
 /* ------------------------------------------------------------------------- *
- * Phase-2 stubs (L3/NAT). Declared so addIpv4Commands-style sequences slot in
- * later; intentionally NOT implemented in Phase 1. (xrdp-offload-abi.md 2.4a.)
+ * Phase-2 L3/NAT primitives (xrdp-offload-abi.md sec 2.4a / 2.3).
+ *
+ * Emitted in the exact stock order by xrdp_build_nat_cmdlist (flow_offload.c):
+ *   decrement_8(TTL) -> replace_32(IP SA/DA) -> apply_icsum_16(IP csum)
+ *   -> replace_16(L4 sport/dport) -> apply_icsum_16(L4 csum).
  * ------------------------------------------------------------------------- */
+
+/*
+ * ADD(-1) on an 8-bit field -> IPv4 TTL / IPv6 hop-limit decrement
+ * (xpe_cmd_decrement_8, sec 2.3). No inline data; the delta (-1) is implicit in
+ * the opcode. We use XPE_OP_ADD with width=8 to mark an 8-bit ADD field.
+ */
 void xpe_cmd_decrement_8(struct xpe_cmdlist *cl, u8 offset)
 {
-	/* Phase 2: ADD(-1) on the IPv4 TTL / IPv6 hop-limit byte. */
+	xpe_emit_cmd32(cl, xpe_pack_cmd(XPE_OP_ADD, offset, 0, 8, 0));
 }
 
+/*
+ * REPLACE a full 32-bit field with an immediate (xpe_cmd_replace_32, sec 2.3):
+ * IPv4 SA or DA rewrite for SNAT/DNAT. The command word marks a 32-bit replace
+ * (width=32 clamps to 0 in the 5-bit width field, so we set width=0 and nbytes=4
+ * to mean "4-byte replace"); the 32-bit immediate follows as TWO 16-bit BE data
+ * words (high half first, low half second).
+ */
 void xpe_cmd_replace_32(struct xpe_cmdlist *cl, u8 offset, u32 data32)
 {
-	/* Phase 2: replace a full 32-bit IP SA/DA (SNAT/DNAT). */
+	xpe_emit_cmd32(cl, xpe_pack_cmd(XPE_OP_REPLACE, offset, 0, 0, 4));
+	xpe_emit16(cl, (data32 >> 16) & 0xffff);	/* high half (BE) */
+	xpe_emit16(cl, data32 & 0xffff);		/* low  half (BE) */
 }
 
+/*
+ * REPLACE a full 16-bit field with an immediate (xpe_cmd_replace_16, sec 2.3):
+ * L4 source/destination port rewrite for NAPT. nbytes=2 marks a 2-byte replace;
+ * the 16-bit immediate follows as one BE data word.
+ */
+void xpe_cmd_replace_16(struct xpe_cmdlist *cl, u8 offset, u16 data16)
+{
+	xpe_emit_cmd32(cl, xpe_pack_cmd(XPE_OP_REPLACE, offset, 0, 0, 2));
+	xpe_emit16(cl, data16);
+}
+
+/*
+ * Incremental ones-complement checksum fixup (xpe_cmd_apply_icsum_16, sec 2.3),
+ * applied after a replace/decrement that changed a checksummed field. No inline
+ * data: the Runner recomputes the delta. 'offset' is the byte offset of the
+ * 16-bit checksum field to fix (IP header csum, or TCP/UDP csum), so the model
+ * (and real HW) knows which checksum to recompute.
+ */
 void xpe_cmd_apply_icsum_16(struct xpe_cmdlist *cl, u8 offset)
 {
-	/* Phase 2: incremental ones-complement checksum fixup after a replace. */
+	xpe_emit_cmd32(cl, xpe_pack_cmd(XPE_OP_ICSUM, offset, 0, 16, 0));
 }

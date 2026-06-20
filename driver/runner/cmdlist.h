@@ -17,9 +17,10 @@
  *     TWO length fields the context carries: cmd_list_data_length (bytes of
  *     command data) and cmd_list_length (the larger, aligned figure).
  *
- * SCOPE: Phase 1 = L2 + VLAN. The emitter primitives needed for Phase 2
- * (L3/NAT: decrement_8, replace_32, apply_icsum_16) are declared but stubbed /
- * left for Phase 2 so the structure is ready without implementing NAT now.
+ * SCOPE: Phase 1 = L2 + VLAN; Phase 2 = L3 routing + NAT/NAPT. The Phase-2
+ * emitter primitives (decrement_8 for TTL, replace_32 for IP SA/DA, replace_16
+ * for L4 port, apply_icsum_16 for IP+L4 checksum) implement the RE'd
+ * addIpv4Commands sequence (xrdp-offload-abi.md sec 2.4a).
  */
 #ifndef _BCM4916_CMDLIST_H_
 #define _BCM4916_CMDLIST_H_
@@ -34,6 +35,9 @@
 #define XPE_OP_MCOPY	0x13
 #define XPE_OP_REPLACE	0x18
 #define XPE_OP_GDMA	0x1c
+#define XPE_OP_ADD	0x1a	/* ADD immediate to a field; decrement_8 = ADD(-1).
+				 * INFER (ABI sec 2.2 "ADD ~0x18 group"); the open
+				 * driver + QEMU model agree on this value. */
 #define XPE_OP_MOVE	0x2c
 #define XPE_OP_ICSUM	0x36
 #define XPE_OP_NOP	0x3f
@@ -94,9 +98,18 @@ void xpe_cmd_delete_16(struct xpe_cmdlist *cl, u8 offset, u8 nbytes);
  */
 void xpe_cmd_end(struct xpe_cmdlist *cl);
 
-/* --- Phase-2 stubs (L3/NAT) - declared, NOT implemented in Phase 1 --- */
+/* --- Phase-2 L3/NAT emitter primitives (xrdp-offload-abi.md sec 2.4a) --- */
+
+/* ADD(-1) on an 8-bit field: IPv4 TTL / IPv6 hop-limit decrement. */
 void xpe_cmd_decrement_8(struct xpe_cmdlist *cl, u8 offset);
+
+/* REPLACE a full 32-bit field: IPv4 SA/DA rewrite (SNAT/DNAT). Two data words. */
 void xpe_cmd_replace_32(struct xpe_cmdlist *cl, u8 offset, u32 data32);
+
+/* REPLACE a full 16-bit field: L4 source/dest port rewrite (NAPT). One data word. */
+void xpe_cmd_replace_16(struct xpe_cmdlist *cl, u8 offset, u16 data16);
+
+/* Incremental ones-complement checksum fixup after a replace/decrement. */
 void xpe_cmd_apply_icsum_16(struct xpe_cmdlist *cl, u8 offset);
 
 /* --- builders --- */

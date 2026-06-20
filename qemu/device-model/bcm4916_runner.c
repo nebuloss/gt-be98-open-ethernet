@@ -106,9 +106,22 @@
 
 /* XPE opcodes (matches cmdlist.h; opcode = cmd_word >> 26) */
 #define XPE_OP_MCOPY             0x13   /* INSERT (VLAN push) */
-#define XPE_OP_REPLACE           0x18   /* REPLACE bits (VLAN edit / TPID/TCI) */
+#define XPE_OP_REPLACE           0x18   /* REPLACE bits/16/32 (VLAN edit, NAT addr/port) */
+#define XPE_OP_ADD               0x1a   /* ADD imm; decrement_8 = ADD(-1) on TTL */
 #define XPE_OP_MOVE              0x2c   /* DELETE (VLAN pop) */
+#define XPE_OP_ICSUM            0x36   /* incremental checksum fixup (IP / L4) */
 #define XPE_OP_NOP               0x3f
+
+/* context flag bits (matches flow_offload.h CTX_FLAG_*) */
+#define CTX_FLAG_IS_ROUTED       (1u << 5)
+#define CTX_FLAG_IS_NAT          (1u << 3)
+
+/* IPv4 packet byte offsets for an untagged frame (matches flow_offload.h) */
+#define L2_HLEN_M                14
+#define IP4_OFF_TTL_M            (L2_HLEN_M + 8)    /* 22 */
+#define IP4_OFF_CSUM_M           (L2_HLEN_M + 10)   /* 24 */
+#define IP4_OFF_SADDR_M          (L2_HLEN_M + 12)   /* 26 */
+#define IP4_OFF_DADDR_M          (L2_HLEN_M + 16)   /* 30 */
 
 #define NATC_MAX_ENTRIES         64
 #define VLAN_HLEN_M              4
@@ -356,6 +369,56 @@ static void natc_compute_key(const uint8_t *frame, size_t len, uint8_t key[16])
     key[15] = (vlan_in ? 1 : 0) & 0xff;   /* (vport[3:0]<<4)|present; vport 0 */
 }
 
+/*
+ * Compute the 16-byte L3 IPv4 5-tuple key from a received frame, EXACTLY as the
+ * driver's xrdp_build_key does for an is_routed flow (flow_offload.c):
+ *   w0 = ORIGINAL src IP; w1 = ORIGINAL dst IP;
+ *   w2 = sport<<16 | dport; w3 = ip_proto<<24 | vport<<4 | 0x1.
+ * The key is the ORIGINAL (ingress) tuple - the lookup runs before the cmdlist
+ * rewrites the packet. Returns false if the frame is not parseable IPv4 TCP/UDP.
+ * Assumes an untagged IPv4 frame (ethertype 0x0800 at [12:13], IHL=5).
+ */
+static bool natc_compute_l3_key(const uint8_t *frame, size_t len, uint8_t key[16])
+{
+    uint16_t ethertype;
+    uint8_t ihl, proto;
+    const uint8_t *ip, *l4;
+
+    if (len < 14 + 20) {
+        return false;
+    }
+    ethertype = (frame[12] << 8) | frame[13];
+    if (ethertype != 0x0800) {
+        return false;
+    }
+    ip = frame + L2_HLEN_M;
+    if ((ip[0] >> 4) != 4) {
+        return false;
+    }
+    ihl = (ip[0] & 0x0f) * 4;
+    proto = ip[9];
+    if (proto != 6 && proto != 17) {     /* TCP or UDP */
+        return false;
+    }
+    if (len < (size_t)(L2_HLEN_M + ihl + 4)) {
+        return false;
+    }
+    l4 = ip + ihl;
+
+    /* w0 = src IP (ip[12..15]) */
+    key[0] = ip[12]; key[1] = ip[13]; key[2] = ip[14]; key[3] = ip[15];
+    /* w1 = dst IP (ip[16..19]) */
+    key[4] = ip[16]; key[5] = ip[17]; key[6] = ip[18]; key[7] = ip[19];
+    /* w2 = sport<<16 | dport (l4[0..3]) */
+    key[8] = l4[0]; key[9] = l4[1]; key[10] = l4[2]; key[11] = l4[3];
+    /* w3 = proto<<24 | vport<<4 | 0x1  (vport=0) */
+    key[12] = proto;
+    key[13] = 0x00;
+    key[14] = 0x00;
+    key[15] = 0x01;
+    return true;
+}
+
 static int natc_lookup(Bcm4916RunnerState *s, const uint8_t key[16])
 {
     int i;
@@ -367,14 +430,118 @@ static int natc_lookup(Bcm4916RunnerState *s, const uint8_t key[16])
     return -1;
 }
 
+/* ones-complement 16-bit checksum over a byte range (for ICSUM modelling) */
+static uint16_t ones_complement_csum(const uint8_t *p, size_t n)
+{
+    uint32_t sum = 0;
+    size_t i;
+    for (i = 0; i + 1 < n; i += 2) {
+        sum += (p[i] << 8) | p[i + 1];
+    }
+    if (i < n) {
+        sum += p[i] << 8;
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    return ~sum & 0xffff;
+}
+
 /*
- * Execute the embedded XPE cmdlist (Phase-1 L2 ops) on a frame in-place,
- * returning the new length. Decodes 16-bit BE words; a command word's opcode is
- * bits[31:26]. Matches the driver's cmdlist.c packing:
+ * Recompute the IPv4 header checksum in place. csum_off is the byte offset of
+ * the 16-bit IP checksum field (IP4_OFF_CSUM_M for an untagged frame).
+ */
+static void fixup_ip_csum(uint8_t *frame, size_t len, uint8_t csum_off)
+{
+    uint8_t ip_off = csum_off - 10;     /* start of the IP header */
+    uint8_t ihl;
+    uint16_t c;
+
+    if ((size_t)(ip_off + 20) > len) {
+        return;
+    }
+    ihl = (frame[ip_off] & 0x0f) * 4;
+    if ((size_t)(ip_off + ihl) > len) {
+        return;
+    }
+    frame[csum_off] = 0;
+    frame[csum_off + 1] = 0;
+    c = ones_complement_csum(frame + ip_off, ihl);
+    frame[csum_off] = (c >> 8) & 0xff;
+    frame[csum_off + 1] = c & 0xff;
+}
+
+/*
+ * Recompute the TCP/UDP checksum in place over the pseudo-header + L4 segment.
+ * csum_off is the byte offset of the 16-bit L4 checksum field. The model assumes
+ * an untagged IPv4 frame with IHL=5 (the Phase-2 fast-path shape).
+ */
+static void fixup_l4_csum(uint8_t *frame, size_t len, uint8_t csum_off)
+{
+    uint8_t ip_off = L2_HLEN_M;
+    uint8_t ihl = (frame[ip_off] & 0x0f) * 4;
+    uint8_t proto = frame[ip_off + 9];
+    uint8_t l4_off = ip_off + ihl;
+    uint16_t l4_len;
+    uint32_t sum = 0;
+    uint16_t c;
+    size_t i;
+
+    if ((size_t)(l4_off + 4) > len) {
+        return;
+    }
+    l4_len = len - l4_off;
+
+    /* zero the checksum field before summing */
+    if ((size_t)(csum_off + 2) > len) {
+        return;
+    }
+    frame[csum_off] = 0;
+    frame[csum_off + 1] = 0;
+
+    /* pseudo-header: src IP, dst IP, zero, proto, L4 length */
+    for (i = 0; i < 4; i += 2) {
+        sum += (frame[ip_off + 12 + i] << 8) | frame[ip_off + 12 + i + 1];
+    }
+    for (i = 0; i < 4; i += 2) {
+        sum += (frame[ip_off + 16 + i] << 8) | frame[ip_off + 16 + i + 1];
+    }
+    sum += proto;
+    sum += l4_len;
+
+    /* L4 header + payload */
+    for (i = 0; i + 1 < l4_len; i += 2) {
+        sum += (frame[l4_off + i] << 8) | frame[l4_off + i + 1];
+    }
+    if (i < l4_len) {
+        sum += frame[l4_off + i] << 8;
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    c = ~sum & 0xffff;
+    /* UDP: a computed checksum of 0 is transmitted as 0xffff */
+    if (proto == 17 && c == 0) {
+        c = 0xffff;
+    }
+    frame[csum_off] = (c >> 8) & 0xff;
+    frame[csum_off + 1] = c & 0xff;
+}
+
+/*
+ * Execute the embedded XPE cmdlist on a frame in-place, returning the new
+ * length. Decodes 16-bit BE words; a command word's opcode is bits[31:26].
+ * Matches the driver's cmdlist.c packing:
  *   word0: [31:26]=opcode [25:18]=offset8 [17:13]=position [12:8]=width [7:0]=nbytes
- *   REPLACE is followed by a 16-bit data word; INSERT/DELETE are single words.
- * Supports: MCOPY=insert (VLAN push), MOVE=delete (VLAN pop), REPLACE bits
- * (TPID/TCI/VID write), NOP=terminate.
+ *
+ * Phase-1 L2: MCOPY=insert (VLAN push), MOVE=delete (VLAN pop), REPLACE-bits
+ *   (TPID/TCI/VID write; width set, nbytes=0, +1 data word), NOP=terminate.
+ * Phase-2 L3/NAT: ADD=decrement_8 (TTL -1, nbytes/width=8), REPLACE-32 (IP
+ *   SA/DA NAT; nbytes=4, +2 data words), REPLACE-16 (L4 port NAPT; nbytes=2,
+ *   +1 data word), ICSUM (recompute IP or L4 checksum at offset).
+ *
+ * REPLACE is disambiguated by nbytes: 4 => 32-bit replace, 2 => 16-bit replace,
+ * else => bit-field replace (the Phase-1 VLAN packing).
  */
 static size_t natc_run_cmdlist(const uint8_t *ctx, uint8_t *frame, size_t len)
 {
@@ -406,26 +573,60 @@ static size_t natc_run_cmdlist(const uint8_t *ctx, uint8_t *frame, size_t len)
                 len -= nbytes;
             }
             break;
-        case XPE_OP_REPLACE: { /* REPLACE bits: data16 follows */
-            uint16_t data16 = 0;
-            if (pos + 2 <= dlen) {
-                data16 = (cl[pos] << 8) | cl[pos + 1];
-                pos += 2;
-            }
-            if (width >= 16 && offset + 2 <= len) {
-                /* full 16-bit field write (TPID or TCI) */
-                frame[offset] = (data16 >> 8) & 0xff;
-                frame[offset + 1] = data16 & 0xff;
-            } else if (offset + 2 <= len) {
-                /* low 'width' bits write (e.g. VID mangle, width 12) */
-                uint16_t cur = (frame[offset] << 8) | frame[offset + 1];
-                uint16_t mask = (1u << width) - 1;
-                cur = (cur & ~mask) | (data16 & mask);
-                frame[offset] = (cur >> 8) & 0xff;
-                frame[offset + 1] = cur & 0xff;
+        case XPE_OP_ADD:    /* decrement_8: ADD(-1) on an 8-bit field (TTL) */
+            if (offset < len) {
+                frame[offset] = (uint8_t)(frame[offset] - 1);
             }
             break;
-        }
+        case XPE_OP_ICSUM:  /* recompute checksum at 'offset' (no inline data) */
+            if (offset == IP4_OFF_CSUM_M) {
+                fixup_ip_csum(frame, len, offset);
+            } else {
+                fixup_l4_csum(frame, len, offset);
+            }
+            break;
+        case XPE_OP_REPLACE:
+            if (nbytes == 4) {              /* REPLACE-32: IP SA/DA NAT */
+                uint32_t d32 = 0;
+                if (pos + 4 <= dlen) {
+                    d32 = (cl[pos] << 24) | (cl[pos + 1] << 16) |
+                          (cl[pos + 2] << 8) | cl[pos + 3];
+                    pos += 4;
+                }
+                if ((size_t)(offset + 4) <= len) {
+                    frame[offset]     = (d32 >> 24) & 0xff;
+                    frame[offset + 1] = (d32 >> 16) & 0xff;
+                    frame[offset + 2] = (d32 >> 8) & 0xff;
+                    frame[offset + 3] = d32 & 0xff;
+                }
+            } else if (nbytes == 2) {       /* REPLACE-16: L4 port NAPT */
+                uint16_t d16 = 0;
+                if (pos + 2 <= dlen) {
+                    d16 = (cl[pos] << 8) | cl[pos + 1];
+                    pos += 2;
+                }
+                if ((size_t)(offset + 2) <= len) {
+                    frame[offset]     = (d16 >> 8) & 0xff;
+                    frame[offset + 1] = d16 & 0xff;
+                }
+            } else {                        /* REPLACE-bits: VLAN edit */
+                uint16_t data16 = 0;
+                if (pos + 2 <= dlen) {
+                    data16 = (cl[pos] << 8) | cl[pos + 1];
+                    pos += 2;
+                }
+                if (width >= 16 && (size_t)(offset + 2) <= len) {
+                    frame[offset] = (data16 >> 8) & 0xff;
+                    frame[offset + 1] = data16 & 0xff;
+                } else if ((size_t)(offset + 2) <= len) {
+                    uint16_t cur = (frame[offset] << 8) | frame[offset + 1];
+                    uint16_t mask = (1u << width) - 1;
+                    cur = (cur & ~mask) | (data16 & mask);
+                    frame[offset] = (cur >> 8) & 0xff;
+                    frame[offset + 1] = cur & 0xff;
+                }
+            }
+            break;
         case XPE_OP_NOP:
         default:
             return len;  /* terminator */
@@ -536,19 +737,40 @@ static ssize_t runner_receive(NetClientState *nc, const uint8_t *buf, size_t len
     {
         uint8_t key[16];
         int hit;
+        bool routed = false;
 
+        /* Try the L2 bridge key first (Phase 1). */
         natc_compute_key(buf, len, key);
         hit = natc_lookup(s, key);
+
+        /* Then the L3 IPv4 5-tuple key (Phase 2 routed/NAT). */
+        if (hit < 0 && natc_compute_l3_key(buf, len, key)) {
+            hit = natc_lookup(s, key);
+            routed = (hit >= 0);
+        }
+
         if (hit >= 0) {
             g_autofree uint8_t *fwd = g_malloc(RX_BUF_MAX);
             size_t newlen;
+            bool is_routed_ctx =
+                !!(s->natc[hit].ctx[CTX_OFF_FLAGS] & CTX_FLAG_IS_ROUTED);
 
             memcpy(fwd, buf, len);
             newlen = natc_run_cmdlist(s->natc[hit].ctx, fwd, len);
             s->off_hits++;
-            qemu_log("bcm4916-runner: NAT-C HIT idx=%d -> HW forward (offload), "
-                     "len %zu->%zu, hits=%" PRIu64 " (CPU bypassed)\n",
-                     hit, len, newlen, s->off_hits);
+            qemu_log("bcm4916-runner: NAT-C HIT idx=%d (%s) -> HW forward "
+                     "(offload), len %zu->%zu, hits=%" PRIu64 " (CPU bypassed)\n",
+                     hit, is_routed_ctx ? "routed/NAT" : "L2",
+                     len, newlen, s->off_hits);
+            if (routed && newlen >= L2_HLEN_M + 20) {
+                qemu_log("bcm4916-runner:   NAT rewrite: src %u.%u.%u.%u:%u "
+                         "TTL=%u  ipcsum=0x%02x%02x l4csum=0x%02x%02x\n",
+                         fwd[IP4_OFF_SADDR_M], fwd[IP4_OFF_SADDR_M + 1],
+                         fwd[IP4_OFF_SADDR_M + 2], fwd[IP4_OFF_SADDR_M + 3],
+                         (fwd[34] << 8) | fwd[35], fwd[IP4_OFF_TTL_M],
+                         fwd[IP4_OFF_CSUM_M], fwd[IP4_OFF_CSUM_M + 1],
+                         fwd[50], fwd[51]);
+            }
             /* forward out the egress port; CPU RX ring untouched */
             qemu_send_packet(qemu_get_queue(s->nic), fwd, newlen);
             return len;
