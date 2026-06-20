@@ -40,17 +40,34 @@
 +#define BCM4916_RUNNER_SIZE  0x00caf004UL
 +#define BCM4916_RUNNER_Q0    75             /* GIC SPI queue0 (RX) */
 +#define BCM4916_RUNNER_FPM   107            /* GIC SPI fpm */
++/*
++ * XPORT 10G line-side blocks (serdes/MPCS/XLMAC). Real-HW bases are
++ * 0x837ff500 / 0x828c4000 / 0x837f0000, but MPCS (0x828c4000) falls INSIDE the
++ * rdpa runner window (0x82000000+0xcaf004) so we map all three at synthetic
++ * bases under the same QEMU peripheral hole as SF2/MDIO. The driver resolves
++ * them via DT phandles, so only self-consistency matters.
++ */
++#define BCM4916_SERDES_BASE  0x0aa00000
++#define BCM4916_SERDES_SIZE  0x300
++#define BCM4916_MPCS_BASE    0x0aa01000
++#define BCM4916_MPCS_SIZE    0x100
++#define BCM4916_XPORT_BASE   0x0ab00000
++#define BCM4916_XPORT_SIZE   0x8000
 +
 +static void create_bcm4916(VirtMachineState *vms)
 +{
 +    MachineState *ms = MACHINE(vms);
-+    DeviceState *sf2, *mdio, *runner;
++    DeviceState *sf2, *mdio, *runner, *xport;
 +    char *node, *mdio_node, *phy_node;
 +    uint32_t mdio_ph, phy2_ph, phy9_ph, phy21_ph;
 +    uint32_t runner_ph;
++    uint32_t serdes_ph, mpcs_ph, xport_ph;
 +    const char sf2_compat[] = "brcm,bcm4916-switch";
 +    const char mdio_compat[] = "brcm,unimac-mdio";
 +    const char runner_compat[] = "brcm,bcm4916-runner";
++    const char serdes_compat[] = "brcm,bcm4916-serdes";
++    const char mpcs_compat[] = "brcm,bcm4916-mpcs";
++    const char xport_compat[] = "brcm,bcm4916-xport";
 +
 +    if (!getenv("QEMU_BCM4916")) {
 +        return;
@@ -65,6 +82,13 @@
 +    mdio = qdev_new("bcm4916-mdio");
 +    sysbus_realize_and_unref(SYS_BUS_DEVICE(mdio), &error_fatal);
 +    sysbus_mmio_map(SYS_BUS_DEVICE(mdio), 0, BCM4916_MDIO_BASE);
++
++    /* --- XPORT 10G blocks: serdes (mmio0) + MPCS (mmio1) + XLMAC (mmio2) --- */
++    xport = qdev_new("bcm4916-xport");
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(xport), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(xport), 0, BCM4916_SERDES_BASE);
++    sysbus_mmio_map(SYS_BUS_DEVICE(xport), 1, BCM4916_MPCS_BASE);
++    sysbus_mmio_map(SYS_BUS_DEVICE(xport), 2, BCM4916_XPORT_BASE);
 +
 +    /* --- XRDP Runner CPU-conduit (DSA conduit netdev) --- */
 +    runner = qdev_new("bcm4916-runner");
@@ -146,11 +170,51 @@
 +        g_free(rnode);
 +    }
 +
++    /* --- FDT: XPORT serdes / MPCS / XLMAC nodes (referenced by the switch
++     * via brcm,serdes / brcm,mpcs / brcm,xport phandles; bcm_sf2 ioremaps
++     * them and creates the pcs-bcm-xport PCS) --- */
++    serdes_ph = qemu_fdt_alloc_phandle(ms->fdt);
++    mpcs_ph = qemu_fdt_alloc_phandle(ms->fdt);
++    xport_ph = qemu_fdt_alloc_phandle(ms->fdt);
++    {
++        char *n;
++        n = g_strdup_printf("/serdes@%x", BCM4916_SERDES_BASE);
++        qemu_fdt_add_subnode(ms->fdt, n);
++        qemu_fdt_setprop(ms->fdt, n, "compatible",
++                         serdes_compat, sizeof(serdes_compat));
++        qemu_fdt_setprop_sized_cells(ms->fdt, n, "reg",
++                                     2, BCM4916_SERDES_BASE, 2, BCM4916_SERDES_SIZE);
++        qemu_fdt_setprop_cell(ms->fdt, n, "phandle", serdes_ph);
++        g_free(n);
++
++        n = g_strdup_printf("/pcs@%x", BCM4916_MPCS_BASE);
++        qemu_fdt_add_subnode(ms->fdt, n);
++        qemu_fdt_setprop(ms->fdt, n, "compatible",
++                         mpcs_compat, sizeof(mpcs_compat));
++        qemu_fdt_setprop_sized_cells(ms->fdt, n, "reg",
++                                     2, BCM4916_MPCS_BASE, 2, BCM4916_MPCS_SIZE);
++        qemu_fdt_setprop_cell(ms->fdt, n, "phandle", mpcs_ph);
++        g_free(n);
++
++        n = g_strdup_printf("/ethernet@%x", BCM4916_XPORT_BASE);
++        qemu_fdt_add_subnode(ms->fdt, n);
++        qemu_fdt_setprop(ms->fdt, n, "compatible",
++                         xport_compat, sizeof(xport_compat));
++        qemu_fdt_setprop_sized_cells(ms->fdt, n, "reg",
++                                     2, BCM4916_XPORT_BASE, 2, BCM4916_XPORT_SIZE);
++        qemu_fdt_setprop_cell(ms->fdt, n, "phandle", xport_ph);
++        g_free(n);
++    }
++
 +    /* --- FDT: SF2 switch node with 6 reg regions + ports --- */
 +    node = g_strdup_printf("/ethernet-switch@%x", BCM4916_SF2_BASE);
 +    qemu_fdt_add_subnode(ms->fdt, node);
 +    qemu_fdt_setprop(ms->fdt, node, "compatible",
 +                     sf2_compat, sizeof(sf2_compat));
++    qemu_fdt_setprop_cell(ms->fdt, node, "brcm,serdes", serdes_ph);
++    qemu_fdt_setprop_cell(ms->fdt, node, "brcm,mpcs", mpcs_ph);
++    qemu_fdt_setprop_cell(ms->fdt, node, "brcm,xport", xport_ph);
++    qemu_fdt_setprop(ms->fdt, node, "brcm,runner-emulated", NULL, 0);
 +    {
 +        uint64_t b = BCM4916_SF2_BASE;
 +        qemu_fdt_setprop_sized_cells(ms->fdt, node, "reg",
@@ -187,13 +251,32 @@
 +        qemu_fdt_setprop_cell(ms->fdt, port, "phy-handle", phy2_ph);
 +        g_free(port);
 +
-+        /* port@5 -> eth0 external 10G @ mdio addr 9 */
++        /* port@5 -> eth0 external 10G copper @ mdio addr 9 (c45 BCM84891) */
 +        port = g_strdup_printf("%s/port@5", ports);
 +        qemu_fdt_add_subnode(ms->fdt, port);
 +        qemu_fdt_setprop_cell(ms->fdt, port, "reg", 5);
 +        qemu_fdt_setprop_string(ms->fdt, port, "label", "eth0");
 +        qemu_fdt_setprop_string(ms->fdt, port, "phy-mode", "gmii");
 +        qemu_fdt_setprop_cell(ms->fdt, port, "phy-handle", phy9_ph);
++        g_free(port);
++
++        /*
++         * port@6 -> eth1: XPORT 10GBASE-R fixed-link. No addressable PHY;
++         * the link comes from the pcs-bcm-xport PCS (serdes+MPCS) selected by
++         * bcm_sf2 .mac_select_pcs. This is the 10G-via-PCS demonstration port.
++         */
++        port = g_strdup_printf("%s/port@6", ports);
++        qemu_fdt_add_subnode(ms->fdt, port);
++        qemu_fdt_setprop_cell(ms->fdt, port, "reg", 6);
++        qemu_fdt_setprop_string(ms->fdt, port, "label", "eth1");
++        qemu_fdt_setprop_string(ms->fdt, port, "phy-mode", "10gbase-r");
++        {
++            char *fl6 = g_strdup_printf("%s/fixed-link", port);
++            qemu_fdt_add_subnode(ms->fdt, fl6);
++            qemu_fdt_setprop_cell(ms->fdt, fl6, "speed", 10000);
++            qemu_fdt_setprop(ms->fdt, fl6, "full-duplex", NULL, 0);
++            g_free(fl6);
++        }
 +        g_free(port);
 +
 +        /* port@7 -> RGMII (satisfies bcm_sf2 BCM4908 crossbar_setup) */

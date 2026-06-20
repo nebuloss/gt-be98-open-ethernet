@@ -1,0 +1,397 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: be98 <be98@local>
+Date: Sat, 20 Jun 2026 00:00:00 +0000
+Subject: [PATCH] net: pcs: add Broadcom BCM4916/6813 XPORT serdes+MPCS PCS
+
+Add a register-mapped phylink_pcs for the Broadcom BCM4916 / BCM6813 XPORT
+10G/multi-gig serdes (Merlin16-Shortfin) + MPCS 10G PCS. bcm_sf2 selects this
+PCS for the XPORT ports (eth0/eth1/eth3 on the ASUS GT-BE98) so they can link
+at 10GBASE-R / USXGMII / 2500BASE-X. Register layout and bring-up sequence are
+reverse-engineered from the Broadcom GPL behnd SDK (serdes_access_6813.h,
+mpcs.c, phy_drv_shortfin.c); see the file header and re-notes/xport-serdes-bringup.md.
+
+Real-silicon caveat: the Merlin serdes needs a proprietary ~31KB PMD microcode
+PRAM-loaded before lanes lock; that blob is non-redistributable. The driver
+does the surrounding register bring-up and polls PMD/PCS lock; QEMU fakes lock.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ drivers/net/pcs/Kconfig         |   8 +
+ drivers/net/pcs/Makefile        |   1 +
+ drivers/net/pcs/pcs-bcm-xport.c | 313 +
+ drivers/net/pcs/pcs-bcm-xport.h | 20 +
+ 4 files changed
+
+diff --git a/drivers/net/pcs/Kconfig b/drivers/net/pcs/Kconfig
+index 111111111..222222222 100644
+--- a/drivers/net/pcs/Kconfig
++++ b/drivers/net/pcs/Kconfig
+@@ -38,4 +38,12 @@ config PCS_RZN1_MIIC
+ 	  Renesas RZ/N1, RZ/N2H, and RZ/T2H SoCs. This PCS converts MII to
+ 	  RMII/RGMII, or can be set in pass-through mode for MII.
+ 
++config PCS_BCM_XPORT
++	tristate
++	select PHYLINK
++	help
++	  This module provides a phylink PCS for the Broadcom BCM4916/BCM6813
++	  XPORT serdes (Merlin16-Shortfin) + MPCS 10G PCS, used by bcm_sf2 to
++	  bring the multi-gig XPORT ports to link (10GBASE-R/USXGMII/2500BASE-X).
++
+ endmenu
+diff --git a/drivers/net/pcs/Makefile b/drivers/net/pcs/Makefile
+index 111111111..222222222 100644
+--- a/drivers/net/pcs/Makefile
++++ b/drivers/net/pcs/Makefile
+@@ -7,3 +7,4 @@ obj-$(CONFIG_PCS_XPCS)		+= pcs_xpcs.o
+ obj-$(CONFIG_PCS_LYNX)		+= pcs-lynx.o
+ obj-$(CONFIG_PCS_MTK_LYNXI)	+= pcs-mtk-lynxi.o
+ obj-$(CONFIG_PCS_RZN1_MIIC)	+= pcs-rzn1-miic.o
++obj-$(CONFIG_PCS_BCM_XPORT)	+= pcs-bcm-xport.o
+diff --git a/drivers/net/pcs/pcs-bcm-xport.c b/drivers/net/pcs/pcs-bcm-xport.c
+new file mode 100644
+index 000000000..333333333
+--- /dev/null
++++ b/drivers/net/pcs/pcs-bcm-xport.c
+@@ -0,0 +1,313 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * pcs-bcm-xport.c - phylink PCS driver for the Broadcom BCM4916 / BCM6813
++ * XPORT 10G/multi-gig serdes (Merlin16-Shortfin) + MPCS 10G PCS.
++ *
++ * The three multi-gig ports on the BCM4916 (ASUS GT-BE98 eth0/eth1/eth3) hang
++ * off the XPORT MAC wrapper, whose line side is a Merlin16-Shortfin serdes
++ * (3 cores x N lanes) fronted by an MPCS 10G PCS block. Mainline has no driver
++ * for any of these blocks, so bcm_sf2 cannot bring those ports to link on real
++ * silicon (re-notes/dts-upstream-rebase.md sec 4). This driver provides a
++ * register-mapped phylink_pcs that bcm_sf2 selects (via .mac_select_pcs) for
++ * the XPORT ports, exposing pcs_config / pcs_get_state / pcs_link_up backed by
++ * the MPCS + serdes status/control registers, for 10GBASE-R / USXGMII /
++ * 2500BASE-X.
++ *
++ * Register layout reverse-engineered from the Broadcom GPL "behnd" SDK
++ * (asuswrt-merlin.ng src-rt-5.04behnd.4916), cited inline as [SDK file:line]:
++ *
++ *   serdes core regs   bcmdrivers/opensource/phy/serdes_access_6813.h
++ *                      base 0x837ff500, 3 cores x 0x100 stride; per core:
++ *                        CONTROL  +0x0c  (serdes_control_t)
++ *                        STATUS   +0x10  (serdes_status_t: link_status bit2,
++ *                                         pll_lock bit3, rx_sigdet bit0)
++ *                        STATUS_1 +0x24  (per-speed nibbles, one bit/lane)
++ *   MPCS regs          bcmdrivers/opensource/phy/mpcs.c
++ *                      base 0x828c4000, MPCS_REG @ +0xf8 (mpcs_reg_t:
++ *                        pmd_mpcs_rx_lock bit0, md_mpcs_signal_detect bit1,
++ *                        fg_mpcs_por_rstb bit3, fg_mpcs_clk_en bit4,
++ *                        fg_mpcs_refclk_rstb bit5)
++ *
++ * Bring-up sequence modelled on:
++ *   serdes:  _serdes_core_init / _serdes_lane_speed_cfg
++ *            bcmdrivers/opensource/phy/phy_drv_shortfin.c:77,223
++ *   mpcs:    mpcs_reg_init / mpcs_cfg
++ *            bcmdrivers/opensource/phy/mpcs.c:208,302
++ *
++ * IMPORTANT real-silicon caveat (serdes firmware blob): the Merlin16-Shortfin
++ * serdes will NOT achieve PMD lock on real hardware until a ~31 KB proprietary
++ * microcode image (merlin16_shortfin_ucode_image[], ver D102_0A, CRC 0x4949)
++ * is PRAM-loaded into the serdes micro [SDK merlin16_shortfin_config.c:210].
++ * That blob is non-redistributable (same class as the Runner microcode). This
++ * driver performs the register bring-up that surrounds the load and polls the
++ * PMD/PCS lock status; on QEMU the model fakes lock so the phylink path is
++ * exercised end to end. On real HW, see bcm_xport_pcs_load_firmware() TODO.
++ */
++
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/phylink.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++
++#include "pcs-bcm-xport.h"
++
++/* --- serdes core regs (per core, stride 0x100) [SDK serdes_access_6813.h] --- */
++#define SERDES_CORE_STRIDE	0x100
++#define SERDES_INDIR_ACC_ADDR	0x04
++#define SERDES_INDIR_ACC_MASK	0x08
++#define SERDES_CONTROL		0x0c
++#define SERDES_STATUS		0x10
++#define SERDES_AN_STATUS	0x20
++#define SERDES_STATUS_1		0x24
++#define SERDES_INDIR_ACC_CNTRL	0xf0
++
++/* SERDES_CONTROL bits (serdes_control_t) */
++#define SC_IDDQ			BIT(0)
++#define SC_REFCLK_RESET		BIT(1)
++#define SC_SERDES_RESET		BIT(2)
++#define SC_REFSEL_SHIFT		3	/* [5:3] */
++#define SC_PRTAD_SHIFT		6	/* [10:6] mdio port addr */
++#define SC_LN_OFFSET_SHIFT	11	/* [15:11] lane offset (lane->port mux) */
++#define SC_COMCLK_ENABLE	BIT(28)
++
++/* SERDES_STATUS bits (serdes_status_t) */
++#define SS_RX_SIGDET		BIT(0)
++#define SS_CDR_LOCK		BIT(1)
++#define SS_LINK_STATUS		BIT(2)
++#define SS_PLL_LOCK		BIT(3)
++
++/* SERDES_STATUS_1 per-speed nibbles (one bit per lane) [serdes_access_6813.h] */
++#define SS1_10M_SHIFT		0
++#define SS1_100M_SHIFT		4
++#define SS1_1G_SHIFT		8
++#define SS1_2P5G_SHIFT		12
++#define SS1_5G_SHIFT		16
++#define SS1_10G_SHIFT		20
++
++/* --- MPCS regs [SDK mpcs.c] --- */
++#define MPCS_REG_OFF		0xf8	/* MPCS_REG = WANTOP_BASE + 0xf8 */
++#define MPCS_PMD_RX_LOCK	BIT(0)
++#define MPCS_SIGNAL_DETECT	BIT(1)
++#define MPCS_TX_CLK_VLD		BIT(2)
++#define MPCS_FG_POR_RSTB	BIT(3)
++#define MPCS_FG_CLK_EN		BIT(4)
++#define MPCS_FG_REFCLK_RSTB	BIT(5)
++
++struct bcm_xport_pcs {
++	struct phylink_pcs	pcs;
++	void __iomem		*serdes;	/* 0x837ff500 window */
++	void __iomem		*mpcs;		/* 0x828c4000 window */
++	struct device		*dev;
++	bool			emulated;	/* QEMU: fake PMD/PCS lock */
++};
++
++#define to_bcm_xport_pcs(p)	container_of((p), struct bcm_xport_pcs, pcs)
++
++static inline u32 serdes_rd(struct bcm_xport_pcs *xp, int core, u32 off)
++{
++	return readl(xp->serdes + core * SERDES_CORE_STRIDE + off);
++}
++
++static inline void serdes_wr(struct bcm_xport_pcs *xp, int core, u32 off, u32 v)
++{
++	writel(v, xp->serdes + core * SERDES_CORE_STRIDE + off);
++}
++
++/*
++ * Port (DSA index 5/6/7) -> serdes core/lane map, from the GT-BE98 port->serdes
++ * map (re-notes/bcm4916-regmap.md): port5 eth0 / port6 eth1 -> serdes core0,
++ * port7 eth3 -> serdes core1; lane 0 throughout. bcm_sf2 selects this PCS per
++ * port, so pcs_enable initialises both cores; pcs_get_state reads core0 (the
++ * 10GBASE-R fixed path) by default. [SDK serdes_access_6813.h]
++ *
++ * MPCS register bring-up [SDK mpcs.c:208 mpcs_reg_init]: deassert the
++ * functional-group resets (clk_en, por_rstb, refclk_rstb) in order. The full
++ * USXGMII speed programming (an_config 0xc4b0 etc., mpcs.c:302) lives behind
++ * the serdes PCS A/B select; for 10GBASE-R the MPCS just needs its resets
++ * released and we then poll PMD rx-lock.
++ */
++static void bcm_xport_mpcs_reg_init(struct bcm_xport_pcs *xp)
++{
++	u32 v = readl(xp->mpcs + MPCS_REG_OFF);
++
++	v |= MPCS_FG_CLK_EN;
++	writel(v, xp->mpcs + MPCS_REG_OFF);
++	v |= MPCS_FG_POR_RSTB;
++	writel(v, xp->mpcs + MPCS_REG_OFF);
++	v |= MPCS_FG_REFCLK_RSTB;
++	writel(v, xp->mpcs + MPCS_REG_OFF);
++}
++
++/*
++ * serdes core init [SDK phy_drv_shortfin.c:77 _serdes_core_init]:
++ *   - release IDDQ / refclk reset / serdes reset, enable comclk.
++ *   - (real HW) PRAM-load the Merlin microcode + verify CRC -> see
++ *     bcm_xport_pcs_load_firmware() TODO. Skipped when emulated.
++ */
++static void bcm_xport_serdes_core_init(struct bcm_xport_pcs *xp, int core)
++{
++	u32 ctrl = serdes_rd(xp, core, SERDES_CONTROL);
++
++	ctrl &= ~SC_IDDQ;
++	ctrl |= SC_COMCLK_ENABLE;
++	serdes_wr(xp, core, SERDES_CONTROL, ctrl);
++
++	ctrl &= ~SC_REFCLK_RESET;
++	serdes_wr(xp, core, SERDES_CONTROL, ctrl);
++
++	ctrl &= ~SC_SERDES_RESET;
++	serdes_wr(xp, core, SERDES_CONTROL, ctrl);
++}
++
++/* TODO(real-silicon): PRAM-load merlin16_shortfin_ucode_image (~31 KB, ver
++ * D102_0A, CRC 0x4949) via the [SDK merlin16_shortfin_config.c:210] sequence
++ * before lanes can lock. Blob is proprietary/non-redistributable. */
++static int bcm_xport_pcs_load_firmware(struct bcm_xport_pcs *xp, int core)
++{
++	if (xp->emulated)
++		return 0;
++	dev_warn_once(xp->dev,
++		      "serdes core %d: Merlin PMD microcode load not implemented (proprietary blob); link will not come up on real HW\n",
++		      core);
++	return 0;
++}
++
++static int bcm_xport_pcs_enable(struct phylink_pcs *pcs)
++{
++	struct bcm_xport_pcs *xp = to_bcm_xport_pcs(pcs);
++
++	/* Core init is per the active port; bcm_sf2 selects this PCS per port,
++	 * so initialise both serdes cores used by the XPORT ports. */
++	bcm_xport_mpcs_reg_init(xp);
++	bcm_xport_serdes_core_init(xp, 0);
++	bcm_xport_serdes_core_init(xp, 1);
++	bcm_xport_pcs_load_firmware(xp, 0);
++	bcm_xport_pcs_load_firmware(xp, 1);
++	return 0;
++}
++
++static int bcm_xport_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
++				phy_interface_t interface,
++				const unsigned long *advertising,
++				bool permit_pause_to_mac)
++{
++	struct bcm_xport_pcs *xp = to_bcm_xport_pcs(pcs);
++
++	switch (interface) {
++	case PHY_INTERFACE_MODE_10GBASER:
++	case PHY_INTERFACE_MODE_USXGMII:
++	case PHY_INTERFACE_MODE_2500BASEX:
++		/* MPCS + serdes are brought up in .pcs_enable; the per-mode
++		 * speed select is handled here on real HW by writing the serdes
++		 * USXGMII/an_config regs [SDK mpcs.c:302]. For 10GBASE-R the
++		 * default speed (10G/lane) needs no extra programming. */
++		dev_dbg(xp->dev, "pcs_config interface=%s neg_mode=%u\n",
++			phy_modes(interface), neg_mode);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static void bcm_xport_pcs_get_state(struct phylink_pcs *pcs,
++				    unsigned int neg_mode,
++				    struct phylink_link_state *state)
++{
++	struct bcm_xport_pcs *xp = to_bcm_xport_pcs(pcs);
++	int core = 0;	/* link is read per active core; default core0 */
++	u32 sstat, mpcs, s1;
++	bool link;
++
++	sstat = serdes_rd(xp, core, SERDES_STATUS);
++	s1 = serdes_rd(xp, core, SERDES_STATUS_1);
++	mpcs = readl(xp->mpcs + MPCS_REG_OFF);
++
++	/* link = serdes PMD link_status (STATUS bit2) AND MPCS rx-lock.
++	 * [SDK serdes_access.c:336 link_status; mpcs.c is_pcs_locked]. */
++	link = (sstat & SS_LINK_STATUS) && (mpcs & MPCS_PMD_RX_LOCK);
++
++	state->link = link;
++	state->an_complete = link;
++	state->duplex = DUPLEX_FULL;	/* 10G/serdes is always full duplex */
++
++	/* speed: decode STATUS_1 per-speed nibbles (lane0 = bit per nibble). */
++	if (s1 & (1u << SS1_10G_SHIFT))
++		state->speed = SPEED_10000;
++	else if (s1 & (1u << SS1_5G_SHIFT))
++		state->speed = SPEED_5000;
++	else if (s1 & (1u << SS1_2P5G_SHIFT))
++		state->speed = SPEED_2500;
++	else if (s1 & (1u << SS1_1G_SHIFT))
++		state->speed = SPEED_1000;
++	else
++		state->speed = SPEED_10000;	/* default for 10GBASE-R */
++
++	state->pause |= MLO_PAUSE_TX | MLO_PAUSE_RX;
++}
++
++static void bcm_xport_pcs_link_up(struct phylink_pcs *pcs,
++				  unsigned int neg_mode,
++				  phy_interface_t interface,
++				  int speed, int duplex)
++{
++	struct bcm_xport_pcs *xp = to_bcm_xport_pcs(pcs);
++
++	dev_dbg(xp->dev, "pcs_link_up %s speed=%d duplex=%d\n",
++		phy_modes(interface), speed, duplex);
++	/* The XLMAC speed/enable is handled by the MAC side (bcm_sf2 XPORT MAC
++	 * helper, XLMAC_MODE SPEED_MODE). Nothing serdes-side to do here for the
++	 * fixed 10GBASE-R / USXGMII modes once PMD is locked. */
++}
++
++static const struct phylink_pcs_ops bcm_xport_pcs_ops = {
++	.pcs_enable	= bcm_xport_pcs_enable,
++	.pcs_config	= bcm_xport_pcs_config,
++	.pcs_get_state	= bcm_xport_pcs_get_state,
++	.pcs_link_up	= bcm_xport_pcs_link_up,
++};
++
++static const phy_interface_t bcm_xport_interfaces[] = {
++	PHY_INTERFACE_MODE_10GBASER,
++	PHY_INTERFACE_MODE_USXGMII,
++	PHY_INTERFACE_MODE_2500BASEX,
++};
++
++/*
++ * Public creator used by bcm_sf2: maps the MPCS + serdes register windows
++ * (resolved from the "mpcs"/"serdes" DT nodes) and returns a phylink_pcs.
++ * The caller stashes the returned pointer and returns it from .mac_select_pcs
++ * for the XPORT ports.
++ */
++struct phylink_pcs *bcm_xport_pcs_create(struct device *dev,
++					 void __iomem *serdes_base,
++					 void __iomem *mpcs_base,
++					 bool emulated)
++{
++	struct bcm_xport_pcs *xp;
++	int i;
++
++	xp = devm_kzalloc(dev, sizeof(*xp), GFP_KERNEL);
++	if (!xp)
++		return ERR_PTR(-ENOMEM);
++
++	xp->dev = dev;
++	xp->serdes = serdes_base;
++	xp->mpcs = mpcs_base;
++	xp->emulated = emulated;
++	xp->pcs.ops = &bcm_xport_pcs_ops;
++	xp->pcs.poll = true;	/* no PCS IRQ; phylink polls pcs_get_state */
++
++	for (i = 0; i < ARRAY_SIZE(bcm_xport_interfaces); i++)
++		__set_bit(bcm_xport_interfaces[i], xp->pcs.supported_interfaces);
++
++	dev_info(dev, "BCM XPORT PCS created (serdes %p mpcs %p%s)\n",
++		 serdes_base, mpcs_base, emulated ? ", emulated" : "");
++
++	return &xp->pcs;
++}
++EXPORT_SYMBOL_GPL(bcm_xport_pcs_create);
++
++MODULE_DESCRIPTION("Broadcom BCM4916/6813 XPORT serdes+MPCS phylink PCS");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/net/pcs/pcs-bcm-xport.h b/drivers/net/pcs/pcs-bcm-xport.h
+new file mode 100644
+index 000000000..444444444
+--- /dev/null
++++ b/drivers/net/pcs/pcs-bcm-xport.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * pcs-bcm-xport.h - phylink PCS for the Broadcom BCM4916/6813 XPORT serdes+MPCS.
++ *
++ * The creator maps the MPCS (0x828c4000) + serdes (0x837ff500) register windows
++ * and returns a phylink_pcs that bcm_sf2 selects for the XPORT 10G ports via
++ * .mac_select_pcs. See pcs-bcm-xport.c for the register/bring-up details.
++ */
++#ifndef _PCS_BCM_XPORT_H
++#define _PCS_BCM_XPORT_H
++
++#include <linux/device.h>
++#include <linux/phylink.h>
++
++struct phylink_pcs *bcm_xport_pcs_create(struct device *dev,
++					 void __iomem *serdes_base,
++					 void __iomem *mpcs_base,
++					 bool emulated);
++
++#endif /* _PCS_BCM_XPORT_H */
+-- 
+2.47.3

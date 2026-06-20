@@ -524,6 +524,227 @@ static void bcm4916_mdio_class_init(ObjectClass *klass, void *data)
 }
 
 /* ------------------------------------------------------------------ */
+/* XPORT 10G blocks: XLMAC MAC + MPCS 10G PCS + Merlin serdes             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Models enough of the BCM4916/6813 XPORT line-side register blocks that the
+ * mainline phylink PCS (drivers/net/pcs/pcs-bcm-xport.c) + the bcm_sf2 XPORT
+ * MAC helper (patch 0005) probe, bring the serdes/MPCS "up", and report a 10G
+ * link for the XPORT ports (eth0/eth1/eth3). Register offsets/bitfields match
+ * the driver, RE'd from the Broadcom GPL behnd SDK:
+ *   serdes  0x837ff500 (3 cores x 0x100)   serdes_access_6813.h
+ *             CONTROL +0x0c, STATUS +0x10 (link bit2/pll bit3/sigdet bit0),
+ *             STATUS_1 +0x24 (per-speed nibbles; 10G nibble @ bit20)
+ *   mpcs    0x828c4000                       mpcs.c (MPCS_REG @ +0xf8:
+ *             pmd_rx_lock bit0, signal_detect bit1, fg_* resets bits3..5)
+ *   xport   0x837f0000 (XLMAC cores)         XPORT_AG.h (CTRL +0x00 / MODE +0x08)
+ *
+ * "Link" model: the serdes reports PMD link + 10G speed and the MPCS reports
+ * rx-lock once their reset/clk-enable bits have been written by the driver
+ * (.pcs_enable), faking the proprietary Merlin PMD microcode lock. This lets
+ * the whole phylink path run end to end under QEMU.
+ */
+
+/* serdes (per core, stride 0x100) */
+#define SERDES_CORE_STRIDE      0x100
+#define SERDES_CONTROL          0x0c
+#define SERDES_STATUS           0x10
+#define SERDES_STATUS_1         0x24
+#define  SS_RX_SIGDET           (1u << 0)
+#define  SS_LINK_STATUS         (1u << 2)
+#define  SS_PLL_LOCK            (1u << 3)
+#define  SC_SERDES_RESET        (1u << 2)
+#define  SS1_10G_SHIFT          20
+#define SERDES_WINDOW           0x300
+
+/* mpcs */
+#define MPCS_REG_OFF            0xf8
+#define  MPCS_PMD_RX_LOCK       (1u << 0)
+#define  MPCS_SIGNAL_DETECT     (1u << 1)
+#define  MPCS_FG_POR_RSTB       (1u << 3)
+#define  MPCS_FG_CLK_EN         (1u << 4)
+#define  MPCS_FG_REFCLK_RSTB    (1u << 5)
+#define  MPCS_FG_RESET_MASK     (MPCS_FG_CLK_EN | MPCS_FG_POR_RSTB | \
+                                 MPCS_FG_REFCLK_RSTB)
+#define MPCS_WINDOW             0x100
+
+/* xport / XLMAC */
+#define XPORT_WINDOW            0x8000
+
+#define TYPE_BCM4916_XPORT "bcm4916-xport"
+OBJECT_DECLARE_SIMPLE_TYPE(Bcm4916XportState, BCM4916_XPORT)
+
+struct Bcm4916XportState {
+    SysBusDevice parent_obj;
+    MemoryRegion serdes_io;     /* 0x837ff500 */
+    MemoryRegion mpcs_io;       /* 0x828c4000 */
+    MemoryRegion xport_io;      /* 0x837f0000 */
+    /* serdes per-core CONTROL latch (drives the "link" model) */
+    uint32_t serdes_ctrl[3];
+    uint32_t mpcs_reg;          /* MPCS_REG latch */
+    uint32_t xlmac[XPORT_WINDOW / 4];   /* sparse XLMAC reg file */
+};
+
+/* serdes window */
+static uint64_t serdes_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Bcm4916XportState *s = opaque;
+    int core = addr / SERDES_CORE_STRIDE;
+    hwaddr off = addr % SERDES_CORE_STRIDE;
+
+    if (core >= 3) {
+        return 0;
+    }
+    switch (off) {
+    case SERDES_CONTROL:
+        return s->serdes_ctrl[core];
+    case SERDES_STATUS:
+        /* Report PMD link + PLL lock + sigdet once the driver has released
+         * SERDES_RESET (SC_SERDES_RESET cleared) in CONTROL. */
+        if (!(s->serdes_ctrl[core] & SC_SERDES_RESET)) {
+            return SS_LINK_STATUS | SS_PLL_LOCK | SS_RX_SIGDET;
+        }
+        return 0;
+    case SERDES_STATUS_1:
+        /* lane0 at 10G once linked */
+        if (!(s->serdes_ctrl[core] & SC_SERDES_RESET)) {
+            return 1u << SS1_10G_SHIFT;
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static void serdes_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    Bcm4916XportState *s = opaque;
+    int core = addr / SERDES_CORE_STRIDE;
+    hwaddr off = addr % SERDES_CORE_STRIDE;
+
+    if (core < 3 && off == SERDES_CONTROL) {
+        s->serdes_ctrl[core] = val;
+    }
+}
+
+static const MemoryRegionOps serdes_ops = {
+    .read = serdes_read,
+    .write = serdes_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
+/* mpcs window */
+static uint64_t mpcs_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Bcm4916XportState *s = opaque;
+
+    if (addr == MPCS_REG_OFF) {
+        /* Report PMD rx-lock + signal detect once the driver released the
+         * functional-group resets (clk_en/por_rstb/refclk_rstb). */
+        if ((s->mpcs_reg & MPCS_FG_RESET_MASK) == MPCS_FG_RESET_MASK) {
+            return s->mpcs_reg | MPCS_PMD_RX_LOCK | MPCS_SIGNAL_DETECT;
+        }
+        return s->mpcs_reg;
+    }
+    return 0;
+}
+
+static void mpcs_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    Bcm4916XportState *s = opaque;
+
+    if (addr == MPCS_REG_OFF) {
+        s->mpcs_reg = val;
+    }
+}
+
+static const MemoryRegionOps mpcs_ops = {
+    .read = mpcs_read,
+    .write = mpcs_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
+/* xport / XLMAC window: plain read/write-back register file */
+static uint64_t xport_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Bcm4916XportState *s = opaque;
+    if (addr < XPORT_WINDOW) {
+        return s->xlmac[addr / 4];
+    }
+    return 0;
+}
+
+static void xport_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    Bcm4916XportState *s = opaque;
+    if (addr < XPORT_WINDOW) {
+        s->xlmac[addr / 4] = val;
+    }
+}
+
+static const MemoryRegionOps xport_ops = {
+    .read = xport_read,
+    .write = xport_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+};
+
+static void bcm4916_xport_reset(DeviceState *dev)
+{
+    Bcm4916XportState *s = BCM4916_XPORT(dev);
+    int i;
+    for (i = 0; i < 3; i++) {
+        s->serdes_ctrl[i] = SC_SERDES_RESET;   /* held in reset until driver */
+    }
+    s->mpcs_reg = 0;
+    memset(s->xlmac, 0, sizeof(s->xlmac));
+}
+
+static void bcm4916_xport_init(Object *obj)
+{
+    Bcm4916XportState *s = BCM4916_XPORT(obj);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+
+    memory_region_init_io(&s->serdes_io, obj, &serdes_ops, s,
+                          "bcm4916-serdes", SERDES_WINDOW);
+    memory_region_init_io(&s->mpcs_io, obj, &mpcs_ops, s,
+                          "bcm4916-mpcs", MPCS_WINDOW);
+    memory_region_init_io(&s->xport_io, obj, &xport_ops, s,
+                          "bcm4916-xport", XPORT_WINDOW);
+    sysbus_init_mmio(sbd, &s->serdes_io);    /* mmio 0 */
+    sysbus_init_mmio(sbd, &s->mpcs_io);      /* mmio 1 */
+    sysbus_init_mmio(sbd, &s->xport_io);     /* mmio 2 */
+}
+
+static const VMStateDescription vmstate_bcm4916_xport = {
+    .name = TYPE_BCM4916_XPORT,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(serdes_ctrl, Bcm4916XportState, 3),
+        VMSTATE_UINT32(mpcs_reg, Bcm4916XportState),
+        VMSTATE_UINT32_ARRAY(xlmac, Bcm4916XportState, XPORT_WINDOW / 4),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static void bcm4916_xport_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->desc = "BCM4916 XPORT serdes+MPCS+XLMAC 10G blocks";
+    dc->vmsd = &vmstate_bcm4916_xport;
+    device_class_set_legacy_reset(dc, bcm4916_xport_reset);
+}
+
+/* ------------------------------------------------------------------ */
 
 static const TypeInfo bcm4916_types[] = {
     {
@@ -539,6 +760,13 @@ static const TypeInfo bcm4916_types[] = {
         .instance_size = sizeof(Bcm4916MdioState),
         .instance_init = bcm4916_mdio_realize_init,
         .class_init    = bcm4916_mdio_class_init,
+    },
+    {
+        .name          = TYPE_BCM4916_XPORT,
+        .parent        = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(Bcm4916XportState),
+        .instance_init = bcm4916_xport_init,
+        .class_init    = bcm4916_xport_class_init,
     },
 };
 

@@ -31,6 +31,43 @@ Interactive (no timeout): `~/.../qemu/scripts/run-virt-baseline.sh` then
 
 ---
 
+## Stage 4 STATUS: DONE — XPORT port links at **10Gbps/Full** via the open serdes PCS
+
+The XPORT 10G/multi-gig blocks (serdes `0x837ff500` + MPCS `0x828c4000` + XLMAC
+`0x837f0000`) are now modelled by `TYPE_BCM4916_XPORT` in `device-model/
+bcm4916_sf2.c` (three MMIO regions matching exactly the regs the drivers touch;
+the serdes/MPCS report PMD/PCS lock once the driver releases their resets,
+faking the proprietary Merlin PMD microcode). `create_bcm4916()` maps it at
+synthetic bases, emits the `brcm,bcm4916-{serdes,mpcs,xport}` FDT nodes, wires
+the `brcm,serdes`/`brcm,mpcs`/`brcm,xport` phandles onto the switch node, and
+adds a `port@6` (eth1) 10GBASE-R fixed-link demo port.
+
+With `driver/mainline-patches/0005`+`0006` and `driver/pcs/pcs-bcm-xport.c`,
+booting the patched kernel and bringing the conduit + eth1 up:
+```
+brcm-sf2 a800000.ethernet-switch: BCM XPORT PCS created (serdes .. mpcs .., emulated)
+brcm-sf2 a800000.ethernet-switch eth1: configuring for fixed/10gbase-r link mode
+brcm-sf2 a800000.ethernet-switch eth1: Link is Up - 10Gbps/Full - flow control off
+# sysfs: eth1 speed=10000
+```
+i.e. an XPORT port reaches **10G link** through phylink → `bcm_sf2.mac_select_pcs`
+→ `pcs-bcm-xport` (serdes+MPCS `pcs_get_state`) → `bcm_sf2_xport_mac_enable`
+(XLMAC). Previously only eth2 (1G UNIMAC) could link. Run command (note the
+`cma=64M` for the runner FPM pool and `-m 1024` so the rdpa window doesn't
+collide with `virt` RAM):
+```bash
+QEMU_BCM4916=1 ~/qemu-src/qemu-10.0.0/build/qemu-system-aarch64 \
+  -machine virt -cpu cortex-a53 -smp 4 -m 1024 \
+  -kernel ~/mainline/arch/arm64/boot/Image -initrd ~/qemu-be98/initramfs.cpio.gz \
+  -append 'console=ttyAMA0 rdinit=/init panic=5 loglevel=8 cma=64M be98_auto=poweroff' \
+  -nographic -no-reboot
+# then in the guest: ip link set rnr0 up; ip link set eth1 up
+```
+Honest gap: QEMU fakes the serdes PMD lock; real silicon needs the
+non-redistributable ~31 KB Merlin microcode (see `re-notes/xport-serdes-bringup.md`
+sec 4/7). This proves bind + phylink-select + PCS state machine + MAC enable +
+10G link *state*, not silicon analog/AN.
+
 ## Stage 2 STATUS: DONE — DSA probe binds as **BCM4916** + EGPHY driver match
 
 A custom `qemu-system-aarch64` (built from `~/qemu-src/qemu-10.0.0` on dev-build)

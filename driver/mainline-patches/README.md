@@ -16,6 +16,17 @@ v7.1/7.2-era) and **proven under the QEMU control-plane harness** (see
 | `0002-net-dsa-bcm_sf2-add-brcm-bcm4916-switch-binding.patch` | `drivers/net/dsa/bcm_sf2.c` | Adds `bcm_sf2_4916_data` (reuses `bcm_sf2_4908_reg_offsets` + the 4908 crossbar config; only `.type` differs) and a `brcm,bcm4916-switch` `of_device_id`. Also folds `BCM4916_DEVICE_ID` into the 4908 switch-cases (rgmii-cntrl, led-base, port-override, crossbar, 2G speed-up) so BCM4916 follows the identical 4908 register path. |
 | `0003-net-phy-broadcom-add-BCM4916-internal-EGPHY-0x359050.patch` | `drivers/net/phy/broadcom.c`, `include/linux/brcmphy.h` | Adds an **EXACT-match** entry for the internal 1G EGPHY `0x359050e0`. Exact (not model-mask) because the model field `0x359050e` is shared with the external 10G PHY `0x359050e1` — a model-mask entry would wrongly claim the 10G PHY. The EGPHY is a standard Broadcom GPHY and reuses `bcm54xx_config_init`. |
 | `0004-net-phy-add-BCM84891-10G-PHY.patch` | `drivers/net/phy/bcm84881.c`, `include/linux/brcmphy.h` | Adds a 4th `phy_driver` entry to the bcm84881 family for the BCM4916 SoC **integrated 10G NBASE-T XPHY** `0x359050e1` (eth0/WAN). **EXACT-match** (model `0x359050e` is shared with the EGPHY `0x359050e0`). Link/speed come from a Broadcom-proprietary VEND1 (MMD 0x1e) status reg `0x400d`; supported set is 100M/1G/2.5G/5G/10G copper. |
+| `0005-net-dsa-bcm_sf2-wire-XPORT-serdes-PCS-for-BCM4916-10G.patch` | `drivers/net/dsa/{bcm_sf2.c,bcm_sf2.h,Kconfig}` | Brings the multi-gig **XPORT ports (5/6/7 = eth0/eth1/eth3)** to link. Adds `.mac_select_pcs` returning the new XPORT serdes+MPCS PCS; resolves the `brcm,serdes`/`brcm,mpcs`/`brcm,xport` phandles + creates the PCS; advertises 10GBASE-R/USXGMII/2500BASE-X + `MAC_{2500,5000,10000}FD` in `get_caps`; flips the `if(0) /*FIXME*/` crossbar stub to route port 7 to `EXT_SERDES`; and enables the XLMAC MAC (SOFT_RESET clear + TX/RX_EN + SPEED_MODE) in `mac_link_up`. XLMAC regs RE'd from the GPL behnd SDK (`XPORT_AG.h`, 6813A0). Depends on 0006. |
+| `0006-net-pcs-add-BCM4916-XPORT-serdes-MPCS-PCS.patch` | `drivers/net/pcs/{Kconfig,Makefile,pcs-bcm-xport.c,pcs-bcm-xport.h}` (new) | New register-mapped `phylink_pcs` for the BCM4916/6813 XPORT Merlin serdes (`0x837ff500`) + MPCS (`0x828c4000`). `.pcs_enable` releases serdes/MPCS resets, `.pcs_get_state` reports link/10G from serdes `STATUS`/`STATUS_1` + MPCS `rx_lock`. Real-HW caveat: needs a proprietary ~31 KB Merlin PMD microcode (CRC 0x4949) before lanes lock — non-redistributable, stubbed (`bcm_xport_pcs_load_firmware` TODO). See `re-notes/xport-serdes-bringup.md`. |
+
+The repo copies of the new PCS driver live in `driver/pcs/pcs-bcm-xport.{c,h}`
+(identical to the files patch 0006 adds at `drivers/net/pcs/`).
+
+### XPORT 10G result (QEMU)
+With 0005+0006 applied, DSA port@6 (eth1, XPORT 10GBASE-R) now reports
+**`Link is Up - 10Gbps/Full`** via phylink → `mac_select_pcs` → `pcs-bcm-xport`
+→ XLMAC enable (`eth1 speed=10000`). Previously only eth2 (1G UNIMAC) could
+link. See `re-notes/xport-serdes-bringup.md` sec 6 + `qemu/README.md`.
 
 ### Why clone BCM4908?
 The BCM4916 integrated switch is SF2-class and register-compatible with the

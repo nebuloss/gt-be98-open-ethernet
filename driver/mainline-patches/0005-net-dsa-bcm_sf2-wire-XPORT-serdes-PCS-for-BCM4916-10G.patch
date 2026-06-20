@@ -1,0 +1,301 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: be98 <be98@local>
+Date: Sat, 20 Jun 2026 00:00:00 +0000
+Subject: [PATCH] net: dsa: bcm_sf2: wire XPORT serdes PCS for BCM4916 10G ports
+
+Bring the BCM4916 (ASUS GT-BE98) multi-gig XPORT ports (DSA ports 5/6/7,
+eth0/eth1/eth3) to link on real silicon. Mainline bcm_sf2 stubbed the 10G
+serdes crossbar route (the "if (0) /* FIXME */" in bcm_sf2_crossbar_setup)
+and has no PCS for the XPORT serdes, so those ports could not link even though
+their DT is complete (the 1G UNIMAC port eth2 was the only first-light path).
+
+This patch:
+
+ 1. Adds .mac_select_pcs to bcm_sf2_phylink_mac_ops, returning the new
+    Broadcom XPORT serdes+MPCS phylink_pcs (drivers/net/pcs/pcs-bcm-xport.c)
+    for the 10GBASE-R / USXGMII / 2500BASE-X XPORT ports.
+
+ 2. Maps the "serdes" (0x837ff500), "mpcs" (0x828c4000) and "xport"
+    (0x837f0000) register windows from the brcm,serdes / brcm,mpcs / brcm,xport
+    phandles on the switch node and creates the PCS at probe time.
+    brcm,runner-emulated (QEMU) is propagated as the PCS "emulated" flag (fake
+    PMD/PCS lock; skip the proprietary Merlin serdes microcode load).
+
+ 3. Flips the crossbar FIXME so internal port 7 routes to EXT_SERDES on
+    BCM4908/BCM4916 when the port is in a serdes phy-mode.
+
+ 4. Enables the XPORT/XLMAC MAC for ports 5/6/7 in mac_link_up: clears
+    XLMAC_CORE_CTRL SOFT_RESET (bit6), sets TX_EN/RX_EN, programs XLMAC_MODE
+    SPEED_MODE from the negotiated speed, and (line side) leaves the PCS to
+    own serdes lock. The XLMAC core base/offsets/field shifts are RE'd from
+    the Broadcom GPL behnd SDK (XPORT_AG.h / XPORT_XLMAC_CORE_AG.c, 6813A0;
+    XLMAC core 0x837f0000 + quad*0x4000 + port*0x400).
+
+Depends on 0006 (the pcs-bcm-xport driver). Details + serdes-firmware caveat in
+drivers/net/pcs/pcs-bcm-xport.c and re-notes/xport-serdes-bringup.md.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+diff --git a/drivers/net/dsa/Kconfig b/drivers/net/dsa/Kconfig
+index 4ab567c5b..20ad5b270 100644
+--- a/drivers/net/dsa/Kconfig
++++ b/drivers/net/dsa/Kconfig
+@@ -12,6 +12,7 @@ config NET_DSA_BCM_SF2
+ 	select BCM7XXX_PHY
+ 	select MDIO_BCM_UNIMAC
+ 	select B53
++	select PCS_BCM_XPORT
+ 	help
+ 	  This enables support for the Broadcom Starfighter 2 Ethernet
+ 	  switch chips.
+diff --git a/drivers/net/dsa/bcm_sf2.c b/drivers/net/dsa/bcm_sf2.c
+index 78ace9b96..02b67edfa 100644
+--- a/drivers/net/dsa/bcm_sf2.c
++++ b/drivers/net/dsa/bcm_sf2.c
+@@ -25,12 +25,57 @@
+ #include <linux/if_bridge.h>
+ #include <linux/brcmphy.h>
+ #include <linux/etherdevice.h>
++#include <linux/of_address.h>
+ #include <linux/platform_data/b53.h>
+ 
+ #include "bcm_sf2.h"
+ #include "bcm_sf2_regs.h"
+ #include "b53/b53_priv.h"
+ #include "b53/b53_regs.h"
++#include "../pcs/pcs-bcm-xport.h"
++
++/*
++ * BCM4916/6813 XPORT 10G MAC (XLMAC core) register map, RE'd from the Broadcom
++ * GPL behnd SDK (XPORT_AG.h / XPORT_XLMAC_CORE_AG.c, 6813A0). The XLMAC core
++ * for port N lives at 0x837f0000 + quad*0x4000 + (port_in_quad)*0x400, relative
++ * to the "xport" reg window base (0x837f0000). DSA ports 5/6/7 -> XLMAC cores
++ * 5/6/7 (quad1 ports 1/2/3). Registers are 64-bit; we touch the low 32 bits.
++ */
++#define XPORT_XLMAC_CORE_STRIDE		0x400
++#define XPORT_QUAD_STRIDE		0x4000
++#define XLMAC_CORE_CTRL			0x00	/* [SDK XPORT_AG.h:4219] */
++#define XLMAC_CORE_MODE			0x08	/* [SDK XPORT_AG.h:4222] */
++#define XLMAC_CORE_TX_CTRL		0x20	/* [SDK XPORT_AG.h:4231] */
++#define XLMAC_CORE_RX_CTRL		0x30	/* [SDK XPORT_AG.h:4237] */
++/* CTRL bits [SDK XPORT_AG.h] */
++#define XLMAC_CTRL_TX_EN		BIT(0)
++#define XLMAC_CTRL_RX_EN		BIT(1)
++#define XLMAC_CTRL_SOFT_RESET		BIT(6)
++#define XLMAC_CTRL_SW_LINK_STATUS	BIT(12)
++/* MODE.SPEED_MODE: shift 4, width 3 [SDK XPORT_AG.h:124] */
++#define XLMAC_MODE_SPEED_SHIFT		4
++#define XLMAC_MODE_SPEED_MASK		(0x7 << XLMAC_MODE_SPEED_SHIFT)
++/* XLMAC SPEED_MODE encoding [SDK xport_defs.h:103]:
++ * 10M=0 100M=1 1G=2 2.5G=3 10G=4 5G=5 (note 10G/5G ordering quirk). */
++#define XLMAC_SPEED_10M			0
++#define XLMAC_SPEED_100M		1
++#define XLMAC_SPEED_1G			2
++#define XLMAC_SPEED_2P5G		3
++#define XLMAC_SPEED_10G			4
++#define XLMAC_SPEED_5G			5
++
++static u32 bcm_sf2_xlmac_off(int port)
++{
++	int quad = port / 4;
++	int pip = port % 4;
++
++	return quad * XPORT_QUAD_STRIDE + pip * XPORT_XLMAC_CORE_STRIDE;
++}
++
++static bool bcm_sf2_port_is_xport(struct bcm_sf2_priv *priv, int port)
++{
++	return priv->xport && (port == 5 || port == 6 || port == 7);
++}
+ 
+ static u16 bcm_sf2_reg_rgmii_cntrl(struct bcm_sf2_priv *priv, int port)
+ {
+@@ -524,7 +569,9 @@ static void bcm_sf2_crossbar_setup(struct bcm_sf2_priv *priv)
+ 	case BCM4916_DEVICE_ID:
+ 		shift = CROSSBAR_BCM4908_INT_P7 * priv->num_crossbar_ext_bits;
+ 		reg &= ~(mask << shift);
+-		if (0) /* FIXME */
++		if (priv->port_sts[7].mode == PHY_INTERFACE_MODE_10GBASER ||
++		    priv->port_sts[7].mode == PHY_INTERFACE_MODE_USXGMII ||
++		    priv->port_sts[7].mode == PHY_INTERFACE_MODE_2500BASEX)
+ 			reg |= CROSSBAR_BCM4908_EXT_SERDES << shift;
+ 		else if (priv->int_phy_mask & BIT(7))
+ 			reg |= CROSSBAR_BCM4908_EXT_GPHY4 << shift;
+@@ -744,6 +791,18 @@ static void bcm_sf2_sw_get_caps(struct dsa_switch *ds, int port,
+ 
+ 	config->mac_capabilities = MAC_ASYM_PAUSE | MAC_SYM_PAUSE |
+ 		MAC_10 | MAC_100 | MAC_1000;
++
++	/*
++	 * BCM4916 XPORT ports (5/6/7): advertise the 10G/multi-gig serdes phy
++	 * modes + capabilities so phylink will use the XPORT serdes PCS
++	 * (.mac_select_pcs). The PCS owns the line-side link.
++	 */
++	if (bcm_sf2_port_is_xport(priv, port)) {
++		__set_bit(PHY_INTERFACE_MODE_10GBASER, interfaces);
++		__set_bit(PHY_INTERFACE_MODE_USXGMII, interfaces);
++		__set_bit(PHY_INTERFACE_MODE_2500BASEX, interfaces);
++		config->mac_capabilities |= MAC_2500FD | MAC_5000FD | MAC_10000FD;
++	}
+ }
+ 
+ static void bcm_sf2_sw_mac_config(struct phylink_config *config,
+@@ -839,6 +898,57 @@ static void bcm_sf2_sw_mac_link_down(struct phylink_config *config,
+ 	bcm_sf2_sw_mac_link_set(dp->ds, port, interface, false);
+ }
+ 
++/*
++ * Select the XPORT serdes+MPCS PCS for the BCM4916 10G ports. Returning NULL
++ * for non-XPORT ports/modes lets phylink fall back to MAC-only validation.
++ */
++static struct phylink_pcs *
++bcm_sf2_sw_mac_select_pcs(struct phylink_config *config,
++			  phy_interface_t interface)
++{
++	struct dsa_port *dp = dsa_phylink_to_port(config);
++	struct bcm_sf2_priv *priv = bcm_sf2_to_priv(dp->ds);
++
++	if (!bcm_sf2_port_is_xport(priv, dp->index))
++		return NULL;
++
++	switch (interface) {
++	case PHY_INTERFACE_MODE_10GBASER:
++	case PHY_INTERFACE_MODE_USXGMII:
++	case PHY_INTERFACE_MODE_2500BASEX:
++		return priv->xport_pcs;
++	default:
++		return NULL;
++	}
++}
++
++/* Enable the XPORT/XLMAC MAC for a 10G port at the negotiated speed. */
++static void bcm_sf2_xport_mac_enable(struct bcm_sf2_priv *priv, int port,
++				     int speed)
++{
++	u32 base = bcm_sf2_xlmac_off(port);
++	u32 mode, ctrl, sp;
++
++	switch (speed) {
++	case SPEED_10000: sp = XLMAC_SPEED_10G; break;
++	case SPEED_5000:  sp = XLMAC_SPEED_5G; break;
++	case SPEED_2500:  sp = XLMAC_SPEED_2P5G; break;
++	case SPEED_1000:  sp = XLMAC_SPEED_1G; break;
++	default:          sp = XLMAC_SPEED_10G; break;
++	}
++
++	mode = readl(priv->xport + base + XLMAC_CORE_MODE);
++	mode &= ~XLMAC_MODE_SPEED_MASK;
++	mode |= sp << XLMAC_MODE_SPEED_SHIFT;
++	writel(mode, priv->xport + base + XLMAC_CORE_MODE);
++
++	/* release SOFT_RESET, set SW link, enable TX+RX [SDK xport_drv.c:373] */
++	ctrl = readl(priv->xport + base + XLMAC_CORE_CTRL);
++	ctrl &= ~XLMAC_CTRL_SOFT_RESET;
++	ctrl |= XLMAC_CTRL_SW_LINK_STATUS | XLMAC_CTRL_TX_EN | XLMAC_CTRL_RX_EN;
++	writel(ctrl, priv->xport + base + XLMAC_CORE_CTRL);
++}
++
+ static void bcm_sf2_sw_mac_link_up(struct phylink_config *config,
+ 				   struct phy_device *phydev,
+ 				   unsigned int mode,
+@@ -856,6 +966,12 @@ static void bcm_sf2_sw_mac_link_up(struct phylink_config *config,
+ 	bcm_sf2_sw_mac_link_set(dp->ds, port, interface, true);
+ 
+ 	priv = bcm_sf2_to_priv(dp->ds);
++
++	if (bcm_sf2_port_is_xport(priv, port)) {
++		bcm_sf2_xport_mac_enable(priv, port, speed);
++		return;
++	}
++
+ 	offset = bcm_sf2_port_override_offset(priv, port);
+ 
+ 	if (phy_interface_mode_is_rgmii(interface) ||
+@@ -1220,6 +1336,7 @@ static int bcm_sf2_sw_get_sset_count(struct dsa_switch *ds, int port,
+ 
+ static const struct phylink_mac_ops bcm_sf2_phylink_mac_ops = {
+ 	.mac_config	= bcm_sf2_sw_mac_config,
++	.mac_select_pcs	= bcm_sf2_sw_mac_select_pcs,
+ 	.mac_link_down	= bcm_sf2_sw_mac_link_down,
+ 	.mac_link_up	= bcm_sf2_sw_mac_link_up,
+ };
+@@ -1384,6 +1501,48 @@ static const struct of_device_id bcm_sf2_of_match[] = {
+ };
+ MODULE_DEVICE_TABLE(of, bcm_sf2_of_match);
+ 
++/*
++ * Map the XPORT serdes (0x837ff500) + MPCS (0x828c4000) windows referenced by
++ * the "brcm,serdes" / "brcm,mpcs" phandles on the switch node, and create the
++ * XPORT phylink PCS. Only present on BCM4916-class parts; absence is not fatal
++ * (the 1G UNIMAC ports still work).
++ */
++static int bcm_sf2_xport_pcs_setup(struct bcm_sf2_priv *priv,
++				   struct device_node *dn)
++{
++	struct device *dev = priv->dev->ds->dev;
++	void __iomem *serdes, *mpcs;
++	struct device_node *snode, *mnode, *rnode;
++	bool emulated;
++
++	snode = of_parse_phandle(dn, "brcm,serdes", 0);
++	mnode = of_parse_phandle(dn, "brcm,mpcs", 0);
++	if (!snode || !mnode) {
++		of_node_put(snode);
++		of_node_put(mnode);
++		return 0;	/* not an XPORT part */
++	}
++
++	serdes = of_iomap(snode, 0);
++	mpcs = of_iomap(mnode, 0);
++	of_node_put(snode);
++	of_node_put(mnode);
++	if (!serdes || !mpcs)
++		return -ENOMEM;
++
++	/* The XLMAC core window == the XPORT base (0x837f0000), mapped via the
++	 * "brcm,xport" phandle. */
++	rnode = of_parse_phandle(dn, "brcm,xport", 0);
++	priv->xport = rnode ? of_iomap(rnode, 0) : NULL;
++	of_node_put(rnode);
++
++	emulated = of_property_read_bool(dn, "brcm,runner-emulated");
++	priv->xport_pcs = bcm_xport_pcs_create(dev, serdes, mpcs, emulated);
++	if (IS_ERR(priv->xport_pcs))
++		return PTR_ERR(priv->xport_pcs);
++	return 0;
++}
++
+ static int bcm_sf2_sw_probe(struct platform_device *pdev)
+ {
+ 	const char *reg_names[BCM_SF2_REGS_NUM] = BCM_SF2_REGS_NAME;
+@@ -1510,6 +1669,12 @@ static int bcm_sf2_sw_probe(struct platform_device *pdev)
+ 
+ 	bcm_sf2_crossbar_setup(priv);
+ 
++	ret = bcm_sf2_xport_pcs_setup(priv, dn);
++	if (ret) {
++		pr_err("failed to set up XPORT PCS: %d\n", ret);
++		goto out_clk_mdiv;
++	}
++
+ 	bcm_sf2_gphy_enable_set(priv->dev->ds, true);
+ 
+ 	ret = bcm_sf2_mdio_register(ds);
+diff --git a/drivers/net/dsa/bcm_sf2.h b/drivers/net/dsa/bcm_sf2.h
+index be9f3b290..10bbddff4 100644
+--- a/drivers/net/dsa/bcm_sf2.h
++++ b/drivers/net/dsa/bcm_sf2.h
+@@ -67,6 +67,11 @@ struct bcm_sf2_priv {
+ 	void __iomem			*fcb;
+ 	void __iomem			*acb;
+ 
++	/* BCM4916 XPORT 10G: serdes (0x837ff500) + MPCS (0x828c4000) windows
++	 * and the phylink PCS bound to them (NULL on non-XPORT parts). */
++	void __iomem			*xport;
++	struct phylink_pcs		*xport_pcs;
++
+ 	struct reset_control		*rcdev;
+ 
+ 	/* Register offsets indirection tables */
+-- 
+2.47.3

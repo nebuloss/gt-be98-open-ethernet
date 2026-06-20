@@ -53,10 +53,21 @@
 	 * (see re-notes PART B verdict). Modeled DSA-style for upstreamability.
 	 */
 	switch0: ethernet-switch@837ff000 {
-		compatible = "brcm,bcm4916-switch"; /* TODO: bcm_sf2-family vs new driver */
+		compatible = "brcm,bcm4916-switch"; /* bcm_sf2 (BCM4916 of_match) */
 		reg = <0x0 0x837ff000 0x0 0x1000>;  /* [SDK] SWITCH_REG_BASE; sub-regs TODO */
 		reg-names = "core";
 		dsa,member = <0 0>;
+
+		/*
+		 * XPORT 10G line-side blocks for ports 5/6/7. bcm_sf2 (patch 0005)
+		 * resolves these phandles, ioremaps the serdes (0x837ff500) + MPCS
+		 * (0x828c4000) + XPORT/XLMAC (0x837f0000) windows, and creates the
+		 * pcs-bcm-xport phylink PCS it returns from .mac_select_pcs.
+		 */
+		brcm,xport = <&xport>;
+		brcm,mpcs = <&mpcs>;
+		brcm,serdes = <&serdes>;
+
 		status = "disabled";
 
 		/*
@@ -247,31 +258,42 @@
 		status = "disabled";
 	};
 
-	/* XPORT 10G/multigig MAC+PCS wrapper (eth0/eth1/eth3). [FDT][SDK] */
+	/*
+	 * XPORT 10G/multigig MAC (XLMAC core) wrapper for eth0/eth1/eth3.
+	 * [FDT][SDK] base 0x837f0000; XLMAC core for port N at
+	 * +quad*0x4000 +port_in_quad*0x400 (XPORT_XLMAC_CORE_AG.c, 6813A0).
+	 * No standalone binding: referenced by phandle (brcm,xport) from switch0
+	 * and ioremapped by bcm_sf2; the MAC enable/speed lives in mac_link_up.
+	 */
 	xport: ethernet@837f0000 {
-		compatible = "brcm,xport";	/* TODO: no mainline binding */
-		reg = <0x0 0x837f0000 0x0 0x8000>,	/* [FDT][SDK] XPORT base */
-		      <0x0 0x828b2000 0x0 0x1000>,	/* [FDT][SDK] XLIF (overlaps XLMAC) */
-		      <0x0 0x837ff1f8 0x0 0x0004>;	/* [FDT][SDK] XPORT0_CLK_CTRL */
-		reg-names = "xport", "xlif", "clk-ctrl";
-		status = "disabled";
-	};
-
-	/* 10G PCS for XPORT/serdes. [FDT mpcs / SDK] */
-	mpcs: pcs@828c4000 {
-		compatible = "brcm,mpcs";	/* TODO: no mainline binding */
-		reg = <0x0 0x828c4000 0x0 0x100>;	/* [FDT][SDK] */
-		status = "disabled";
+		compatible = "brcm,bcm4916-xport";
+		reg = <0x0 0x837f0000 0x0 0x8000>;	/* [FDT][SDK] XPORT/XLMAC */
+		reg-names = "xport";
+		status = "okay";
 	};
 
 	/*
-	 * On-die multi-lane serdes control. [FDT serdes / SDK]
-	 * Lives in the ETH_PHYS window (0x83400000 + 0x3ff500 = 0x837ff500).
+	 * 10G MPCS PCS block. [FDT mpcs / SDK mpcs.c] base 0x828c4000, MPCS_REG
+	 * at +0xf8. Referenced by phandle (brcm,mpcs) from switch0; the
+	 * pcs-bcm-xport phylink PCS (created by bcm_sf2) drives it.
+	 */
+	mpcs: pcs@828c4000 {
+		compatible = "brcm,bcm4916-mpcs";
+		reg = <0x0 0x828c4000 0x0 0x100>;	/* [FDT][SDK] */
+		status = "okay";
+	};
+
+	/*
+	 * On-die Merlin16-Shortfin serdes control. [FDT serdes / SDK
+	 * serdes_access_6813.h] base 0x837ff500, 3 cores x 0x100. Referenced by
+	 * phandle (brcm,serdes) from switch0; the pcs-bcm-xport PCS drives it.
+	 * NOTE real HW needs a proprietary Merlin PMD microcode (sec caveat in
+	 * pcs-bcm-xport.c) before lanes lock.
 	 */
 	serdes: serdes@837ff500 {
-		compatible = "brcm,serdes1";	/* TODO: no mainline binding */
+		compatible = "brcm,bcm4916-serdes";
 		reg = <0x0 0x837ff500 0x0 0x300>;	/* [FDT][SDK] */
-		status = "disabled";
+		status = "okay";
 	};
 
 	/*
