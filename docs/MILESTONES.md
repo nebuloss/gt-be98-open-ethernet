@@ -56,12 +56,15 @@ GT-BE98 device tree end-to-end in emulation. Remaining wired work is the datapat
 ## M3 — Switch (DSA)
 - [ ] b53/bcm_sf2 for the internal switch; LAN ports up + bridged
 
-## M4 — Multi-gig / 10G PHY  ⏳ control-plane done
+## M4 — Multi-gig / 10G PHY + XPORT/serdes  ✅ 10G links in emulation
 - [x] 10G PHY driver for eth0 (`driver/mainline-patches/0004`): ID 0x359050e1 = BCM4916 integrated
-      **XPHY** ("XPHY4916_X"), not standalone BCM84891. Binds under QEMU as "Broadcom BCM4916 10G XPHY"
-      (reads VEND1 0x400d per GPL SDK). eth3's real BCM84891L (0x35905081) already in bcm84881.c.
-- [ ] Live 10G link not provable in QEMU (modeled MAC is 1G-class; real 10G needs the Runner/crossbar)
-- [ ] 2.5G ports / serdes config (later)
+      **XPHY** ("XPHY4916_X"). eth3's real BCM84891L (0x35905081) already in bcm84881.c.
+- [x] **XPORT/XLMAC/MPCS/serdes drivers** (`driver/pcs/pcs-bcm-xport.*` + patches 0005/0006): phylink PCS
+      over serdes+MPCS + XLMAC 10G MAC enable + bcm_sf2 mac_select_pcs + real 10G crossbar. **eth1 (XPORT)
+      links at 10Gbps/Full in QEMU** (`re-notes/xport-serdes-bringup.md`).
+- [ ] serdes PMD needs ~31KB non-redistributable Merlin microcode (stubbed; QEMU fakes lock) — extract
+      from device like the Runner ucode
+- [ ] USXGMII per-mode + eth0/eth3 (ext-PHY) paths only to PCS-select stage; lane-mux RE'd not written
 
 ## M5 — Runner/RDPA HW offload  ★ THE GOAL — ALL PHASES PROVEN IN EMULATION
 "Full features: 10G with no CPU overload" → the Runner MUST do fast-path forward/NAT/QoS in HW.
