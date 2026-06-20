@@ -40,6 +40,12 @@
 				 * driver + QEMU model agree on this value. */
 #define XPE_OP_MOVE	0x2c
 #define XPE_OP_ICSUM	0x36
+/*
+ * 0x3f is the opcode-switch "default" (csel fallback) in xpe_api_opcode_name -
+ * it is NOT used as a list terminator. The stock list is length-delimited by
+ * cmd_list_data_length (xpe_cmd_end emits no NOP word; see cmdlist.c). Kept for
+ * completeness / defensive decoding only.
+ */
 #define XPE_OP_NOP	0x3f
 
 /*
@@ -62,7 +68,10 @@
  */
 struct xpe_cmdlist {
 	u8	buf[XPE_CMDLIST_MAX_BYTES];
-	u16	len;		/* bytes emitted so far */
+	u16	len;		/* bytes emitted so far (incl. trailing 0xfc pad) */
+	u16	data_len;	/* executable length (excl. pad); set by xpe_cmd_end.
+				 * The stock list is length-delimited by this value -
+				 * there is NO NOP terminator (xpe_api.o xpe_cmd_end). */
 	bool	overflow;	/* set if an emit would exceed XPE_CMDLIST_MAX_BYTES */
 };
 
@@ -118,12 +127,14 @@ void xpe_cmd_apply_icsum_16(struct xpe_cmdlist *cl, u8 offset);
 void xpe_cmdlist_init(struct xpe_cmdlist *cl);
 
 /*
- * cmd_list_data_length: bytes of command data actually emitted (matches the
- * live field of the same name).
+ * cmd_list_data_length: executable bytes of the program (matches the live field
+ * of the same name). The stock list is length-delimited by this value (no NOP
+ * terminator). Valid only after xpe_cmd_end(); before that it falls back to the
+ * raw emitted length.
  */
 static inline u16 xpe_cmdlist_data_len(const struct xpe_cmdlist *cl)
 {
-	return cl->len;
+	return cl->data_len ? cl->data_len : cl->len;
 }
 
 /*

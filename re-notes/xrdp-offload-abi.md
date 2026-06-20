@@ -249,6 +249,70 @@ sop_push_replace x1, sop_pull_replace x1, save_16/restore_16 x1.
 => L2 path dominated by **VLAN edit** (replace_bits_16/copy_bits_16) and **push/pull**
 (sop_push/pull_replace), no IP rewrite. Short program -> realistic Phase-1 target.
 
+### 2.5 Command-word bit-packing + list framing — PINNED from xpe_api.o disasm `[XRDP-BIN]`
+
+Resolves UNKNOWN #3. Addrs are file offsets in `xpe_api.armb53_6813.o` (r2:
+`-a arm -b 64 -e io.va=false -e bin.cache=true`).
+
+**Command word = 32-bit, stored BIG-ENDIAN.** The shared low-level emitter
+`sym.__command_add` @0x740 builds each command word in a register, then `rev w5, w22`
+(byte-swap) + `str w5, [.text]` -> the word lands MSB-first in the buffer. Inline data
+words are `rev16`'d (16-bit BE) into a separate `.data` region; `xpe_cmd_end` later
+relocates the data "from" offsets and concatenates `.text` + `.data`. So the on-wire word
+is read with `opcode = word>>26` (bits[31:26]) exactly as live-confirmed (REPLACE 0x18 ->
+top byte 0x60).
+
+**Byte structure of the 32-bit word** (from the clean single-purpose emitters):
+
+| field | bits | source |
+|---|---|---|
+| opcode | [31:26] | `>>26`; byte0 = opcode<<2 \| sub-flags |
+| sub-flags | [25:24] | size class etc. (decrement: even=0b00 in 0x6a; odd path sets 1) |
+| "to" word-count / dst offset | [23:16] | `(offset>>1)+1`, `bfi w*, w*, 0x10, 8` |
+| "from" offset (data ref) OR inline immediate | [15:8] / [15:0] | data-region ref (0x94-relative, relocated by xpe_cmd_end) OR a 16-bit immediate (icsum16) |
+| sentinel / mask | [7:0] | 0xff for "all bytes / to end" ops (decrement_8) |
+
+Per-emitter base words (the `mov w*, 0x........` seed before the `bfi` inserts):
+
+| emitter | addr | base word | opcode (>>26) | notes |
+|---|---|---|---|---|
+| xpe_cmd_replace_bits_16 | 0x1e60 | 0x50000000 | 0x14 | inline data = `data16<<position`; position/width packed into byte0/low byte via bfi/bfxil |
+| xpe_cmd_decrement_8 | 0x2c90 | 0x64000000 -> byte0 set 0x6a | 0x1a (=ADD) | TTL/hop-limit -1; no inline data; byte3=0xff |
+| xpe_cmd_apply_icsum_16 | 0x2da0 | 0x70000000 | 0x1c | `bfxil w22, icsum16, 0, 16` -> the 16-bit immediate is INLINE in the command word's low half |
+| xpe_cmd_replace_16/_32 | 0x1d60 / 0x1de0 | via 0xae0/0x310 | 0x18 | nbytes in [30:24], from-offset (0x94-based) in [23:16]; data appended to .data as words16/words32 |
+
+(The 6-bit `>>26` opcode values emitted differ from the §2.2 switch *cmp* values for
+ADD/ICSUM groups - §2.2 reads the opcode-name LUT which buckets ranges; the **emitted**
+values above are what real silicon decodes. REPLACE=0x18 and the byte0=opcode<<2 placement
+are the two facts also confirmed live.)
+
+**LIST FRAMING — there is NO NOP terminator; the list is LENGTH-DELIMITED.**
+`sym.xpe_cmd_end` @0x1450: walks the `.text` words to relocate the "from" offsets, then
+(@0x16e0) `mov w2, 0xfc` + a `str w2, [tail, x0, lsl 2]` loop **fills the trailing slack of
+the context's `command_list[]` slot with the byte 0xfc**. That 0xfc pad lies *past*
+`cmd_list_data_length` and is never decoded. The Runner executes commands until it reaches
+`cmd_list_data_length`. The final SOP/GDMA descriptor for L2 header insert is emitted by
+the helper @0xa40 as words `0x08800021` / `0xb080....` (these are the `08 80 00 21 b0 80
+c1 88 b0 80 ...` bytes seen trailing the live body - they are part of the cmdlist's GDMA
+descriptor region, NOT context pad as previously assumed).
+
+**Worked decode of the captured live 28-byte body** (GDX-local-delivery flow; see
+offload-live-validation.md). As BE 32-bit command words:
+```
+60 14 eb 98 | 3f 00 60 14 | 00 00 00 00 | XX 06 00 20 | 00 14 18 04 | 7c 01 00 00 | 18 94 ff ff
+W0=0x6014eb98  op=0x18 REPLACE, to-byte=0x14, ref/data 0xeb98
+W1=0x3f006014  0x3f00 = a relocated "from" half-word (NOT a NOP), 0x6014 = REPLACE op repeat
+W2=0x00000000  (zeroed slot / cleared ref)
+W3=0xXX060020  XX = per-flow GDX/SOP selector immediate (56..59 across the 4 flows)
+W4=0x00141804  to/ref bytes; the 0x18 low byte = relocated REPLACE ref tag (orr ...,0x18 @0x15a4)
+W5=0x7c010000  from-offset / length descriptor
+W6=0x1894ffff  0x18 ref tag + 0x94 (the 0x94 data-region base) + 0xffff "to end" sentinel
+```
+The two facts that are direction-independent and match our builder: **opcode in bits[31:26]
+(REPLACE=0x18)** and **byte0 = opcode<<2** (live 0x60). The "3f 00" is conclusively NOT a
+terminator. This is a *structural / framing* validation - a byte-for-byte program match
+needs a live L2-accel or routed-NAT flow (none were captured; forbidden to generate).
+
 ---
 
 ## 3. HASH @0x82920000 and CNPL @0x82948000 — roles & registers `[XRDP-BIN]`
@@ -405,8 +469,14 @@ clean-room (blobs cannot ship); microcode ships as a GPLv2 firmware blob.
    MWRITE offsets), or obtain 6813 rdd_data_structures_auto.h.
 2. NAT-C HW hash polynomial / bucket selection (engine-internal). -> RE drv_natc_key_idx_get +
    ag_drv_natc_eng_hash_get; or rely on the engine (write key+result, let HW place).
-3. Exact operand bit-packing of each XPE opcode below bit 26. -> disasm each xpe_cmd_* emitter's
-   word composition in xpe_api.armb53_6813.o_saved (all present, not stripped — bounded).
+3. ~~Exact operand bit-packing of each XPE opcode below bit 26.~~ **RESOLVED** (sec 2.5):
+   32-bit BE command word, byte0=opcode<<2|flags, byte1="to" word-count, byte2/3="from"
+   data-ref OR inline immediate (icsum16), byte3=0xff sentinel; list is LENGTH-DELIMITED by
+   cmd_list_data_length (no NOP terminator; trailing slot padded with 0xfc bytes by
+   xpe_cmd_end @0x16e0). Disassembled from xpe_api.armb53_6813.o (__command_add @0x740,
+   decrement_8 @0x2c90, apply_icsum_16 @0x2da0, replace_bits_16 @0x1e60, xpe_cmd_end @0x1450).
+   Caveat: the live capture was GDX-local so this pins the ENCODING/FRAMING, not a byte-match
+   of our L2/NAT programs.
 4. cmdlist<->microcode version coupling. -> confirm against device fw partition Runner image gen.
 5. Which NAT-C table id / key-mask maps to which direction/flow-class. -> RE rdd_ag_natc_*_mask_*
    callers + data_path_natc_init.

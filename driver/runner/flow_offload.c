@@ -153,10 +153,14 @@ void xrdp_build_ctx(const struct xrdp_flow *f, const struct xpe_cmdlist *cl,
 	if (f->is_hw_cso)
 		ctx->buf[CTX_OFF_IS_HW_CSO] = BIT(0);
 
-	/* embed the cmdlist inline at +16 */
+	/* Embed the cmdlist inline at +16. Copy the full padded buffer (clen
+	 * bytes = executable dlen + the trailing 0xfc slot pad emitted by
+	 * xpe_cmd_end), so the context's command_list[] slack matches the stock
+	 * 0xfc fill. The Runner executes only the first dlen bytes
+	 * (length-delimited; the 0xfc pad is never decoded). */
 	if (clen > XPE_CMDLIST_MAX_BYTES)
 		clen = XPE_CMDLIST_MAX_BYTES;
-	memcpy(&ctx->buf[XPE_CTX_CMDLIST_OFF], cl->buf, dlen);
+	memcpy(&ctx->buf[XPE_CTX_CMDLIST_OFF], cl->buf, clen);
 
 	/* the TWO length fields (live-flow-dump.md "CORRECTS") */
 	ctx->buf[CTX_OFF_CMDLIST_DLEN] = dlen;

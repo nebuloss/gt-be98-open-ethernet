@@ -110,7 +110,14 @@
 #define XPE_OP_ADD               0x1a   /* ADD imm; decrement_8 = ADD(-1) on TTL */
 #define XPE_OP_MOVE              0x2c   /* DELETE (VLAN pop) */
 #define XPE_OP_ICSUM            0x36   /* incremental checksum fixup (IP / L4) */
+/*
+ * 0x3f is the opcode-switch default, NOT a terminator: the stock list is
+ * length-delimited by cmd_list_data_length (xpe_api.o xpe_cmd_end emits no NOP
+ * word and pads the trailing slot slack with the byte 0xfc, which lies past the
+ * data-length and is never decoded). Kept only as a defensive early-out.
+ */
 #define XPE_OP_NOP               0x3f
+#define XPE_PAD_BYTE             0xfc   /* stock slot pad fill (outside dlen) */
 
 /* context flag bits (matches flow_offload.h CTX_FLAG_*) */
 #define CTX_FLAG_IS_ROUTED       (1u << 5)
@@ -542,6 +549,12 @@ static void fixup_l4_csum(uint8_t *frame, size_t len, uint8_t csum_off)
  *
  * REPLACE is disambiguated by nbytes: 4 => 32-bit replace, 2 => 16-bit replace,
  * else => bit-field replace (the Phase-1 VLAN packing).
+ *
+ * FRAMING (matches the RE'd stock emitter, xpe_api.o xpe_cmd_end): the program
+ * is LENGTH-DELIMITED by cmd_list_data_length (dlen) - there is NO NOP
+ * terminator word. We walk command words until pos reaches dlen. The stock 0xfc
+ * slot-pad bytes lie past dlen and are never reached. The XPE_OP_NOP/default
+ * case below is a defensive early-out only.
  */
 static size_t natc_run_cmdlist(const uint8_t *ctx, uint8_t *frame, size_t len)
 {

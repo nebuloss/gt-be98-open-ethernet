@@ -29,22 +29,35 @@
  *   word1 (data, when present): the 16-bit immediate (BE); replace_32 emits TWO
  *                    data words (high half then low half).
  *
- * LIVE-SILICON VALIDATION (re-notes/offload-live-validation.md):
- *   The stock REPLACE command word captured from a real NAT-C entry is 0x6014.
- *   Decoded under THIS layout that is opcode=(0x6014>>26-equiv)=0x18 (REPLACE) and
- *   offset8=((0x6014>>18-equiv)&0xff)=5 - a clean, sane decode. So the OPCODE
- *   field (bits[31:26]) and the OFFSET8 field (bits[25:18]) placement are
- *   CONFIRMED against silicon: REPLACE's 0x18 lands in the top byte as 0x60, and
- *   the offset packs immediately below it.
- *   STILL UNCONFIRMED (UNKNOWN #3): the sub-offset operand math differs - stock
- *   packs the 16-bit REPLACE immediate alongside the opcode (...0x6014 0xeb98...,
- *   data in the trailing half) and interleaves command+data half-words, so the
- *   stock body cannot be unambiguously re-segmented into command vs data words
- *   without the xpe_api.o emitter disasm. The position/width sub-fields and the
- *   NOP framing (we emit 0x3f<<10=0xfc00; stock shows a 0x3f00 word whose role -
- *   NOP vs inline data - is not resolvable from bytes alone) are therefore left
- *   as-is: changing them on a guess would only break the proven driver<->QEMU
- *   contract. Resolve via xpe_api.armb53_6813.o_saved disasm, NOT byte-staring.
+ * ENCODING PINNED FROM THE STOCK EMITTER (xpe_api.armb53_6813.o disasm,
+ * re-notes/xrdp-offload-abi.md sec 2.5):
+ *   - Command words are 32-bit, stored BIG-ENDIAN (sym.__command_add @0x740:
+ *     `rev w5, w22 ; str w5, [.text]`). Opcode = word>>26 (bits[31:26]), confirmed
+ *     by the live REPLACE word 0x6014eb98 (byte0 0x60 -> 0x60>>2... i.e. top 6
+ *     bits = 0x18 = REPLACE) and offset8 in bits[25:18] (live offset 5).
+ *   - Byte structure of the 32-bit word (from xpe_cmd_decrement_8 @0x2c90,
+ *     xpe_cmd_apply_icsum_16 @0x2da0, xpe_cmd_replace_bits_16 @0x1e60):
+ *       byte0 = opcode<<2 | sub-flags   (decrement_8 base 0x6a -> op 0x1a = ADD)
+ *       byte1 = "to"   word-count/offset (offset/2 + 1)
+ *       byte2 = "from" offset (data-region ref, 0x94-relative; relocated later)
+ *               OR, for ops with an inline immediate (icsum16), byte2|byte3 hold
+ *               the immediate (icsum base 0x70 with bfxil of icsum16 into [15:0]).
+ *       byte3 = 0xff sentinel for "to end" / all-bytes ops (decrement_8).
+ *   - TERMINATOR / FRAMING (resolves the old 0x3f00-vs-0xfc00 contradiction):
+ *     the list is LENGTH-DELIMITED by cmd_list_data_length. xpe_cmd_end @0x1450
+ *     emits NO NOP word; it relocates the "from" offsets, concatenates the
+ *     .text+.data regions, and fills the trailing slot slack with the BYTE 0xfc
+ *     (loop @0x16e0: `mov w2,0xfc ; str w2,[tail]`). That 0xfc pad is OUTSIDE
+ *     cmd_list_data_length and is never decoded. The live "3f 00" in the captured
+ *     body is therefore inline data / a relocated from-offset half-word, NOT a
+ *     terminator. Our xpe_cmd_end now matches: no NOP word, 0xfc tail pad,
+ *     length-delimited execution.
+ *   CAVEAT: the captured live body was a GDX-local-delivery program (a path the
+ *   open driver does not implement), so this validates the WORD ENCODING and
+ *   FRAMING, not a byte-for-byte match of our L2/NAT programs (no L2-accel or
+ *   routed-NAT flow was live to capture). The driver<->QEMU-model contract is
+ *   kept consistent: the model decodes the same length-delimited, byte-structured
+ *   words.
  *
  * ICSUM (incremental ones-complement checksum) carries no inline data: the
  * Runner recomputes the checksum delta from the field(s) the preceding
@@ -113,14 +126,46 @@ void xpe_cmd_delete_16(struct xpe_cmdlist *cl, u8 offset, u8 nbytes)
 	xpe_emit_cmd32(cl, xpe_pack_cmd(XPE_OP_MOVE, offset, 0, 0, nbytes));
 }
 
-/* Terminator / NOP (sec 2.3 xpe_cmd_end; NOP=0x3f observed live as 0x3f00). */
+/*
+ * Finalize the program.
+ *
+ * RE-CORRECTED (xpe_api.armb53_6813.o sym.xpe_cmd_end @file-off 0x1450): the
+ * stock list is *length-delimited* by cmd_list_data_length - there is NO NOP
+ * terminator word. xpe_cmd_end walks the .text command words to relocate the
+ * inline-data ("from") offsets, concatenates the .text + .data regions, and then
+ * fills the *trailing slack* of the context's command_list[] slot with the byte
+ * 0xfc (the loop @0x16e0: `mov w2, 0xfc` -> `str w2, [tail, x0, lsl 2]`). That
+ * 0xfc pad lies OUTSIDE cmd_list_data_length, so the Runner never executes it;
+ * it is pure slot padding, not an opcode.
+ *
+ * This corrects the earlier guess that the terminator was a 0x3f<<10 = 0xfc00
+ * NOP word: the live stock body (60 14 eb 98 3f 00 ...) carries no 0x3f00 NOP -
+ * the "3f 00" there is an inline-data / relocated from-offset half-word, and the
+ * list is bounded purely by the data-length field. See re-notes/xrdp-offload-abi.md
+ * sec 2.5 (UNKNOWN #3 RESOLVED).
+ *
+ * Our builder therefore emits NO terminator command word. We only pad the emitted
+ * byte buffer up to a 4-byte multiple so the context's command_list[] slot is
+ * word-aligned; cmd_list_data_length (xpe_cmdlist_data_len) is recorded BEFORE
+ * the pad, and cmd_list_length (xpe_cmdlist_len) is the rounded-up figure. The
+ * pad byte is 0xfc to match the stock slot fill (cosmetic - it is excluded from
+ * the executed length on both real HW and the QEMU model).
+ */
 void xpe_cmd_end(struct xpe_cmdlist *cl)
 {
-	xpe_emit16(cl, (u16)XPE_OP_NOP << 10);	/* 0x3f00: NOP in the high bits */
+	/* record the executable length (length-delimited; excludes pad) */
+	cl->data_len = cl->len;
 
-	/* pad to a 4-byte multiple (sec 2.1: total size asserted % 4 == 0) */
-	while (cl->len & 0x3)
-		xpe_emit16(cl, 0);
+	/* pad the slot to a 4-byte multiple with the stock 0xfc fill byte
+	 * (sec 2.1: total slot size asserted % 4 == 0). These bytes are past
+	 * data_len and are never decoded as commands. */
+	while (cl->len & 0x3) {
+		if (cl->len + 1 > XPE_CMDLIST_MAX_BYTES) {
+			cl->overflow = true;
+			return;
+		}
+		cl->buf[cl->len++] = 0xfc;
+	}
 }
 
 /* ------------------------------------------------------------------------- *
