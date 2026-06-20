@@ -29,6 +29,23 @@
  *   word1 (data, when present): the 16-bit immediate (BE); replace_32 emits TWO
  *                    data words (high half then low half).
  *
+ * LIVE-SILICON VALIDATION (re-notes/offload-live-validation.md):
+ *   The stock REPLACE command word captured from a real NAT-C entry is 0x6014.
+ *   Decoded under THIS layout that is opcode=(0x6014>>26-equiv)=0x18 (REPLACE) and
+ *   offset8=((0x6014>>18-equiv)&0xff)=5 - a clean, sane decode. So the OPCODE
+ *   field (bits[31:26]) and the OFFSET8 field (bits[25:18]) placement are
+ *   CONFIRMED against silicon: REPLACE's 0x18 lands in the top byte as 0x60, and
+ *   the offset packs immediately below it.
+ *   STILL UNCONFIRMED (UNKNOWN #3): the sub-offset operand math differs - stock
+ *   packs the 16-bit REPLACE immediate alongside the opcode (...0x6014 0xeb98...,
+ *   data in the trailing half) and interleaves command+data half-words, so the
+ *   stock body cannot be unambiguously re-segmented into command vs data words
+ *   without the xpe_api.o emitter disasm. The position/width sub-fields and the
+ *   NOP framing (we emit 0x3f<<10=0xfc00; stock shows a 0x3f00 word whose role -
+ *   NOP vs inline data - is not resolvable from bytes alone) are therefore left
+ *   as-is: changing them on a guess would only break the proven driver<->QEMU
+ *   contract. Resolve via xpe_api.armb53_6813.o_saved disasm, NOT byte-staring.
+ *
  * ICSUM (incremental ones-complement checksum) carries no inline data: the
  * Runner recomputes the checksum delta from the field(s) the preceding
  * replace/decrement touched. We encode the L4 csum offset in the offset8 field
