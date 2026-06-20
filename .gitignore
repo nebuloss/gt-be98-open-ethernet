@@ -30,6 +30,10 @@ re-bins/
 docs/gt-be98-open-ethernet-orchestrator-prompt.md
 docs/recovery-plan.md
 docs/build-env.md
+# live-test-runbook references device recovery internals (slots/U-Boot/watchdog)
+docs/live-test-runbook.md
+# extract-runner-microcode documents proprietary microcode symbol offsets
+tools/extract-runner-microcode.sh
 
 # Secrets / local
 *.local
