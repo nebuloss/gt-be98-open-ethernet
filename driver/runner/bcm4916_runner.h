@@ -173,4 +173,38 @@ struct runner_ring_cfg {
  */
 #define CPU_TX_RING_INDICES_OFF		0x0000	/* TODO: pin RDD table offset */
 
+/* ----------------------------------------------------------------------------
+ * OFFLOAD (Phase 1: L2 + VLAN HW flow-offload). The offload context bundles the
+ * flowtable rhashtable, the NAT-C MMIO handle and a default egress vport. The
+ * conduit driver owns the ioremapped window, so the NAT-C add/del/stats helpers
+ * (which poke PSRAM + the indirect command register) live in the conduit driver
+ * and are called by flow_offload.c. See flow_offload.{c,h}.
+ * -------------------------------------------------------------------------- */
+#include <linux/rhashtable.h>
+#include <linux/netdevice.h>	/* enum tc_setup_type (by value below) */
+
+struct net_device;
+struct natc_key;
+struct fc_ucast_ctx;
+
+struct xrdp_offload {
+	struct rhashtable	flow_table;
+	void			*drv;		/* struct runner_priv * (conduit) */
+	u16			default_vport;	/* egress vport for the self-test */
+};
+
+/* flow_offload.c */
+int  xrdp_offload_init(struct xrdp_offload *o);
+void xrdp_offload_deinit(struct xrdp_offload *o);
+int  xrdp_offload_setup_tc(struct xrdp_offload *o, struct net_device *dev,
+			   enum tc_setup_type type, void *type_data);
+int  xrdp_offload_selftest(struct xrdp_offload *o, const u8 *mac_da,
+			   const u8 *mac_sa, int vlan_op, u16 vid);
+
+/* bcm4916_runner.c - NAT-C connection-table I/O (owns the MMIO window) */
+int  xrdp_natc_add(struct xrdp_offload *o, const struct natc_key *key,
+		   const struct fc_ucast_ctx *ctx, u32 *idx_out);
+void xrdp_natc_del(struct xrdp_offload *o, const struct natc_key *key, u32 idx);
+void xrdp_natc_stats(struct xrdp_offload *o, u32 idx, u64 *pkts, u64 *bytes);
+
 #endif /* _BCM4916_RUNNER_H_ */

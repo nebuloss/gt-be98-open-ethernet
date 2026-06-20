@@ -339,3 +339,81 @@ RXP_BEFORE=0  RXP_AFTER=4  RXB_AFTER=284          # driver rx_packets/bytes adva
   Kconfig `BCM4916_RUNNER` + Makefile; `CONFIG_BCM4916_RUNNER=y`.
 - conduit netdev renamed `rnr%d` (was `eth%d`) so it never collides with DSA
   user-port labels.
+
+---
+
+## Stage 4 STATUS: DONE — **L2 + VLAN HW flow-offload (Phase 1) proven**
+
+The Runner model now models the **NAT-C connection table** so HW flow-offload
+can be tested: the model watches the driver's NAT-C `{key, context}` PSRAM
+staging + the indirect add command, populates a modelled NAT-C table, and on a
+received frame computes the 16-byte key (the SAME packing as the driver),
+looks it up, and **on a HIT runs the embedded XPE cmdlist (VLAN edit) and
+forwards the frame to the egress backend WITHOUT delivering it to the CPU RX
+ring**; on a MISS it delivers to the CPU (slow path) as before.
+
+**Result: first packet of a flow MISSES → CPU; the open driver programs a NAT-C
+entry; subsequent packets HIT → forwarded in HW, CPU bypassed.** Full design +
+evidence: `re-notes/offload-phase1-status.md`.
+
+### What is modelled (added to `device-model/bcm4916_runner.c`)
+- NAT-C staging-write capture (key @0x100, ctx @0x120, index @0x200, cmd @0x204)
+  → 64-entry modelled NAT-C table (`natc_add`/`natc_del`).
+- `natc_compute_key` (matches driver `xrdp_build_key`) + `natc_lookup`.
+- `natc_run_cmdlist`: XPE byte-code interpreter (MCOPY=insert / MOVE=delete /
+  REPLACE bits / NOP) applying VLAN edits in place.
+- HIT path: run cmdlist + `qemu_send_packet` out the egress, CPU ring untouched.
+- Debug counters at NATC base `+0x00` (hits) / `+0x08` (misses); NAT-C ADD logs
+  the key + cmdlist bytes for validation.
+- An RX heartbeat + `qemu_flush_queued_packets` so the dgram backend re-arms its
+  RX poll (without it only the first injected datagram is ever delivered).
+
+### Run (on dev-build)
+Build the kernel `Image` (`CONFIG_BCM4916_RUNNER=y`) and the custom QEMU, then:
+```bash
+# two-phase peer: inject MISS frames (pre-program) then HIT frames (post-program)
+PEER_DUR=42 python3 ~/qemu-be98/offload_peer.py 15412 15411 offload-tx.pcap &
+QEMU_BCM4916=1 ~/qemu-src/qemu-10.0.0/build/qemu-system-aarch64 \
+  -machine virt -cpu cortex-a53 -smp 4 -m 1024 \
+  -kernel ~/mainline/arch/arm64/boot/Image -initrd ~/qemu-be98/offload-initramfs.cpio.gz \
+  -append "console=ttyAMA0 rdinit=/init panic=5 cma=128M be98_auto=poweroff" \
+  -netdev dgram,id=rnet,remote.type=inet,remote.host=127.0.0.1,remote.port=15412,\
+local.type=inet,local.host=127.0.0.1,local.port=15411 \
+  -nic none -nographic -no-reboot
+```
+The offload initramfs `/init` brings `rnr0` up, lets the peer inject MISS frames,
+then `echo "0 0" > /sys/kernel/debug/bcm4916-runner/offload_selftest` programs the
+NAT-C entry, then the peer injects HIT frames.
+
+### Evidence (dev-build `~/qemu-be98/offload-EVIDENCE.log`)
+```
+NAT-C MISS -> CPU slow path, misses=1 .. 6           # before programming
+NAT-C ADD idx=0 key=ffffffffffff02000000000108000000 is_l2_accel=1 cmdlist_dlen=4
+NAT-C ADD idx=0 cmdlist=[ fc 00 00 00 ]              # NOP (plain L2 forward)
+NAT-C HIT idx=0 -> HW forward (offload), len 60->60, hits=1 .. 4 (CPU bypassed)
+RXP_AFTER_HIT=0                                       # conduit CPU rx did NOT advance
+[peer] TOTAL from guest=4 offloaded-HW-forwarded=4   # HIT frames bounced out egress
+```
+cmdlist variants captured (opcode = byte0>>2): VLAN push
+`4c 30 00 04 60 30 10 00 81 00 60 38 10 00 00 64 fc 00 00 00` (insert+TPID+TCI),
+VLAN pop `b0 30 00 04 …` (delete), VLAN mangle `60 38 0c 00 00 c8 …` (replace
+12-bit VID). All opcodes match the RE'd table (REPLACE=0x18, MCOPY=0x13,
+MOVE=0x2c, NOP=0x3f).
+
+### Honest gaps (Stage 4)
+- The end-to-end **nf_flow_table FLOW_CLS_REPLACE** trigger is implemented +
+  registered but exercised via a **debugfs self-test** (same `xrdp_build_*` +
+  `xrdp_natc_add` code) — a live conntrack flowtable trigger needs
+  `CONFIG_NF_FLOW_TABLE` + a 2-port forwarding topology the single-NIC emulation
+  doesn't host. See `re-notes/offload-phase1-status.md` §6.
+- NAT-C key layout, context byte offsets, and the indirect-register / PSRAM
+  staging offsets are **driver↔model CONTRACT placeholders**, not pinned 6813
+  silicon values — the proof is internally consistent but not silicon-accurate.
+- Phase 2 (L3 + NAT) not modelled.
+
+### Files added/changed for Stage 4
+- `device-model/bcm4916_runner.c` — NAT-C table + key/cmdlist + HIT-bypass (ext).
+- `driver/runner/{cmdlist,flow_offload}.{c,h}` (new) + `bcm4916_runner.{c,h}`
+  (offload glue) — in-tree composite `bcm4916-runner.ko`.
+- `qemu/scripts/`-style helper `offload_peer.py` + `init-offload.sh` (on
+  dev-build under `~/qemu-be98/`).

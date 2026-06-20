@@ -44,8 +44,10 @@
 #include <linux/firmware.h>
 #include <linux/delay.h>
 #include <linux/byteorder/generic.h>
+#include <linux/debugfs.h>
 
 #include "bcm4916_runner.h"
+#include "flow_offload.h"
 
 #define DRV_NAME		"bcm4916-runner"
 #define RUNNER_FW_NAME		"brcm/bcm4916-runner-microcode.bin"
@@ -92,6 +94,12 @@ struct runner_priv {
 	u32			tx_write_idx;
 
 	bool			fw_loaded;
+
+	/* HW flow offload (Phase 1: L2 + VLAN) */
+	struct xrdp_offload	offload;
+	void __iomem		*natc;		/* xrdp + XRDP_OFF_NATC */
+	u32			natc_next_idx;	/* simple slot allocator */
+	struct dentry		*dbg;		/* debugfs dir */
 };
 
 /* ============================ FPM pool driver ============================ *
@@ -417,6 +425,65 @@ static int tx_ring_alloc(struct runner_priv *p)
 	return 0;
 }
 
+/* ============================ NAT-C offload I/O ========================== *
+ * The open analog of drv_natc_key_result_entry_var_size_ctx_add (ABI sec 1.1):
+ * stage the 16-byte masked BE key + the FC_UCAST_FLOW_CONTEXT_ENTRY into PSRAM
+ * staging windows, write the table index, then issue the indirect "add"
+ * command (cmd=3). The QEMU model watches these PSRAM writes and the command
+ * register to populate its modelled NAT-C table.
+ *
+ * The PSRAM staging offsets + indirect command register here are CONTRACT
+ * placeholders (real RDD/NAT-C indirect-register offsets are ABI UNKNOWN #5);
+ * driver and model agree on them.
+ */
+int xrdp_natc_add(struct xrdp_offload *o, const struct natc_key *key,
+		  const struct fc_ucast_ctx *ctx, u32 *idx_out)
+{
+	struct runner_priv *p = o->drv;
+	u32 idx = p->natc_next_idx++;
+
+	/* 1. stage the 16-byte masked BE key */
+	memcpy_toio(p->xrdp + XRDP_OFF_PSRAM + NATC_STAGE_KEY, key->w,
+		    sizeof(key->w));
+
+	/* 2. stage the variable-length context (result) */
+	memcpy_toio(p->xrdp + XRDP_OFF_PSRAM + NATC_STAGE_CTX, ctx->buf,
+		    ctx->len);
+
+	/* 3. write the table index */
+	writel(idx, p->xrdp + XRDP_OFF_PSRAM + NATC_INDIR_INDEX);
+
+	/* 4. issue the add command (cmd=3) - this is the "doorbell" the model
+	 *    keys on to copy {key, ctx} into its NAT-C table. */
+	dma_wmb();
+	writel(NATC_CMD_ADD, p->xrdp + XRDP_OFF_PSRAM + NATC_INDIR_CMD);
+
+	*idx_out = idx;
+	return 0;
+}
+
+void xrdp_natc_del(struct xrdp_offload *o, const struct natc_key *key, u32 idx)
+{
+	struct runner_priv *p = o->drv;
+
+	memcpy_toio(p->xrdp + XRDP_OFF_PSRAM + NATC_STAGE_KEY, key->w,
+		    sizeof(key->w));
+	writel(idx, p->xrdp + XRDP_OFF_PSRAM + NATC_INDIR_INDEX);
+	dma_wmb();
+	writel(NATC_CMD_DEL, p->xrdp + XRDP_OFF_PSRAM + NATC_INDIR_CMD);
+}
+
+void xrdp_natc_stats(struct xrdp_offload *o, u32 idx, u64 *pkts, u64 *bytes)
+{
+	/*
+	 * Per-flow stats are CNPL counters (ABI sec 3.2). The CNPL read-back is
+	 * not yet pinned; return 0 (the flowtable still ages the entry out by
+	 * its own timeout). Phase 1.x: read the CNPL counter for this idx.
+	 */
+	*pkts = 0;
+	*bytes = 0;
+}
+
 /* ============================ microcode load ============================ */
 static int runner_load_microcode(struct runner_priv *p)
 {
@@ -474,6 +541,54 @@ static void runner_ubus_decode_init(struct runner_priv *p)
 	 *   apb 0x82900000..0x82A00000. */
 }
 
+/* ============================ offload self-test (debugfs) =============== *
+ * Writing "<vlan_op> <vid>" to .../offload_selftest programs one NAT-C L2 flow
+ * keyed on the fixed test DA/SA below (so frames the dgram peer injects HIT).
+ * This drives the REAL builders + NAT-C add path - the QEMU offload proof.
+ *   vlan_op: 0=plain L2, 1=push, 2=pop, 3=mangle ; vid: VLAN id for 1/2/3.
+ */
+static const u8 selftest_da[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+static const u8 selftest_sa[ETH_ALEN] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+
+static ssize_t runner_selftest_write(struct file *file, const char __user *ubuf,
+				     size_t count, loff_t *ppos)
+{
+	struct runner_priv *p = file->private_data;
+	char buf[32];
+	int vlan_op = 0;
+	unsigned int vid = 0;
+	int ret;
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+	sscanf(buf, "%d %u", &vlan_op, &vid);
+
+	ret = xrdp_offload_selftest(&p->offload, selftest_da, selftest_sa,
+				    vlan_op, (u16)vid);
+	if (ret < 0) {
+		dev_err(p->dev, "offload self-test failed: %d\n", ret);
+		return ret;
+	}
+	dev_info(p->dev, "offload self-test OK (cmdlist %d data bytes programmed)\n",
+		 ret);
+	return count;
+}
+
+static const struct file_operations runner_selftest_fops = {
+	.open	= simple_open,
+	.write	= runner_selftest_write,
+};
+
+static void runner_debugfs_init(struct runner_priv *p)
+{
+	p->dbg = debugfs_create_dir(DRV_NAME, NULL);
+	debugfs_create_file("offload_selftest", 0200, p->dbg, p,
+			    &runner_selftest_fops);
+}
+
 /* ============================ netdev / probe ============================ */
 static int runner_ndo_open(struct net_device *ndev)
 {
@@ -495,10 +610,24 @@ static int runner_ndo_stop(struct net_device *ndev)
 	return 0;
 }
 
+/*
+ * TC_SETUP_FT / TC_SETUP_BLOCK: register the flowtable HW-offload block on the
+ * conduit so nf_flow_table programs L2/VLAN flows into NAT-C (Phase 1). Modelled
+ * on mtk_eth_setup_tc (mtk_ppe_offload.c:660).
+ */
+static int runner_ndo_setup_tc(struct net_device *ndev, enum tc_setup_type type,
+			       void *type_data)
+{
+	struct runner_priv *p = netdev_priv(ndev);
+
+	return xrdp_offload_setup_tc(&p->offload, ndev, type, type_data);
+}
+
 static const struct net_device_ops runner_netdev_ops = {
 	.ndo_open	= runner_ndo_open,
 	.ndo_stop	= runner_ndo_stop,
 	.ndo_start_xmit	= runner_start_xmit,
+	.ndo_setup_tc	= runner_ndo_setup_tc,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr = eth_validate_addr,
 };
@@ -529,6 +658,7 @@ static int runner_probe(struct platform_device *pdev)
 	if (IS_ERR(p->xrdp))
 		return PTR_ERR(p->xrdp);
 	p->fpm = p->xrdp + XRDP_OFF_FPM;
+	p->natc = p->xrdp + XRDP_OFF_NATC;
 	for (i = 0; i < XRDP_RNR_CORES; i++)
 		p->rnr_mem[i] = p->xrdp + XRDP_OFF_RNR_MEM0 +
 				i * XRDP_RNR_MEM_STRIDE;
@@ -559,6 +689,17 @@ static int runner_probe(struct platform_device *pdev)
 	ndev->max_mtu = p->chunk_size - ETH_HLEN;
 	eth_hw_addr_random(ndev);
 
+	/* HW flow-offload (Phase 1: L2 + VLAN). Advertise NETIF_F_HW_TC so the
+	 * flowtable/TC layer offers us a flow_block to bind. */
+	p->offload.drv = p;
+	p->offload.default_vport = 0;
+	ret = xrdp_offload_init(&p->offload);
+	if (ret)
+		return ret;
+	ndev->features |= NETIF_F_HW_TC;
+	ndev->hw_features |= NETIF_F_HW_TC;
+	runner_debugfs_init(p);
+
 	/*
 	 * Name the conduit "rnr%d" so it never collides with the DSA user-port
 	 * netdev labels (eth0/eth2/...) the switch driver registers; otherwise
@@ -583,6 +724,14 @@ static int runner_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static void runner_remove(struct platform_device *pdev)
+{
+	struct runner_priv *p = platform_get_drvdata(pdev);
+
+	debugfs_remove_recursive(p->dbg);
+	xrdp_offload_deinit(&p->offload);
+}
+
 static const struct of_device_id runner_of_match[] = {
 	{ .compatible = "brcm,bcm4916-runner" },
 	{ }
@@ -591,6 +740,7 @@ MODULE_DEVICE_TABLE(of, runner_of_match);
 
 static struct platform_driver runner_driver = {
 	.probe	= runner_probe,
+	.remove	= runner_remove,
 	.driver	= {
 		.name		= DRV_NAME,
 		.of_match_table	= runner_of_match,

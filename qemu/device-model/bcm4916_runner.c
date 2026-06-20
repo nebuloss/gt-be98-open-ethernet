@@ -59,6 +59,7 @@
 #define XRDP_RNR_MEM_STRIDE  0x00020000ULL
 #define XRDP_RNR_CORES       8
 #define XRDP_OFF_FPM         0x00a00000ULL
+#define XRDP_OFF_NATC        0x00950000ULL   /* NAT-C engine (ABI 1.1) */
 
 /* FPM registers (offsets within the FPM block) */
 #define FPM_CTL                  0x0000
@@ -84,6 +85,33 @@
 #define PSRAM_CPU_RX_RING_DESC   0x0000
 #define PSRAM_CPU_TX_RING_DESC   0x0080
 #define CPU_TX_RING_INDICES_OFF  0x0000   /* within each RNR_MEM[n] */
+
+/* -------- NAT-C offload contract (matches driver/runner/flow_offload.h) ---- */
+#define PSRAM_NATC_STAGE_KEY     0x0100   /* 16-byte masked BE key */
+#define PSRAM_NATC_STAGE_CTX     0x0120   /* FC_UCAST_FLOW_CONTEXT_ENTRY */
+#define PSRAM_NATC_INDIR_INDEX   0x0200   /* table index (u32) */
+#define PSRAM_NATC_INDIR_CMD     0x0204   /* command reg (u32): 3=add 4=del */
+#define  NATC_CMD_ADD            3
+#define  NATC_CMD_DEL            4
+
+/* context-entry byte offsets (matches flow_offload.h CTX_OFF_*) */
+#define CTX_OFF_FLAGS            8
+#define  CTX_FLAG_IS_L2_ACCEL    (1u << 4)
+#define CTX_OFF_VPORT            12
+#define CTX_OFF_CMDLIST_OFF      16
+#define CTX_OFF_CMDLIST_DLEN     96
+#define CTX_OFF_CMDLIST_LEN      97
+#define CTX_OFF_VALID            98
+#define CTX_ENTRY_MAX            128
+
+/* XPE opcodes (matches cmdlist.h; opcode = cmd_word >> 26) */
+#define XPE_OP_MCOPY             0x13   /* INSERT (VLAN push) */
+#define XPE_OP_REPLACE           0x18   /* REPLACE bits (VLAN edit / TPID/TCI) */
+#define XPE_OP_MOVE              0x2c   /* DELETE (VLAN pop) */
+#define XPE_OP_NOP               0x3f
+
+#define NATC_MAX_ENTRIES         64
+#define VLAN_HLEN_M              4
 
 /* RX descriptor word2 (ABI 2.4) */
 #define RXD_W2_OWNERSHIP_HOST    0x80000000u
@@ -140,6 +168,19 @@ struct Bcm4916RunnerState {
     /* captured ring-cfg bytes (driver memcpy_toio's word-by-word) */
     uint8_t rx_cfg[DESC_SIZE];
     uint8_t tx_cfg[DESC_SIZE];
+
+    /* ---- NAT-C connection table (HW flow-offload model) ---- */
+    uint8_t  natc_stage_key[16];          /* staged 16-byte BE key */
+    uint8_t  natc_stage_ctx[CTX_ENTRY_MAX];
+    uint32_t natc_stage_idx;              /* staged table index */
+    struct {
+        bool     valid;
+        uint8_t  key[16];                 /* masked BE key */
+        uint8_t  ctx[CTX_ENTRY_MAX];      /* FC_UCAST_FLOW_CONTEXT_ENTRY */
+        uint32_t ctx_len;
+    } natc[NATC_MAX_ENTRIES];
+    uint64_t off_hits;                    /* frames forwarded in HW (bypassed CPU) */
+    uint64_t off_misses;                  /* frames delivered to CPU (slow path) */
 };
 
 /* DMA helpers operate on the system address space of this device. */
@@ -226,6 +267,173 @@ static void runner_parse_ring(const uint8_t *d, RunnerRing *r)
     r->valid = (depth != 0 && base != 0 && r->entry_size == DESC_SIZE);
 }
 
+/* ===================== NAT-C connection table (offload) ================== */
+
+/*
+ * Add the staged {key, ctx} into a NAT-C slot. Mirrors the driver's
+ * xrdp_natc_add (drv_natc_key_result_entry_var_size_ctx_add, ABI sec 1.1):
+ * the driver staged the key + context into PSRAM, wrote the index, and issued
+ * the add command; we copy the staging buffers into the indexed slot.
+ */
+static void natc_add(Bcm4916RunnerState *s)
+{
+    uint32_t idx = s->natc_stage_idx % NATC_MAX_ENTRIES;
+
+    memcpy(s->natc[idx].key, s->natc_stage_key, 16);
+    memcpy(s->natc[idx].ctx, s->natc_stage_ctx, CTX_ENTRY_MAX);
+    s->natc[idx].ctx_len = CTX_ENTRY_MAX;
+    s->natc[idx].valid = true;
+    qemu_log("bcm4916-runner: NAT-C ADD idx=%u key=%02x%02x%02x%02x%02x%02x%02x%02x"
+             "%02x%02x%02x%02x%02x%02x%02x%02x is_l2_accel=%d cmdlist_dlen=%u\n",
+             idx,
+             s->natc_stage_key[0], s->natc_stage_key[1], s->natc_stage_key[2],
+             s->natc_stage_key[3], s->natc_stage_key[4], s->natc_stage_key[5],
+             s->natc_stage_key[6], s->natc_stage_key[7], s->natc_stage_key[8],
+             s->natc_stage_key[9], s->natc_stage_key[10], s->natc_stage_key[11],
+             s->natc_stage_key[12], s->natc_stage_key[13], s->natc_stage_key[14],
+             s->natc_stage_key[15],
+             !!(s->natc_stage_ctx[CTX_OFF_FLAGS] & CTX_FLAG_IS_L2_ACCEL),
+             s->natc_stage_ctx[CTX_OFF_CMDLIST_DLEN]);
+    {
+        /* dump the embedded cmdlist bytes (16-bit BE words) for validation */
+        uint8_t dl = s->natc_stage_ctx[CTX_OFF_CMDLIST_DLEN];
+        char hex[3 * 64 + 1];
+        int i, n = 0;
+        if (dl > 60) {
+            dl = 60;
+        }
+        for (i = 0; i < dl; i++) {
+            n += snprintf(hex + n, sizeof(hex) - n, "%02x ",
+                          s->natc_stage_ctx[CTX_OFF_CMDLIST_OFF + i]);
+        }
+        qemu_log("bcm4916-runner: NAT-C ADD idx=%u cmdlist=[ %s]\n",
+                 idx, hex);
+    }
+}
+
+static void natc_del(Bcm4916RunnerState *s)
+{
+    uint32_t idx = s->natc_stage_idx % NATC_MAX_ENTRIES;
+
+    s->natc[idx].valid = false;
+    qemu_log("bcm4916-runner: NAT-C DEL idx=%u\n", idx);
+}
+
+/*
+ * Compute the 16-byte masked BE key from a received frame, EXACTLY as the
+ * driver's xrdp_build_key does (flow_offload.c), so a model lookup matches a
+ * driver-programmed entry:
+ *   w0 = DA[0..3]; w1 = DA[4..5]|SA[0..1]; w2 = SA[2..5];
+ *   w3 = ethertype<<16 | ingress_vport<<4 | (vlan_in?1:0)
+ * ingress_vport = 0 (single pipe, matches the driver's default_vport).
+ * For an L2 key the ethertype used is the *inner* frame ethertype; on an
+ * untagged frame that is bytes [12:13].
+ */
+static void natc_compute_key(const uint8_t *frame, size_t len, uint8_t key[16])
+{
+    uint16_t ethertype = 0;
+    uint16_t vlan_in = 0;
+
+    if (len >= 14) {
+        ethertype = (frame[12] << 8) | frame[13];
+    }
+    if (ethertype == 0x8100 && len >= 18) {
+        /* tagged: record inner ethertype + vid for the key */
+        vlan_in = ((frame[14] << 8) | frame[15]) & 0xfff;
+        ethertype = (frame[16] << 8) | frame[17];
+    }
+
+    /* w0 = DA[0..3] (big-endian byte order in the key buffer) */
+    key[0] = frame[0]; key[1] = frame[1]; key[2] = frame[2]; key[3] = frame[3];
+    /* w1 = DA[4..5] | SA[0..1] */
+    key[4] = frame[4]; key[5] = frame[5]; key[6] = frame[6]; key[7] = frame[7];
+    /* w2 = SA[2..5] */
+    key[8] = frame[8]; key[9] = frame[9]; key[10] = frame[10]; key[11] = frame[11];
+    /* w3 = ethertype<<16 | vport<<4 | vlan_present.  vport=0. */
+    key[12] = (ethertype >> 8) & 0xff;
+    key[13] = ethertype & 0xff;
+    key[14] = 0x00;                       /* (vport[11:4]) high */
+    key[15] = (vlan_in ? 1 : 0) & 0xff;   /* (vport[3:0]<<4)|present; vport 0 */
+}
+
+static int natc_lookup(Bcm4916RunnerState *s, const uint8_t key[16])
+{
+    int i;
+    for (i = 0; i < NATC_MAX_ENTRIES; i++) {
+        if (s->natc[i].valid && memcmp(s->natc[i].key, key, 16) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * Execute the embedded XPE cmdlist (Phase-1 L2 ops) on a frame in-place,
+ * returning the new length. Decodes 16-bit BE words; a command word's opcode is
+ * bits[31:26]. Matches the driver's cmdlist.c packing:
+ *   word0: [31:26]=opcode [25:18]=offset8 [17:13]=position [12:8]=width [7:0]=nbytes
+ *   REPLACE is followed by a 16-bit data word; INSERT/DELETE are single words.
+ * Supports: MCOPY=insert (VLAN push), MOVE=delete (VLAN pop), REPLACE bits
+ * (TPID/TCI/VID write), NOP=terminate.
+ */
+static size_t natc_run_cmdlist(const uint8_t *ctx, uint8_t *frame, size_t len)
+{
+    uint8_t dlen = ctx[CTX_OFF_CMDLIST_DLEN];
+    const uint8_t *cl = ctx + CTX_OFF_CMDLIST_OFF;
+    int pos = 0;
+
+    while (pos + 4 <= dlen) {
+        uint32_t cmd = (cl[pos] << 24) | (cl[pos + 1] << 16) |
+                       (cl[pos + 2] << 8) | cl[pos + 3];
+        uint8_t opcode = (cmd >> 26) & 0x3f;
+        uint8_t offset = (cmd >> 18) & 0xff;
+        uint8_t width  = (cmd >> 8) & 0x1f;
+        uint8_t nbytes = cmd & 0xff;
+        pos += 4;
+
+        switch (opcode) {
+        case XPE_OP_MCOPY:  /* INSERT nbytes at offset (VLAN push) */
+            if (offset <= len && len + nbytes <= RX_BUF_MAX) {
+                memmove(frame + offset + nbytes, frame + offset, len - offset);
+                memset(frame + offset, 0, nbytes);
+                len += nbytes;
+            }
+            break;
+        case XPE_OP_MOVE:   /* DELETE nbytes at offset (VLAN pop) */
+            if (offset + nbytes <= len) {
+                memmove(frame + offset, frame + offset + nbytes,
+                        len - offset - nbytes);
+                len -= nbytes;
+            }
+            break;
+        case XPE_OP_REPLACE: { /* REPLACE bits: data16 follows */
+            uint16_t data16 = 0;
+            if (pos + 2 <= dlen) {
+                data16 = (cl[pos] << 8) | cl[pos + 1];
+                pos += 2;
+            }
+            if (width >= 16 && offset + 2 <= len) {
+                /* full 16-bit field write (TPID or TCI) */
+                frame[offset] = (data16 >> 8) & 0xff;
+                frame[offset + 1] = data16 & 0xff;
+            } else if (offset + 2 <= len) {
+                /* low 'width' bits write (e.g. VID mangle, width 12) */
+                uint16_t cur = (frame[offset] << 8) | frame[offset + 1];
+                uint16_t mask = (1u << width) - 1;
+                cur = (cur & ~mask) | (data16 & mask);
+                frame[offset] = (cur >> 8) & 0xff;
+                frame[offset + 1] = cur & 0xff;
+            }
+            break;
+        }
+        case XPE_OP_NOP:
+        default:
+            return len;  /* terminator */
+        }
+    }
+    return len;
+}
+
 /* ===================== RX inject (backend -> guest) ===================== */
 
 /*
@@ -243,6 +451,9 @@ static void runner_rx_drain_check(void *opaque)
     AddressSpace *as = runner_dma_as(s);
 
     if (!s->rx.valid) {
+        /* ring not up yet - keep the heartbeat alive so we re-check */
+        timer_mod(s->rx_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000); /* 1ms */
         return;
     }
     while (s->rx_cons != s->rx.idx) {
@@ -267,11 +478,26 @@ static void runner_rx_drain_check(void *opaque)
             qemu_set_irq(s->irq[RUNNER_IRQ_FPM], 0);
             s->irq_asserted = false;
         }
+        /*
+         * Re-enable the backend RX poll. A dgram/socket backend disables its
+         * read handler once a receive is deferred (or returns a short result);
+         * flushing here re-arms it so queued frames keep flowing. Without this
+         * only the first injected datagram is ever delivered.
+         */
+        qemu_flush_queued_packets(qemu_get_queue(s->nic));
     } else {
         /* still pending -> keep line high and re-check soon */
         timer_mod(s->rx_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 200000); /* 200us */
+        return;
     }
+
+    /*
+     * Keep a slow heartbeat so the backend RX poll is periodically re-armed and
+     * the level IRQ is re-checked even when the guest is idle (1ms).
+     */
+    timer_mod(s->rx_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000); /* 1ms */
 }
 
 
@@ -297,6 +523,39 @@ static ssize_t runner_receive(NetClientState *nc, const uint8_t *buf, size_t len
     }
     if (len > RX_BUF_MAX) {
         len = RX_BUF_MAX;   /* truncate jumbo to one chunk for first light */
+    }
+
+    /*
+     * HW FAST PATH (offload): compute the NAT-C key for this frame and look it
+     * up. On a HIT, the Runner runs the embedded cmdlist (VLAN edit) and
+     * forwards the frame to the egress port WITHOUT delivering it to the CPU RX
+     * ring - exactly the behaviour that proves offload (subsequent packets
+     * bypass the A53). On a MISS, fall through to the slow path (deliver to
+     * CPU), where the driver's flowtable learns the flow and programs NAT-C.
+     */
+    {
+        uint8_t key[16];
+        int hit;
+
+        natc_compute_key(buf, len, key);
+        hit = natc_lookup(s, key);
+        if (hit >= 0) {
+            g_autofree uint8_t *fwd = g_malloc(RX_BUF_MAX);
+            size_t newlen;
+
+            memcpy(fwd, buf, len);
+            newlen = natc_run_cmdlist(s->natc[hit].ctx, fwd, len);
+            s->off_hits++;
+            qemu_log("bcm4916-runner: NAT-C HIT idx=%d -> HW forward (offload), "
+                     "len %zu->%zu, hits=%" PRIu64 " (CPU bypassed)\n",
+                     hit, len, newlen, s->off_hits);
+            /* forward out the egress port; CPU RX ring untouched */
+            qemu_send_packet(qemu_get_queue(s->nic), fwd, newlen);
+            return len;
+        }
+        s->off_misses++;
+        qemu_log("bcm4916-runner: NAT-C MISS -> CPU slow path, misses=%" PRIu64 "\n",
+                 s->off_misses);
     }
 
     desc_pa = s->rx.base + (uint64_t)s->rx.idx * DESC_SIZE;
@@ -442,6 +701,21 @@ static uint64_t runner_read(void *opaque, hwaddr addr, unsigned size)
         }
     }
 
+    /*
+     * NAT-C debug counters (model-only; not real silicon registers). Lets a
+     * test read offload hit/miss without parsing the QEMU log.
+     *   NATC base + 0x00 : off_hits (frames HW-forwarded, CPU bypassed)
+     *   NATC base + 0x08 : off_misses (frames sent to CPU slow path)
+     */
+    if (addr >= XRDP_OFF_NATC && addr < XRDP_OFF_NATC + 0x10) {
+        hwaddr off = addr - XRDP_OFF_NATC;
+        switch (off) {
+        case 0x00: return (uint32_t)s->off_hits;
+        case 0x08: return (uint32_t)s->off_misses;
+        default:   return 0;
+        }
+    }
+
     /* everything else reads 0 (PSRAM/RNR_MEM reads are not used by the driver) */
     return 0;
 }
@@ -523,6 +797,44 @@ static void runner_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             }
             return;
         }
+
+        /*
+         * NAT-C offload staging. The driver memcpy_toio's the 16-byte BE key
+         * and the context entry (word-by-word, 32-bit), then writel's the index
+         * and the command. memcpy_toio writes the BE-in-memory bytes with a raw
+         * store, so on this LE guest each 32-bit write arrives as the BE byte
+         * sequence reinterpreted as an int: store it LE to reconstruct the
+         * original BE byte order in our staging buffer.
+         */
+        if (off >= PSRAM_NATC_STAGE_KEY &&
+            off < PSRAM_NATC_STAGE_KEY + 16 && size == 4) {
+            stl_le_p(s->natc_stage_key + (off - PSRAM_NATC_STAGE_KEY),
+                     (uint32_t)val);
+            return;
+        }
+        if (off >= PSRAM_NATC_STAGE_CTX &&
+            off < PSRAM_NATC_STAGE_CTX + CTX_ENTRY_MAX) {
+            hwaddr coff = off - PSRAM_NATC_STAGE_CTX;
+            /* context is copied with memcpy_toio (variable length, may be
+             * 1/2/4/8-byte chunks); store byte-wise to be size-agnostic. */
+            unsigned i;
+            for (i = 0; i < size && coff + i < CTX_ENTRY_MAX; i++) {
+                s->natc_stage_ctx[coff + i] = (val >> (8 * i)) & 0xff;
+            }
+            return;
+        }
+        if (off == PSRAM_NATC_INDIR_INDEX && size == 4) {
+            s->natc_stage_idx = (uint32_t)val;
+            return;
+        }
+        if (off == PSRAM_NATC_INDIR_CMD && size == 4) {
+            switch ((uint32_t)val) {
+            case NATC_CMD_ADD: natc_add(s); break;
+            case NATC_CMD_DEL: natc_del(s); break;
+            default: break;
+            }
+            return;
+        }
         return;
     }
 
@@ -592,6 +904,12 @@ static void bcm4916_runner_reset(DeviceState *dev)
     memset(&s->tx, 0, sizeof(s->tx));
     memset(s->rx_cfg, 0, sizeof(s->rx_cfg));
     memset(s->tx_cfg, 0, sizeof(s->tx_cfg));
+    memset(s->natc, 0, sizeof(s->natc));
+    memset(s->natc_stage_key, 0, sizeof(s->natc_stage_key));
+    memset(s->natc_stage_ctx, 0, sizeof(s->natc_stage_ctx));
+    s->natc_stage_idx = 0;
+    s->off_hits = 0;
+    s->off_misses = 0;
     fpm_pool_reset(s);
     qemu_set_irq(s->irq[RUNNER_IRQ_QUEUE0], 0);
     qemu_set_irq(s->irq[RUNNER_IRQ_FPM], 0);
@@ -621,6 +939,9 @@ static void bcm4916_runner_realize(DeviceState *dev, Error **errp)
                           object_get_typename(OBJECT(dev)),
                           dev->id, &dev->mem_reentrancy_guard, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+
+    /* start the RX heartbeat (re-arms the backend poll; see drain_check) */
+    timer_mod(s->rx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
 }
 
 static const VMStateDescription vmstate_bcm4916_runner = {

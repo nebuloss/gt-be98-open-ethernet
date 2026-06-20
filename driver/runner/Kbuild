@@ -1,3 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0
-# Out-of-tree build of the open BCM4916 XRDP Runner CPU-conduit datapath driver.
-obj-m += bcm4916_runner.o
+# Out-of-tree build of the open BCM4916 XRDP Runner CPU-conduit datapath driver
+# plus the Phase-1 L2/VLAN HW flow-offload layer.
+#
+# The module is composed of three objects; the composite is named
+# bcm4916-runner (dash) so it does not collide with the bcm4916_runner.o
+# component object. Produces bcm4916-runner.ko.
+obj-m += bcm4916-runner.o
+bcm4916-runner-y := bcm4916_runner.o cmdlist.o flow_offload.o

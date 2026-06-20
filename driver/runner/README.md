@@ -13,10 +13,32 @@ CPU-ring datapath.
 
 ## Scope
 
-**Slow path only** — CPU-forwarded frames (RX trap-to-host + host TX). The
-hardware **fast path** (flow offload / NAT-C / cmdlist / RDD ucast) is *not*
-implemented here; the structs and bring-up are laid out so an offload layer can
-be added on top later without reworking the conduit.
+**Slow path** — CPU-forwarded frames (RX trap-to-host + host TX) — **plus
+Phase-1 L2/VLAN HW flow-offload**. The offload fast path (NAT-C connection table
++ XPE cmdlist + `FC_UCAST_FLOW_CONTEXT_ENTRY`) is now implemented for the
+**L2 bridge + VLAN** case (`is_l2_accel`): a flow-miss traps to the CPU, the
+driver learns it via the flowtable and programs one NAT-C entry, and every
+subsequent packet hits NAT-C and is forwarded by the Runner without the CPU.
+L3 + NAT (routed/NAPT) is **Phase 2** — explicitly rejected (`-EOPNOTSUPP`) and
+left as cmdlist stubs (`xpe_cmd_decrement_8` / `_replace_32` / `_apply_icsum_16`)
+so the `addIpv4Commands` sequence slots in next. See
+`re-notes/offload-phase1-status.md`.
+
+### Offload files
+- `cmdlist.{c,h}` — open XPE (XRDP Packet Engine) cmdlist builder: emits 16-bit
+  big-endian command words (opcode = word>>26), Phase-1 L2 ops (VLAN
+  push/pop/mangle + NOP). Clean-room from the RE'd opcode encoding.
+- `flow_offload.{c,h}` — the `FC_UCAST_FLOW_CONTEXT_ENTRY` builder, the 16-byte
+  masked BE NAT-C key builder, and the nf_flow_table / `TC_SETUP_FT` offload
+  block (flow_block_cb + FLOW_CLS_REPLACE/DESTROY/STATS), modelled on
+  mainline `mtk_ppe_offload.c`.
+- NAT-C connection-table I/O (`xrdp_natc_add/del/stats`) lives in
+  `bcm4916_runner.c` (it owns the MMIO window); `.ndo_setup_tc` +
+  `NETIF_F_HW_TC` register the offload block on the conduit.
+
+A debugfs trigger `…/bcm4916-runner/offload_selftest` (`echo "<vlan_op> <vid>"`)
+programs one L2 flow through the real builders + NAT-C add path (the QEMU
+offload proof). vlan_op: 0=plain L2, 1=push, 2=pop, 3=mangle.
 
 ## What it does
 
@@ -49,9 +71,13 @@ be added on top later without reworking the conduit.
 
 ## Files
 
-- `bcm4916_runner.h` — register map, descriptor/token bitfields (all cited).
-- `bcm4916_runner.c` — platform driver, FPM, RX NAPI, TX, microcode hook.
-- `Kbuild`, `Makefile` — out-of-tree module build.
+- `bcm4916_runner.h` — register map, descriptor/token bitfields, offload glue (cited).
+- `bcm4916_runner.c` — platform driver, FPM, RX NAPI, TX, microcode hook,
+  NAT-C I/O, `.ndo_setup_tc`, debugfs self-test.
+- `cmdlist.{c,h}` — open XPE cmdlist builder (Phase-1 L2/VLAN ops).
+- `flow_offload.{c,h}` — context/key builders + nf_flow_table offload block.
+- `Kbuild`, `Makefile` — out-of-tree module build. The module is the composite
+  `bcm4916-runner.ko` (= `bcm4916_runner.o + cmdlist.o + flow_offload.o`).
 
 ## Build (on the dedicated build host only)
 
@@ -114,6 +140,15 @@ move packets on real silicon until a licensed image is present.
 
 ## Honest status / TODO
 
+- **Offload Phase 1 (L2 + VLAN): implemented and proven in QEMU** — first packet
+  misses NAT-C → CPU; driver programs the entry; subsequent packets hit NAT-C →
+  HW-forwarded, CPU bypassed. cmdlist/context/key bytes validated against the
+  RE'd opcode encoding. See `re-notes/offload-phase1-status.md`. Gaps: the full
+  nf_flow_table FLOW_CLS_REPLACE trigger is proven via a debugfs self-test (same
+  code path) rather than live conntrack (needs `NF_FLOW_TABLE` + a 2-port
+  topology); context byte offsets / NAT-C key layout / indirect-register offsets
+  are contract placeholders, not pinned 6813 silicon offsets; CNPL stats stubbed;
+  Phase 2 (L3/NAT) not implemented.
 - FPM, RX ring + NAPI poll, TX descriptor build + SRAM doorbell: implemented.
 - **PSRAM RDD table offsets** (`CPU_RING_DESCRIPTORS_TABLE`,
   `CPU_TX_RING_DESCRIPTOR_TABLE`, `CPU_TX_RING_INDICES_VALUES_TABLE`) are
