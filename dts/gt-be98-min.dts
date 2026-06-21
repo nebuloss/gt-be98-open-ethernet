@@ -55,11 +55,13 @@
 };
 
 &nand_controller {
+	brcm,wp-not-connected;		/* [upstream bcm96813.dts] */
 	status = "okay";
 };
 
 &nandcs {
 	nand-on-flash-bbt;
+	brcm,nand-ecc-use-strap;	/* ECC layout from NAND strap/bootloader [upstream bcm96813.dts] */
 
 	partitions {
 		compatible = "fixed-partitions";

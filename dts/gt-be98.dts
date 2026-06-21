@@ -114,11 +114,15 @@
  * [silicon: /proc/mtd + /proc/device-tree/periph/nand + stock cmdline mtdparts]
  */
 &nand_controller {
+	brcm,wp-not-connected;		/* [upstream bcm96813.dts] */
 	status = "okay";
 };
 
 &nandcs {
 	nand-on-flash-bbt;	/* [stock GT-BE98 nandcs@0] */
+	brcm,nand-ecc-use-strap;	/* ECC layout from NAND strap/bootloader — REQUIRED for
+					 * mainline brcmnand to bind; the DTSI node carries no ECC
+					 * config, the board dts must. [upstream bcm96813.dts] */
 
 	partitions {
 		compatible = "fixed-partitions";
