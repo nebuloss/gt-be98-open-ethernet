@@ -8,11 +8,18 @@
  * and FPM-token bitfields are ported from the GPL Broadcom SDK:
  *   - FPM token format / register struct:
  *       asuswrt-merlin.ng .../bcmdrivers/opensource/char/fpm/impl1/fpm_priv.h
- *   - CPU RX descriptor (word0..3) layout:
- *       broadcom-sdk-416L05 .../shared/opensource/include/rdp/rdp_cpu_ring_defs.h
- *       (the "Rosetta stone"; cross-confirmed with rdpa.ko
- *        dump_RDD_PROCESSING_RX_DESCRIPTOR, ABI 2.3/5bis-G1)
- *   - TX descriptor layout: rdpa.ko dump_RDD_RING_CPU_TX_DESCRIPTOR, ABI 2.2
+ *   - CPU RX/FEED/RECYCLE/TX descriptor layout (BCM6813/XRDP, authoritative):
+ *       src-rt-5.04behnd.4916/rdp/projects/XRDP_CFE2/drivers/rdp_subsystem/cpu/
+ *         rdp_cpu_ring_defs.h          (CPU_RX_DESCRIPTOR, LE variant)
+ *       src-rt-5.04behnd.4916/rdp/drivers/rdpa_gpl/include/rdpa_cpu_helper.h
+ *         (rdpa_cpu_rx_pd_get / rdpa_cpu_ring_rest_desc parse + refill)
+ *       src-rt-5.04behnd.4916/rdp/drivers/rdp_subsystem/xrdp/rdp_cpu_ring_defs.h
+ *         (CPU_FEED_DESCRIPTOR)
+ *       src-rt-5.04behnd.4916/rdp/projects/BCM6813/target/rdd/
+ *         rdd_data_structures_auto.h  (RING_CPU_TX_DESCRIPTOR, CPU_RECYCLE_DESCRIPTOR)
+ *     All cross-validated against LIVE silicon descriptors captured via the stock
+ *     bdmf shell ("bs /Driver/cpUr/Vrpd"). The earlier 416L05 (63138/63148) layout
+ *     was the WRONG XRDP generation and is replaced; see the per-field notes below.
  *
  * Runner is BIG-ENDIAN; the ARM host is little-endian, so every 32-bit
  * descriptor word is byte-swapped (swap4) before/after the host touches it.
@@ -104,53 +111,167 @@
 
 /* ----------------------------------------------------------------------------
  * Host CPU RX data-ring descriptor: 16 bytes / 4 words, big-endian in DDR.
- * Layout = the GPL 416L05 CPU_RX_DESCRIPTOR (rdp_cpu_ring_defs.h), which is the
- * host view of the Runner PROCESSING_RX_DESCRIPTOR (ABI 2.3/5bis-G1).
  *
- * IMPORTANT (ABI 2.4 / 5bis-G1, GPL-confirmed): for the host CPU-RX *ring*,
- * word2 carries BOTH the buffer phys pointer (low 31 bits) AND the ownership
- * bit (bit31, MSB post-swap). This is the abs-address ring mode the open
- * driver uses; it does not depend on FPM-token decode on the RX path (the
- * Runner DMAs the frame straight into the host-provided buffer).
+ * AUTHORITATIVE SOURCE (BCM6813/XRDP, NOT 416L05/63138):
+ *   CPU_RX_DESCRIPTOR in the 6813 GPL SDK
+ *   src-rt-5.04behnd.4916/rdp/projects/XRDP_CFE2/drivers/rdp_subsystem/cpu/
+ *     rdp_cpu_ring_defs.h  (little-endian variant, lines ~143-235)
+ *   parsed by rdpa_cpu_rx_pd_get() in
+ *   src-rt-5.04behnd.4916/rdp/drivers/rdpa_gpl/include/rdpa_cpu_helper.h
+ *   and consumed by the GPL conduit in
+ *   bcmdrivers/opensource/net/enet/impl7/enet_ring.c (e.g. line 305:
+ *   "swap4bytes(p->word2) & 0x80000000" = ownership test).
+ *
+ * The Runner writes the descriptor big-endian in DDR; the LE host byte-swaps
+ * each 32-bit word (swap4bytes) before reading, so the field positions below
+ * are in the HOST (post-swap) little-endian word view.
+ *
+ * VALIDATED against LIVE silicon (bdmf "bs /Driver/cpUr/Vrpd", abs-addr mode):
+ *   LAN  len=66  host words: 5d094140 00a5010a 82800000 80000000
+ *     -> word0=ptr_low=0x5d094140, word1.packet_length=66, word1.abs=1,
+ *        word2.is_src_lan=1, word2.source_port=1, word3.is_exception=1.
+ *   WLAN/CPU len=124: 5d084140 000101f2 07400000 20000402
+ *     -> word0=ptr_low=0x5d084140, word1.packet_length=124, word1.abs=1,
+ *        word2.is_src_lan=0, word2.vport=3, word2.ssid=10,
+ *        word3.is_ucast=1, word3.wl_metadata=0x402.
+ *   (len=102/774 LAN samples also decode exactly; see RE notes.)
+ *
+ * NOTE on word numbering: this XRDP layout puts the abs buffer phys pointer in
+ * word0/word1 and length+abs in word1 - it is NOT the legacy DSL-RDP layout
+ * (word0=len, word2=ptr) that the old 416L05 header used. The abs phys pointer
+ * is the FULL 40-bit address: word0 = ptr_low[31:0], word1.host_buffer_data_ptr_hi
+ * = ptr[39:32]. Ownership/valid is signalled by word3.is_exception's byte (the
+ * runner sets word2/word3 high byte non-zero); the conduit's "packet present"
+ * test in the GPL enet uses (swap4bytes(word2) & 0x80000000) on this same ring
+ * for the *legacy* layout, but on XRDP the abs.abs bit (word1 bit16) marks abs
+ * mode and the runner clears word1/word2 to 0 on a free slot. The open driver
+ * follows rdpa_cpu_ring_rest_desc(): on refill it writes word2 only.
  * -------------------------------------------------------------------------- */
 struct runner_rx_desc {
-	__be32	word0;	/* packet_length[13:0], source_port[18:14], ... */
-	__be32	word1;	/* descriptor_type/reason/dst_ssid (unused slow-path) */
-	__be32	word2;	/* ownership(bit31) | host_buffer_data_pointer[30:0] */
-	__be32	word3;	/* wl/1588 metadata (unused slow-path) */
+	__be32	word0;	/* abs: host_buffer_data_ptr_low[31:0] (packet DDR phys, low 32) */
+	__be32	word1;	/* abs: ptr_hi[31:24] | abs(b16) | packet_length[15:2] | is_chksum_verified(b1) */
+	__be32	word2;	/* reason[5:0] | data_offset[12:6] | {LAN:src_port|CPU:ssid,vport} | is_src_lan(b31) */
+	__be32	word3;	/* wl_metadata/dst_ssid_vector[15:0] | is_ucast(b29)|is_rx_offload(b30)|is_exception(b31) */
 };
 
-/* word0 fields (LE host order, post-swap) - 416L05 little-endian struct */
-#define RXD_W0_PKT_LEN_MASK	0x3fff		/* bits [13:0]  */
-#define RXD_W0_SRC_PORT_SHIFT	14		/* bits [18:14] */
-#define RXD_W0_SRC_PORT_MASK	0x1f
+/* --- word0/word1: abs (absolute-address) buffer pointer + length --- */
+/* word0 = host_buffer_data_ptr_low[31:0] (no shift) */
+#define RXD_W1_PKT_LEN_SHIFT	2		/* word1 bits [15:2], width 14 */
+#define RXD_W1_PKT_LEN_MASK	0x3fff
+#define RXD_W1_ABS		BIT(16)		/* word1 bit16: 1 = abs-address mode */
+#define RXD_W1_IS_CHKSUM_VERIF	BIT(1)		/* word1 bit1 */
+#define RXD_W1_PTR_HI_SHIFT	24		/* word1 bits [31:24] = phys[39:32] */
+#define RXD_W1_PTR_HI_MASK	0xff
 
-/* word2: ownership bit + 31-bit buffer pointer */
-#define RXD_W2_OWNERSHIP_HOST	0x80000000U	/* MSB post-swap; set => host owns */
-#define RXD_W2_BUF_PTR_MASK	0x7fffffffU
+/* --- word2: reason / data_offset / source identification --- */
+#define RXD_W2_REASON_MASK	0x3f		/* bits [5:0]   rdpa_cpu_reason */
+#define RXD_W2_DATA_OFFSET_SHIFT 6		/* bits [12:6]  headroom offset */
+#define RXD_W2_DATA_OFFSET_MASK	0x7f
+#define RXD_W2_IS_SRC_LAN	BIT(31)		/* bit31: 1=LAN bridge port, 0=CPU/WLAN vport */
+/* LAN / WAN sub-decode (is_src_lan==1): */
+#define RXD_W2_LAN_SRC_PORT_SHIFT 25		/* bits [29:25] source bridge port */
+#define RXD_W2_LAN_SRC_PORT_MASK  0x1f
+#define RXD_W2_WAN_FLOW_ID_SHIFT  13		/* bits [24:13] WAN flow id (WAN only) */
+#define RXD_W2_WAN_FLOW_ID_MASK   0xfff
+/* CPU/WLAN vport sub-decode (is_src_lan==0): */
+#define RXD_W2_VPORT_SHIFT	25		/* bits [29:25] originating vport */
+#define RXD_W2_VPORT_MASK	0x1f
+#define RXD_W2_SSID_SHIFT	21		/* bits [24:21] WLAN ssid */
+#define RXD_W2_SSID_MASK	0xf
+
+/* --- word3: WLAN/offload metadata + flags --- */
+#define RXD_W3_WL_METADATA_MASK	0xffff		/* bits [15:0] dst_ssid_vector / wl_metadata */
+#define RXD_W3_IS_UCAST		BIT(29)		/* bit29 */
+#define RXD_W3_IS_RX_OFFLOAD	BIT(30)		/* bit30 */
+#define RXD_W3_IS_EXCEPTION	BIT(31)		/* bit31 (set for trapped/exception frames) */
+
+/*
+ * Ownership / refill: rdpa_cpu_ring_rest_desc() (rdpa_cpu_helper.h) hands a slot
+ * back to the runner by writing word2 = swap4bytes(phys & 0x7fffffff) - i.e. it
+ * stages the next buffer's low-31 phys in *word2* and clears the top bit so the
+ * runner owns it. On the XRDP abs ring the runner then DMAs the frame and rewrites
+ * word0/word1 (abs ptr + len) and word2/word3 (source + flags). The conduit's
+ * empty test is byte-wise (word3 high byte / is_exception byte != 0 once filled).
+ */
+#define RXD_REFILL_PTR_MASK	0x7fffffffU	/* low-31 phys staged into word2 on refill */
 
 /* ----------------------------------------------------------------------------
- * CPU-TX ring descriptor: 16 bytes, big-endian. ABI 2.2.
- * Built by the host in FPM-token mode (abs=0): packet copied into an FPM
- * buffer, token placed in word3 (pkt_buf_ptr_low_or_fpm_bn0).
+ * Host CPU FEED-ring descriptor: 8 bytes, big-endian.
+ * Source: CPU_FEED_DESCRIPTOR in the 6813 GPL SDK
+ *   src-rt-5.04behnd.4916/rdp/drivers/rdp_subsystem/xrdp/rdp_cpu_ring_defs.h
+ * Each feed entry is just an abs buffer token the host posts so the runner has
+ * somewhere to DMA the next RX frame. Live feed ring 24 entries look like
+ * 0xFFFFFF800E01FFF2 (an FPM/abs token, two 32-bit halves). LE host word view:
+ * -------------------------------------------------------------------------- */
+struct runner_feed_desc {
+	__be32	ptr_low;	/* host_buffer_data_ptr_low[31:0] (abs phys, low 32) */
+	__be32	w1;		/* ptr_hi[31:24] | abs(b16) | reserved[15:0] */
+};
+#define FEED_W1_ABS		BIT(16)		/* word1 bit16: abs-address token */
+#define FEED_W1_PTR_HI_SHIFT	24		/* word1 bits [31:24] = phys[39:32] */
+#define FEED_W1_PTR_HI_MASK	0xff
+
+/* ----------------------------------------------------------------------------
+ * Host CPU RECYCLE-ring descriptor: 8 bytes, big-endian.
+ * Source: CPU_RECYCLE_DESCRIPTOR in
+ *   src-rt-5.04behnd.4916/rdp/projects/BCM6813/target/rdd/rdd_data_structures_auto.h
+ *   (lines ~513-561; field byte/bit offsets from the RDD_CPU_RECYCLE_* macros).
+ * The runner posts freed skb tokens here for the host to reclaim. LE host view:
+ * -------------------------------------------------------------------------- */
+struct runner_recycle_desc {
+	__be32	skb_ptr_low;	/* skb pointer / phys low 32 */
+	__be32	w1;		/* skb_ptr_hi[31:24] | abs(b16) | from_feed_ring(b17) | rsvd */
+};
+#define RECYCLE_W1_ABS		BIT(16)		/* word1 bit16 (byte6 bit0 BE) */
+#define RECYCLE_W1_FROM_FEED	BIT(17)		/* word1 bit17 (byte6 bit1 BE) */
+#define RECYCLE_W1_PTR_HI_SHIFT	24		/* word1 bits [31:24] = skb_ptr_hi (byte7 BE) */
+#define RECYCLE_W1_PTR_HI_MASK	0xff
+
+/* ----------------------------------------------------------------------------
+ * CPU-TX ring descriptor: 16 bytes, big-endian.
+ * Source: RING_CPU_TX_DESCRIPTOR in the 6813 GPL SDK
+ *   src-rt-5.04behnd.4916/rdp/projects/BCM6813/target/rdd/rdd_data_structures_auto.h
+ *   (struct at line ~1994; field byte/bit offsets from the RDD_RING_CPU_TX_* macros,
+ *    e.g. PACKET_LENGTH @+0 lsb8 w14, IS_EMAC @+8 bit4, ABS @+9 bit0, PKT_BUF_PTR_LOW
+ *    @+12). Filled by the closed rdpa_cpu_send_sysb(); the open driver writes the
+ *    same wire layout. Positions below are the HOST (post-swap) LE word view.
+ *
+ * Two payload modes:
+ *   abs=1  : word3 = pkt_buf_ptr_low (host buffer phys low-32), word2.pkt_buf_ptr_high
+ *            = phys[39:32]. The runner DMAs directly from host DDR.
+ *   abs=0  : word3 = FPM token (fpm_bn0[19:0] | fpm_sop[29:20]); the host first
+ *            copied the packet into an FPM buffer.
  * -------------------------------------------------------------------------- */
 struct runner_tx_desc {
-	__be32	word0;	/* is_egress | egress_or_ingress_1 | packet_length | sk_buf_ptr_high */
-	__be32	word1;	/* sk_buf_ptr_low_or_data_1588 */
-	__be32	word2;	/* color|recycle|1588|is_emac | wan_flow/src_port | flags | pkt_buf_ptr_high */
-	__be32	word3;	/* pkt_buf_ptr_low_or_fpm_bn0 (the FPM token in abs=0 mode) */
+	__be32	word0;	/* sk_buf_ptr_high[7:0] | packet_length[21:8] | egress_or_ingress_1[30:22] | is_egress(b31) */
+	__be32	word1;	/* sk_buf_ptr_low_or_data_1588[31:0] */
+	__be32	word2;	/* pkt_buf_ptr_high[7:0] | ssid[13:10] | abs(b16) | wan_flow/src_port[27:20] | is_emac(b28) | flag_1588(b29) | do_not_recycle(b30) | color(b31) */
+	__be32	word3;	/* pkt_buf_ptr_low (abs=1) OR fpm_bn0[19:0]|fpm_sop[29:20] (abs=0) */
 };
 
-/* word0 (host order, post-swap). ABI 2.2 byte/bit map. */
-#define TXD_W0_IS_EGRESS	BIT(31)			/* byte0 bit7 */
+/* word0 (host LE order, post-swap) */
+#define TXD_W0_IS_EGRESS	BIT(31)			/* bit31 */
 #define TXD_W0_PKT_LEN_SHIFT	8			/* bits [21:8], width 14 */
 #define TXD_W0_PKT_LEN_MASK	0x3fff
+#define TXD_W0_SKB_PTR_HI_MASK	0xff			/* bits [7:0] = sk_buf phys[39:32] */
 
-/* word2 (host order, post-swap) */
-#define TXD_W2_IS_EMAC		BIT(28)			/* byte8 bit4 */
-#define TXD_W2_PORT_SHIFT	20			/* half@8 bits[11:4], egress port */
+/* word2 (host LE order, post-swap) */
+#define TXD_W2_COLOR		BIT(31)			/* bit31 */
+#define TXD_W2_DO_NOT_RECYCLE	BIT(30)			/* bit30 */
+#define TXD_W2_FLAG_1588	BIT(29)			/* bit29 */
+#define TXD_W2_IS_EMAC		BIT(28)			/* bit28 */
+#define TXD_W2_PORT_SHIFT	20			/* bits [27:20] wan_flow / source_port (egress) */
 #define TXD_W2_PORT_MASK	0xff
-#define TXD_W2_ABS		BIT(8)			/* byte9 bit0: 1=abs addr, 0=FPM token */
+#define TXD_W2_IS_VPORT		BIT(27)			/* bit27 (when set, [26:20]=vport flow_or_port_id) */
+#define TXD_W2_ABS		BIT(16)			/* bit16: 1=abs addr (word3=phys), 0=FPM token */
+#define TXD_W2_SSID_SHIFT	10			/* bits [13:10] WLAN ssid */
+#define TXD_W2_SSID_MASK	0xf
+#define TXD_W2_PKT_BUF_PTR_HI_MASK 0xff			/* bits [7:0] = pkt_buf phys[39:32] (abs mode) */
+
+/* word3 FPM-token sub-fields (abs=0 mode) */
+#define TXD_W3_FPM_BN0_MASK	0xfffff			/* bits [19:0] */
+#define TXD_W3_FPM_SOP_SHIFT	20			/* bits [29:20] */
+#define TXD_W3_FPM_SOP_MASK	0x3ff
 
 /* ----------------------------------------------------------------------------
  * CPU_RING_DESCRIPTOR - the per-ring control block the host fills in PSRAM so

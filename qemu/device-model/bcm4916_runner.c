@@ -137,9 +137,16 @@
 #define NATC_MAX_ENTRIES         64
 #define VLAN_HLEN_M              4
 
-/* RX descriptor word2 (ABI 2.4) */
-#define RXD_W2_OWNERSHIP_HOST    0x80000000u
-#define RXD_W2_BUF_PTR_MASK      0x7fffffffu
+/* RX descriptor (BCM6813/XRDP CPU_RX_DESCRIPTOR, abs-address mode, host LE view).
+ * word0 = buf phys low32; word1 = abs(b16)|packet_length[15:2]|ptr_hi[31:24];
+ * word2 = is_src_lan(b31)|src_port/vport[29:25]; word3 = flags.
+ * A filled slot has packet_length != 0; an empty (runner-owned) slot has it 0. */
+#define RXD_W1_ABS               (1u << 16)
+#define RXD_W1_PKT_LEN_SHIFT     2
+#define RXD_W1_PKT_LEN_MASK      0x3fffu
+#define RXD_W1_PTR_HI_SHIFT      24
+#define RXD_W2_IS_SRC_LAN        0x80000000u
+#define RXD_W2_SRC_PORT_SHIFT    25
 
 /* defaults */
 #define FPM_CHUNK_SIZE_DEFAULT   512
@@ -685,14 +692,14 @@ static void runner_rx_drain_check(void *opaque)
     while (s->rx_cons != s->rx.idx) {
         uint8_t desc[DESC_SIZE];
         hwaddr pa = s->rx.base + (uint64_t)s->rx_cons * DESC_SIZE;
-        uint32_t w2;
+        uint32_t w1;
         if (dma_memory_read(as, pa, desc, DESC_SIZE,
                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
             break;
         }
-        w2 = ldl_be_p(desc + 8);
-        if (w2 & RXD_W2_OWNERSHIP_HOST) {
-            break;   /* guest has not consumed this slot yet */
+        w1 = ldl_be_p(desc + 4);
+        if ((w1 >> RXD_W1_PKT_LEN_SHIFT) & RXD_W1_PKT_LEN_MASK) {
+            break;   /* slot still carries a packet: guest not consumed yet */
         }
         s->rx_cons = (s->rx_cons + 1) % s->rx.depth;
     }
@@ -739,7 +746,7 @@ static ssize_t runner_receive(NetClientState *nc, const uint8_t *buf, size_t len
     AddressSpace *as = runner_dma_as(s);
     hwaddr desc_pa;
     uint8_t desc[DESC_SIZE];
-    uint32_t w2, w0;
+    uint32_t w0, w1;
     uint64_t buf_pa;
     uint32_t copylen;
 
@@ -811,16 +818,18 @@ static ssize_t runner_receive(NetClientState *nc, const uint8_t *buf, size_t len
         return -1;
     }
 
-    w2 = ldl_be_p(desc + 8);
-    if (w2 & RXD_W2_OWNERSHIP_HOST) {
-        /* host hasn't re-armed this slot yet -> ring full, drop */
+    w0 = ldl_be_p(desc + 0);     /* abs buf phys, low 32 */
+    w1 = ldl_be_p(desc + 4);     /* abs(b16)|packet_length|ptr_hi */
+    if ((w1 >> RXD_W1_PKT_LEN_SHIFT) & RXD_W1_PKT_LEN_MASK) {
+        /* slot still carries an unconsumed packet -> ring full, drop */
         qemu_log_mask(LOG_GUEST_ERROR,
                       "bcm4916-runner: RX ring full at idx %u, dropping\n",
                       s->rx.idx);
         return len;   /* consumed (dropped) */
     }
 
-    buf_pa = w2 & RXD_W2_BUF_PTR_MASK;
+    /* abs phys = ptr_hi(word1[31:24]) << 32 | word0 */
+    buf_pa = ((uint64_t)(w1 >> RXD_W1_PTR_HI_SHIFT) << 32) | w0;
     copylen = len;
 
     /* 1. DMA the frame into the host-provided buffer */
@@ -829,13 +838,15 @@ static ssize_t runner_receive(NetClientState *nc, const uint8_t *buf, size_t len
         return -1;
     }
 
-    /* 2. word0 = packet_length | (src_port<<14); src_port 0 (single pipe) */
-    w0 = copylen & 0x3fff;
-    stl_be_p(desc + 0, w0);
+    /* 2. word2 = source: LAN, source_port 0 (single pipe), is_src_lan=1 */
+    stl_be_p(desc + 8, RXD_W2_IS_SRC_LAN);
+    /* word3 flags: 0 (plain LAN unicast) */
+    stl_be_p(desc + 12, 0);
 
-    /* 3. publish: word2 ownership=HOST (bit31), same buffer pointer; LAST. */
-    stl_be_p(desc + 8, (uint32_t)(buf_pa & RXD_W2_BUF_PTR_MASK) |
-                       RXD_W2_OWNERSHIP_HOST);
+    /* 3. publish: word1 with packet_length set (abs kept). LAST write. */
+    stl_be_p(desc + 4, RXD_W1_ABS |
+                       ((copylen & RXD_W1_PKT_LEN_MASK) << RXD_W1_PKT_LEN_SHIFT) |
+                       ((w1 >> RXD_W1_PTR_HI_SHIFT) << RXD_W1_PTR_HI_SHIFT));
 
     if (dma_memory_write(as, desc_pa, desc, DESC_SIZE,
                          MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {

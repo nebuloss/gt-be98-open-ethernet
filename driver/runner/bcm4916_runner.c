@@ -194,15 +194,23 @@ static int fpm_pool_init(struct runner_priv *p)
  * packet_length, the host consumes and re-arms in place.
  */
 
-/* hand descriptor 'd' a fresh buffer at buf_phys, ownership -> RUNNER */
+/* hand descriptor 'd' a fresh buffer at buf_phys, ownership -> RUNNER.
+ *
+ * XRDP abs-address ring (CPU_RX_DESCRIPTOR, rdp_cpu_ring_defs.h / rdpa_cpu_helper.h):
+ * the host stages the next buffer's abs phys pointer and marks abs mode, then
+ * zeroes word1's length so the slot reads "empty" until the runner DMAs a frame
+ * and writes packet_length (and source/flags). word0 = phys[31:0],
+ * word1 = abs(b16) | ptr_hi[31:24]; length field left 0 (RUNNER will fill).
+ */
 static void rx_rest_desc(struct runner_rx_desc *d, dma_addr_t buf_phys)
 {
-	/* rdpa_cpu_ring_rest_desc: word2 = swap4(phys & 0x7fffffff) (own=RUNNER) */
-	d->word0 = 0;
-	d->word1 = 0;
+	u32 w1 = RXD_W1_ABS |
+		 (((u32)(buf_phys >> 32) & RXD_W1_PTR_HI_MASK) << RXD_W1_PTR_HI_SHIFT);
+
+	d->word0 = cpu_to_be32((u32)buf_phys);
+	d->word1 = cpu_to_be32(w1);	/* packet_length == 0 => RUNNER owns / empty */
+	d->word2 = 0;
 	d->word3 = 0;
-	/* store big-endian; clearing bit31 == OWNERSHIP_RUNNER */
-	d->word2 = cpu_to_be32((u32)buf_phys & RXD_W2_BUF_PTR_MASK);
 }
 
 static int rx_ring_alloc(struct runner_priv *p)
@@ -269,18 +277,17 @@ static int runner_rx_poll(struct napi_struct *napi, int budget)
 
 	while (done < budget) {
 		struct runner_rx_desc *d = &p->rx_ring[p->rx_head];
-		u32 w2 = be32_to_cpu(d->word2);
-		u32 w0;
+		u32 w1 = be32_to_cpu(d->word1);
 		u16 len;
 		struct sk_buff *skb;
 		void *buf;
 
-		/* ABI 2.4: ownership = bit31 of word2 post-swap. */
-		if (!(w2 & RXD_W2_OWNERSHIP_HOST))
+		/* XRDP: a filled abs descriptor has a non-zero packet_length in
+		 * word1[15:2]; the empty (RUNNER-owned) slot we staged has len 0. */
+		len = (w1 >> RXD_W1_PKT_LEN_SHIFT) & RXD_W1_PKT_LEN_MASK;
+		if (!len)
 			break;
 
-		w0  = be32_to_cpu(d->word0);
-		len = w0 & RXD_W0_PKT_LEN_MASK;
 		buf = p->rx_buf[p->rx_head];
 
 		dma_sync_single_for_cpu(p->dev, p->rx_buf_phys[p->rx_head],

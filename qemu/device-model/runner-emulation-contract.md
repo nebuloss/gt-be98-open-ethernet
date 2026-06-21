@@ -106,49 +106,58 @@ RDD offset is TBD — driver and model share this constant). Layout, big-endian
 From this the model learns: **ring phys base** = `(base_addr_high<<32)|base_addr_low`,
 **depth** = number_of_entries, **entry size** = 16 B. The driver uses depth 256.
 
-### 3.2 Per-descriptor protocol (16 B big-endian, ABI 2.3/5bis-G1)
+### 3.2 Per-descriptor protocol (16 B big-endian — BCM6813/XRDP CPU_RX_DESCRIPTOR)
 
-Each ring entry (`struct runner_rx_desc`):
+Each ring entry (`struct runner_rx_desc`), abs-address mode. Layout is the 6813
+GPL `CPU_RX_DESCRIPTOR` (XRDP_CFE2 `rdp_cpu_ring_defs.h`), validated against live
+silicon. **This replaces the old 416L05 layout (word0=len, word2=ptr).** Fields
+below are the HOST (post-swap, little-endian word) view; in DDR each word is BE.
 
-| word | bytes | field |
+| word | bytes | field (host LE-word view) |
 |---|---|---|
-| word0 | 0..3 | `[13:0]`=packet_length, `[18:14]`=source_port (ingress vport) |
-| word1 | 4..7 | reason/dst_ssid (model may leave 0) |
-| word2 | 8..11 | **`[31]`=ownership** (1=HOST owns), `[30:0]`=host_buffer_data_pointer (buffer phys, low 31 bits) |
-| word3 | 12..15 | metadata (model may leave 0) |
+| word0 | 0..3 | `host_buffer_data_ptr_low[31:0]` = packet DDR phys, low 32 |
+| word1 | 4..7 | `[1]`=is_chksum_verified, `[15:2]`=packet_length, `[16]`=abs, `[31:24]`=ptr_hi (phys[39:32]) |
+| word2 | 8..11 | `[5:0]`=reason, `[12:6]`=data_offset, `[31]`=is_src_lan; LAN: `[29:25]`=source_port; CPU/WLAN: `[29:25]`=vport, `[24:21]`=ssid |
+| word3 | 12..15 | `[15:0]`=wl_metadata/dst_ssid_vector, `[29]`=is_ucast, `[30]`=is_rx_offload, `[31]`=is_exception |
 
-**Initial state (set by guest in `create_ring`):** every descriptor's word2 =
-`BE( buffer_phys & 0x7fffffff )` with **bit31 clear** ⇒ ownership = RUNNER. So at
-start the model owns all slots and each carries a guest-provided buffer phys.
+**Initial state (set by guest in `create_ring` / re-arm):** word0 =
+`BE(buffer_phys & 0xffffffff)`, word1 = `BE(0x00010000 | (ptr_hi<<24))`
+(abs bit set, **packet_length = 0**), word2 = word3 = 0. packet_length==0 marks
+the slot **RUNNER-owned / empty**. So at start the model owns all slots and each
+carries a guest-provided abs buffer phys in word0.
 
 ### 3.3 RX injection (model receives a frame from its host netdev backend)
 
 When a frame arrives on the model's backend netdev, for the slot the model is
 about to fill (it tracks its own producer index; start at 0, wrap at depth):
 
-1. Read the descriptor's **word2** (BE) → `buf_phys = word2 & 0x7fffffff`.
-   (Ownership must be RUNNER, i.e. bit31 clear; if it's HOST, the host hasn't
-   re-armed yet → ring full, drop or back-pressure.)
+1. Read **word0** (BE) → `buf_phys_low = word0`; read **word1** ptr_hi
+   (`[31:24]`) for the high address bits. The slot must be empty
+   (word1 packet_length == 0); if non-zero the host hasn't consumed it yet →
+   ring full, drop or back-pressure.
 2. **DMA the frame bytes into guest physical memory at `buf_phys`** (length =
    frame length, ≤ buffer size 2048).
-3. Write **word0** (BE) = `(packet_length & 0x3fff) | ((src_port & 0x1f)<<14)`.
-   `src_port` = the ingress vport for that backend (maps to a DSA user port);
-   for a dumb single-port pipe, 0 is fine.
-4. Write **word2** (BE) = `(buf_phys & 0x7fffffff) | 0x80000000` — i.e. **set
-   ownership = HOST** (bit31). This publish must be the **last** write and must
-   be ordered after the payload+word0 writes.
-5. Advance the model's producer index (wrap at depth).
-6. **Raise the RX IRQ** (see §5). RX has **no host-visible doorbell**; the IRQ
-   only wakes the guest's NAPI poll, which then polls ownership in DDR.
+3. Write **word2** (BE) for the source: LAN frame =>
+   `(src_port<<25) | 0x80000000` (is_src_lan=1); CPU/WLAN => leave is_src_lan=0
+   and set `(vport<<25)|(ssid<<21)`. reason/data_offset may stay 0.
+4. Write **word3** (BE) flags as needed (`is_ucast`/`is_exception`); 0 is fine
+   for a plain LAN unicast pipe.
+5. Write **word1** (BE) = `(packet_length<<2) | 0x00010000 | (ptr_hi<<24)` —
+   i.e. set **packet_length** (and keep abs). This publish must be the **last**
+   write and ordered after the payload + word0/word2/word3 writes; a non-zero
+   length is what the guest polls on.
+6. Advance the model's producer index (wrap at depth).
+7. **Raise the RX IRQ** (see §5). RX has **no host-visible doorbell**; the IRQ
+   only wakes the guest's NAPI poll, which then polls word1 length in DDR.
 
 ### 3.4 Host consume + re-arm (what the guest does — informational)
 
-The guest NAPI poll reads word2 (BE-swapped), checks bit31; if set, reads
-word0 for length, copies the payload out, then **re-arms in place**: rewrites
-word2 = `BE(buf_phys & 0x7fffffff)` (ownership cleared → RUNNER) using the
-**same buffer**, and advances its consumer index. The model must treat a slot
-whose ownership flips back to RUNNER as available again. (The guest reuses the
-same buffer phys, so the model can keep using the word2 pointer it reads.)
+The guest NAPI poll reads word1 (BE-swapped), checks `packet_length != 0`; if
+set, copies `packet_length` bytes out of the buffer at the word0/word1 abs phys,
+then **re-arms in place**: rewrites word0 = `BE(buf_phys)`, word1 =
+`BE(0x00010000 | (ptr_hi<<24))` (abs set, length cleared → RUNNER), word2=word3=0,
+using the **same buffer**, and advances its consumer index. The model must treat
+a slot whose length goes back to 0 as available again.
 
 ---
 
@@ -166,12 +175,15 @@ dma_alloc_coherent and the model reads them from guest memory).
 
 `struct runner_tx_desc`, the fields the model must honour:
 
-| word | field (host order, BE in memory) |
+| word | field (host LE-word view, BE in memory) |
 |---|---|
-| word0 | `[31]`=is_egress (1), `[21:8]`=packet_length |
+| word0 | `[31]`=is_egress (1), `[21:8]`=packet_length, `[7:0]`=sk_buf_ptr_high |
 | word1 | (sk_buf ptr / 1588 — unused in FPM mode) |
-| word2 | `[28]`=is_emac, `[19:12]`=egress port (bits[11:4] of half@8), `[8]`=abs (0 ⇒ FPM-token mode) |
-| word3 | **FPM token** (`pkt_buf_ptr_low_or_fpm_bn0`) when abs=0 |
+| word2 | `[31]`=color, `[30]`=do_not_recycle, `[29]`=flag_1588, `[28]`=is_emac, `[27:20]`=wan_flow/egress source_port, `[16]`=abs (0 ⇒ FPM-token mode), `[13:10]`=ssid, `[7:0]`=pkt_buf_ptr_high |
+| word3 | abs=0: **FPM token** = `fpm_bn0[19:0] | fpm_sop[29:20]`; abs=1: pkt_buf_ptr_low |
+
+(Source: 6813 GPL `RING_CPU_TX_DESCRIPTOR`, `rdd_data_structures_auto.h`. NOTE the
+abs bit is **word2 bit16**, not bit8 as in the old 416L05-derived note.)
 
 The driver always uses **abs=0 (FPM-token mode)**: word3 is an FPM token. The
 model computes the payload location via the token math (§2.2):
