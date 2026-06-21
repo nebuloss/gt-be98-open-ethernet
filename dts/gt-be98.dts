@@ -29,6 +29,25 @@
 
 /dts-v1/;
 
+/*
+ * BOOT-CRITICAL reserved firmware region (1 MiB @ phys 0).
+ * The bootloader leaves ATF/BL31 (the EL3 secure monitor that services PSCI
+ * SMC calls, incl. CPU_ON for SMP bringup), the secondary-CPU boot trampoline
+ * and the PMC firmware/log resident in low DRAM. Mainline upstream bcm6813.dtsi
+ * declares NO reservation, so a full memory@0 = <0 0x80000000> lets Linux clobber
+ * ATF -> the first PSCI CPU_ON faults very early (no console). The vendor SDK
+ * reserves exactly this via /memreserve/ in kernel/dts/boot_rsvdmem.dtsi:
+ *   0x00000:0x04000  16K  secondary-CPU boot
+ *   0x04000:0xC0000 752K  ATF/BL31 secure monitor   (ATF FIT load/entry = 0x4000)
+ *   0xC0000:0xF0000 192K  PMC firmware
+ *   0xF0000:0x100000 64K  PMC firmware log
+ * Non-SMC / no-OPTEE build (CONFIG_BRCM_SMC_BASED/BOOT and CONFIG_OPTEE all
+ * unset in the 6813 .config) => BOOT_RESERVED = ALWAYS_RESERVED = 0x100000.
+ * Source: src-rt-5.04behnd.4916 kernel/dts/boot_rsvdmem.dtsi +
+ *         bootloaders/armtf/.../bcm_mem_reserve.h + brcm_simple_aarch64_atf.its
+ */
+/memreserve/ 0x0000000000000000 0x0000000000100000;
+
 #include "bcm6813.dtsi"
 #include "bcm4916-enet.dtsi"
 
@@ -52,7 +71,24 @@
 	 */
 	memory@0 {
 		device_type = "memory";
-		reg = <0x0 0x0 0x0 0x80000000>;	/* 2 GiB [SDK]; TODO: confirm reserved regions */
+		reg = <0x0 0x0 0x0 0x80000000>;	/* 2 GiB [SDK GT-BE98 BP_DDR_TOTAL_SIZE_2048MB] */
+	};
+
+	/*
+	 * Same firmware region as the /memreserve/ above, also exposed as a
+	 * no-map reserved-memory node so the kernel reserved-memory framework
+	 * keeps it out of the linear map / page allocator. no-map => never
+	 * mapped cacheable, never handed to Linux (vendor keeps ATF/PMC here).
+	 */
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		atf_pmc@0 {
+			reg = <0x0 0x0 0x0 0x00100000>;	/* 1 MiB: bootcpu+ATF/BL31+PMC [SDK boot_rsvdmem.dtsi] */
+			no-map;
+		};
 	};
 };
 
