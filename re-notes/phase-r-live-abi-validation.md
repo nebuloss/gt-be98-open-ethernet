@@ -62,8 +62,32 @@ Exact corrected word/bit layout (RX 16 B abs-mode, feed/recycle 8 B, and a TX-de
 being derived from the 6813 rdpa.ko `Vrpd` decoder / dump_RDD function — apply to the header AND the
 QEMU model, then re-validate in QEMU.
 
+## Offload: live flow context + cmd_list capture (`bs /Bdmf/Examine ucast`)
+The BEST offload oracle: `bs "/Bdmf/Examine ucast"` dumps EVERY accelerated flow's full key +
+result context INCLUDING the cmd_list bytes — no graft module needed. Captured 4 live flows (SSH to
+the device's own IP, so CPU/gdx-delivery flows, NOT NAPT-rewrite):
+
+- **Key fields (confirm our NAT-C key):** `src_ip,dst_ip,prot=6,src_port,dst_port,dir=us,
+  tcp_pure_ack,vtag_num=0,tos,ctx_ext,client_idx,port_ingress_obj={eth0}`. Multi-flow keying is LIVE:
+  `fc_global_cfg={fc_accel_mode=layer23,fc_tcp_ack_mflows=1,fc_tos_mflows=1,fc_pbit_key_mode=0}` → the
+  SAME 5-tuple yields SEPARATE NAT-C entries per `tcp_pure_ack`(0/1) and per `tos`(0xb8/0x20) — our
+  builder/key must replicate this or keys won't match silicon.
+- **Result/context fields (confirm FC_UCAST_FLOW_CONTEXT_ENTRY):** `port_egress_obj={gdx0},queue_id,
+  is_routed=0,is_l2_accel=0,ip_addresses_table_index=4,rx_max_pkt_len=10258,tos,wl_metadata,
+  cmd_list_data_length=28,tx_adjust=-10,cmd_list_length=40,tunnel_index_ref=16,is_gdx_tx=yes,
+  gdx_ctx_data=1026,is_hw_cso=yes`.
+- **Live cmd_list (redacted flow, ingress eth0 → gdx0, dir=us):** cmd_list_length=40, data_length=28:
+  `6014 eb98 3f00 6014 00 00000000 3100 0020 0014 1804 8d00 000000 1894 ffff 0880 0021 b080 c188 b080 00 <zero pad>`
+  - op[0] `0x6014eb98 >> 26 = 0x18` = **REPLACE** ✓ (matches our pinned opcode set). Length-delimited
+    (cmd_list_data_length=28), the remaining context bytes are 0x00 padded (NOT 0xfc — the 0xfc framing
+    is a within-cmdlist pad nuance; here the trailing CONTEXT region is zero).
+  - This is a CPU/gdx-delivery cmd_list (is_routed=0/is_l2_accel=0), so it validates the cmd_list
+    ENCODING/framing + the context layout, not a NAPT IP/port rewrite.
+
 ## Next
-1. Apply corrected RX/TX/feed descriptor layout (RE in flight) to header + QEMU model; re-test slow path.
-2. Per-core TX doorbell: pin `CPU_TX_RING_INDICES` (RE: per-core ~0x2368–0x29c8, not 0x0) from live.
-3. Capture a live NAT-C entry (key+context+cmdlist) via `bs nAtc` for a real NAT flow (needs traffic
-   through the device) to validate the offload cmdlist bytes (the open gap in [[stock-driver-watch-lever]]).
+1. ✅ Corrected RX/TX/feed descriptor layout applied to header + QEMU model (commit 2298c77).
+2. Per-core TX doorbell: pin `CPU_TX_RING_INDICES` (RE: per-core ~0x2368–0x29c8, not 0x0) — RE'd from
+   rdpa.ko; live-pin needs a safe RNR_MEM read path (NOT raw MMIO).
+3. NAPT-rewrite cmd_list: capture a FORWARDED flow (through the box to another host, ideally a routed/
+   NAT topology) via `bs /Bdmf/Examine ucast` to validate the IP/port rewrite + csum ops of
+   flow_offload.c — the remaining open gap. The encoding/framing + key/context are now silicon-confirmed.
