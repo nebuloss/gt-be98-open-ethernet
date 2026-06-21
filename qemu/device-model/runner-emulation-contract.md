@@ -264,6 +264,61 @@ so the model does not need to decode them.
 
 ---
 
+## 6b. NAT-C offload — XPE cmdlist decode (byte-exact 6813 layout)
+
+When an RX frame **hits** a programmed NAT-C entry (§offload), the model runs
+the cmdlist embedded in the FC_UCAST context at byte offset
+`XPE_CTX_CMDLIST_OFF = 24` and forwards the result without delivering to the
+CPU. The cmdlist is **length-delimited** by `cmd_list_data_length`
+(`ctx[CTX_OFF_CMDLIST_DLEN]`) — there is **no NOP terminator**; trailing slot
+slack is padded with the byte `0xfc`, which lies past `dlen` and is never
+decoded.
+
+**Encoding (contract source: `driver/runner/cmdlist.c`, the byte-exact emitter
+pinned from `xpe_api.armb53_6813.o`).** Every command word is 32-bit
+**big-endian** (emitted as two 16-bit BE half-words). Common fields:
+
+- `opcode = byte0 >> 2`
+- for offset-based ops, `byte1 = (offset >> 1) + 1`, so `offset = (byte1-1)*2`.
+
+> SUPERSEDES the OLD uniform packing `opcode<<26 | offset8<<18 | position<<13 |
+> width<<8 | nbytes` (with MCOPY/MOVE/ICSUM at 0x13/0x2c/0x36). The driver no
+> longer emits that. The model now decodes the per-op byte layout below.
+
+| op | byte0 | opcode | byte1 | byte2 | byte3 | inline data after word | effect |
+|---|---|---|---|---|---|---|---|
+| `replace_32`      | `0x60` | `0x18` | `(off>>1)+1` | `0x94` (.data ref) | `4` | 4 B = 32-bit imm (hi half, lo half; BE) | overwrite 4 B @off |
+| `replace_16`      | `0x60` | `0x18` | `(off>>1)+1` | `0x94` | `2` | 2 B = 16-bit imm (BE) | overwrite 2 B @off |
+| `replace_bits_16` | `0x50` | `0x14` | `(off>>1)+1` | `0x94` | `(pos&0xf) \| (((width-1)+pos)&0xf)<<4` | 2 B = `imm<<pos` | replace `width` bits at `pos` in the 16-bit word @off |
+| `move_packet`     | `0x4c` | `0x13` | `from` (RAW byte off) | `to` (RAW byte off) | `nbytes` (`[6:0]`) | — | move `nbytes`; `to>from` = insert hole (VLAN push), `from>to` = delete hole (VLAN pop) |
+| `decrement_8`     | `0x6a` | `0x1a` | `(off>>1)+1` | `(off>>1)+1` | `0xff` | — | byte @off -= 1 (TTL) |
+| `apply_icsum_16`  | `0x70` | `0x1c` | `(off>>1)+1` | imm hi | imm lo | — (imm inline in low half, `0` here) | IP/L4 incremental checksum fixup @off |
+
+Decode notes:
+
+- **REPLACE (0x60)** is disambiguated by `byte3` (= nbytes): `4` → 32-bit, else
+  → 16-bit. Both consume their immediate from the bytes that *follow* the
+  command word (the open driver emits a flat single buffer, with the `.data`
+  operand inline immediately after each command word; `byte2 = 0x94` is the
+  pre-relocation `.data` reference and is not otherwise interpreted).
+- **REPLACE_BITS (0x50)** recovers `position = byte3 & 0xf` and
+  `width = ((byte3>>4)&0xf) - position + 1`; the inline operand is already
+  pre-shifted (`imm << position`), so the model masks it to the
+  `[(1<<width)-1] << position` window.
+- **MOVE_PACKET (0x4c)** carries **raw** byte offsets in `byte1`/`byte2` (not
+  `/2`) and no inline data. VLAN push = `insert_16(12,4)` = `move(12->16,4)` then
+  `replace_32(12,tag)`; VLAN pop = `delete_16(12,4)` = `move(16->12,4)`.
+- **ICSUM (0x70)** carries no separate data word (the 16-bit immediate is inline
+  in the command word's low half, `0` in the open driver). The model recomputes
+  the IP header checksum at `IP4_OFF_CSUM` or the L4 checksum elsewhere; real HW
+  applies the precomputed incremental delta.
+
+Approximation: ICSUM **recomputes** the full checksum rather than applying a
+ones-complement delta (functionally identical for a well-formed frame; the model
+zeroes the field and recomputes over the IP header / pseudo-header + L4 segment).
+
+---
+
 ## 7. Contract constants shared with the driver
 
 These must match `driver/runner/bcm4916_runner.{c,h}` exactly:

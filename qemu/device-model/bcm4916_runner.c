@@ -108,12 +108,28 @@
 #define CTX_OFF_VALID            (CTX_OFF_CMDLIST_OFF + XPE_CMDLIST_MAX_M + 2) /* 106 */
 #define CTX_ENTRY_MAX            124
 
-/* XPE opcodes (matches cmdlist.h; opcode = cmd_word >> 26) */
-#define XPE_OP_MCOPY             0x13   /* INSERT (VLAN push) */
-#define XPE_OP_REPLACE           0x18   /* REPLACE bits/16/32 (VLAN edit, NAT addr/port) */
-#define XPE_OP_ADD               0x1a   /* ADD imm; decrement_8 = ADD(-1) on TTL */
-#define XPE_OP_MOVE              0x2c   /* DELETE (VLAN pop) */
-#define XPE_OP_ICSUM            0x36   /* incremental checksum fixup (IP / L4) */
+/*
+ * XPE opcodes. opcode = byte0 >> 2 (= cmd_word >> 26). These are PINNED
+ * byte-for-byte from the driver's emitter (driver/runner/cmdlist.c, commit that
+ * rewrote the encoding to the 6813 silicon layout). The per-op byte0 the driver
+ * emits, and the opcode it decodes to, are:
+ *
+ *   replace_bits_16   byte0 0x50 -> op 0x14  (VLAN VID/PCP edit, ToS mangle)
+ *   move_packet       byte0 0x4c -> op 0x13  (VLAN push/pop primitive)
+ *   replace_16/_32    byte0 0x60 -> op 0x18  (full-field replace: NAT addr/port,
+ *                                             4-byte VLAN tag write)
+ *   decrement_8       byte0 0x6a -> op 0x1a  (= ADD(-1) on TTL, byte3 0xff)
+ *   apply_icsum_16    byte0 0x70 -> op 0x1c  (IP/L4 incremental checksum fixup)
+ *
+ * (Was the OLD uniform packing: opcode<<26 | offset8<<18 | position<<13 |
+ *  width<<8 | nbytes, with MCOPY/MOVE/ICSUM at 0x13/0x2c/0x36. The driver no
+ *  longer emits that; the per-op byte layout below is the contract.)
+ */
+#define XPE_OP_REPLACE_BITS      0x14   /* replace_bits_16, byte0 0x50 */
+#define XPE_OP_MOVE_PACKET       0x13   /* move_packet (VLAN push/pop), byte0 0x4c */
+#define XPE_OP_REPLACE           0x18   /* replace_16/_32, byte0 0x60 */
+#define XPE_OP_ADD               0x1a   /* decrement_8 = ADD(-1) on TTL, byte0 0x6a */
+#define XPE_OP_ICSUM             0x1c   /* apply_icsum_16 (IP / L4 csum), byte0 0x70 */
 /*
  * 0x3f is the opcode-switch default, NOT a terminator: the stock list is
  * length-delimited by cmd_list_data_length (xpe_api.o xpe_cmd_end emits no NOP
@@ -556,24 +572,40 @@ static void fixup_l4_csum(uint8_t *frame, size_t len, uint8_t csum_off)
 
 /*
  * Execute the embedded XPE cmdlist on a frame in-place, returning the new
- * length. Decodes 16-bit BE words; a command word's opcode is bits[31:26].
- * Matches the driver's cmdlist.c packing:
- *   word0: [31:26]=opcode [25:18]=offset8 [17:13]=position [12:8]=width [7:0]=nbytes
+ * length.
  *
- * Phase-1 L2: MCOPY=insert (VLAN push), MOVE=delete (VLAN pop), REPLACE-bits
- *   (TPID/TCI/VID write; width set, nbytes=0, +1 data word), NOP=terminate.
- * Phase-2 L3/NAT: ADD=decrement_8 (TTL -1, nbytes/width=8), REPLACE-32 (IP
- *   SA/DA NAT; nbytes=4, +2 data words), REPLACE-16 (L4 port NAPT; nbytes=2,
- *   +1 data word), ICSUM (recompute IP or L4 checksum at offset).
+ * NEW ENCODING (the byte-exact 6813 silicon layout — contract source is
+ * driver/runner/cmdlist.c). Every command word is a 32-bit BIG-ENDIAN word
+ * (emitted as two 16-bit BE half-words). The model reads 4 bytes at a time:
  *
- * REPLACE is disambiguated by nbytes: 4 => 32-bit replace, 2 => 16-bit replace,
- * else => bit-field replace (the Phase-1 VLAN packing).
+ *   byte0 = (opcode << 2) | sub-flags        -> opcode = byte0 >> 2
+ *   byte1 = "to" word index = (offset>>1)+1  -> offset = (byte1-1)*2  [offset ops]
+ *   byte2/byte3 are op-specific (see each case).
+ *
+ * Per-op layout and inline-data consumed AFTER the command word:
+ *   REPLACE_32 (0x60, op 0x18): b2=0x94(.data ref) b3=4. +4 inline bytes = the
+ *     32-bit immediate (hi half then lo half, BE). Overwrite 4 bytes @offset.
+ *   REPLACE_16 (0x60, op 0x18): b2=0x94 b3=2. +2 inline bytes = 16-bit immediate
+ *     (BE). Overwrite 2 bytes @offset.  (disambiguated from _32 by b3 == nbytes)
+ *   REPLACE_BITS_16 (0x50, op 0x14): b2=0x94 b3=(position&0xf)|(((width-1)+
+ *     position)&0xf)<<4. +2 inline bytes = operand already pre-shifted to
+ *     data16<<position. Replace 'width' bits at 'position' in the 16-bit word
+ *     @offset (so position/width are recovered from b3, and the inline operand
+ *     is masked back with the position/width window).
+ *   MOVE_PACKET (0x4c, op 0x13): b1=from (RAW byte off), b2=to (RAW byte off),
+ *     b3[6:0]=nbytes. NO inline data. insert = move(off -> off+n) opens a hole;
+ *     delete = move(off+n -> off) closes one. We detect push vs pop by to>from.
+ *   DECREMENT_8 (0x6a, op 0x1a): b1=b2=(offset>>1)+1, b3=0xff. NO inline data.
+ *     Decrement the byte @offset by 1 (TTL).
+ *   APPLY_ICSUM_16 (0x70, op 0x1c): b1=(offset>>1)+1, low half (b2/b3) = a 16-bit
+ *     immediate INLINE in the command word (0 here). NO separate data word. We
+ *     recompute the IP or L4 checksum at 'offset' (real HW applies the delta).
  *
  * FRAMING (matches the RE'd stock emitter, xpe_api.o xpe_cmd_end): the program
  * is LENGTH-DELIMITED by cmd_list_data_length (dlen) - there is NO NOP
  * terminator word. We walk command words until pos reaches dlen. The stock 0xfc
- * slot-pad bytes lie past dlen and are never reached. The XPE_OP_NOP/default
- * case below is a defensive early-out only.
+ * slot-pad bytes lie past dlen and are never reached; a 0xfc byte where a
+ * command word is expected is also treated as the end (defensive early-out).
  */
 static size_t natc_run_cmdlist(const uint8_t *ctx, uint8_t *frame, size_t len)
 {
@@ -582,43 +614,56 @@ static size_t natc_run_cmdlist(const uint8_t *ctx, uint8_t *frame, size_t len)
     int pos = 0;
 
     while (pos + 4 <= dlen) {
-        uint32_t cmd = (cl[pos] << 24) | (cl[pos + 1] << 16) |
-                       (cl[pos + 2] << 8) | cl[pos + 3];
-        uint8_t opcode = (cmd >> 26) & 0x3f;
-        uint8_t offset = (cmd >> 18) & 0xff;
-        uint8_t width  = (cmd >> 8) & 0x1f;
-        uint8_t nbytes = cmd & 0xff;
+        uint8_t b0 = cl[pos];
+        uint8_t b1 = cl[pos + 1];
+        uint8_t b2 = cl[pos + 2];
+        uint8_t b3 = cl[pos + 3];
+        uint8_t opcode = b0 >> 2;
+        /* offset-based ops: byte1 = (offset>>1)+1 -> offset = (byte1-1)*2 */
+        uint8_t offset = (uint8_t)((b1 - 1) * 2);
         pos += 4;
 
+        if (b0 == XPE_PAD_BYTE) {
+            break;   /* hit the 0xfc slot pad (defensive; normally past dlen) */
+        }
+
         switch (opcode) {
-        case XPE_OP_MCOPY:  /* INSERT nbytes at offset (VLAN push) */
-            if (offset <= len && len + nbytes <= RX_BUF_MAX) {
-                memmove(frame + offset + nbytes, frame + offset, len - offset);
-                memset(frame + offset, 0, nbytes);
-                len += nbytes;
+        case XPE_OP_MOVE_PACKET: {
+            /* byte1=from (RAW), byte2=to (RAW), byte3[6:0]=nbytes; no inline. */
+            uint8_t from = b1;
+            uint8_t to = b2;
+            uint8_t n = b3 & 0x7f;
+            if (to > from) {
+                /* insert: open a hole of n bytes at 'from' (VLAN push) */
+                if (from <= len && len + n <= RX_BUF_MAX) {
+                    memmove(frame + from + n, frame + from, len - from);
+                    memset(frame + from, 0, n);
+                    len += n;
+                }
+            } else if (from > to) {
+                /* delete: close the hole, move [from..] back to 'to' (VLAN pop).
+                 * removes (from - to) bytes; for delete_16 that equals 'n'. */
+                if (from <= len) {
+                    memmove(frame + to, frame + from, len - from);
+                    len -= (from - to);
+                }
             }
             break;
-        case XPE_OP_MOVE:   /* DELETE nbytes at offset (VLAN pop) */
-            if (offset + nbytes <= len) {
-                memmove(frame + offset, frame + offset + nbytes,
-                        len - offset - nbytes);
-                len -= nbytes;
-            }
-            break;
-        case XPE_OP_ADD:    /* decrement_8: ADD(-1) on an 8-bit field (TTL) */
+        }
+        case XPE_OP_ADD:    /* decrement_8: byte3=0xff, no inline (TTL -1) */
             if (offset < len) {
                 frame[offset] = (uint8_t)(frame[offset] - 1);
             }
             break;
-        case XPE_OP_ICSUM:  /* recompute checksum at 'offset' (no inline data) */
+        case XPE_OP_ICSUM:  /* apply_icsum_16: 16-bit imm inline in word, no data */
             if (offset == IP4_OFF_CSUM_M) {
                 fixup_ip_csum(frame, len, offset);
             } else {
                 fixup_l4_csum(frame, len, offset);
             }
             break;
-        case XPE_OP_REPLACE:
-            if (nbytes == 4) {              /* REPLACE-32: IP SA/DA NAT */
+        case XPE_OP_REPLACE:    /* byte0 0x60: full-field replace, b3 = nbytes */
+            if (b3 == 4) {              /* REPLACE-32: IP SA/DA NAT, +4 inline */
                 uint32_t d32 = 0;
                 if (pos + 4 <= dlen) {
                     d32 = (cl[pos] << 24) | (cl[pos + 1] << 16) |
@@ -631,7 +676,7 @@ static size_t natc_run_cmdlist(const uint8_t *ctx, uint8_t *frame, size_t len)
                     frame[offset + 2] = (d32 >> 8) & 0xff;
                     frame[offset + 3] = d32 & 0xff;
                 }
-            } else if (nbytes == 2) {       /* REPLACE-16: L4 port NAPT */
+            } else {                    /* REPLACE-16: L4 port NAPT, +2 inline */
                 uint16_t d16 = 0;
                 if (pos + 2 <= dlen) {
                     d16 = (cl[pos] << 8) | cl[pos + 1];
@@ -641,27 +686,35 @@ static size_t natc_run_cmdlist(const uint8_t *ctx, uint8_t *frame, size_t len)
                     frame[offset]     = (d16 >> 8) & 0xff;
                     frame[offset + 1] = d16 & 0xff;
                 }
-            } else {                        /* REPLACE-bits: VLAN edit */
-                uint16_t data16 = 0;
-                if (pos + 2 <= dlen) {
-                    data16 = (cl[pos] << 8) | cl[pos + 1];
-                    pos += 2;
-                }
-                if (width >= 16 && (size_t)(offset + 2) <= len) {
-                    frame[offset] = (data16 >> 8) & 0xff;
-                    frame[offset + 1] = data16 & 0xff;
-                } else if ((size_t)(offset + 2) <= len) {
-                    uint16_t cur = (frame[offset] << 8) | frame[offset + 1];
-                    uint16_t mask = (1u << width) - 1;
-                    cur = (cur & ~mask) | (data16 & mask);
-                    frame[offset] = (cur >> 8) & 0xff;
-                    frame[offset + 1] = cur & 0xff;
-                }
             }
             break;
+        case XPE_OP_REPLACE_BITS: { /* byte0 0x50: bit-field replace, +2 inline */
+            /* b3 = (position & 0xf) | (((width-1)+position) & 0xf) << 4.
+             * Recover position and width; the inline operand is data16<<position
+             * (already pre-shifted by the emitter), so mask it to the window. */
+            uint8_t position = b3 & 0x0f;
+            uint8_t hinib = (b3 >> 4) & 0x0f;     /* = (width-1)+position */
+            uint8_t width = (uint8_t)(hinib - position + 1);
+            uint16_t operand = 0;
+            if (pos + 2 <= dlen) {
+                operand = (cl[pos] << 8) | cl[pos + 1];
+                pos += 2;
+            }
+            if (width >= 16 && (size_t)(offset + 2) <= len) {
+                frame[offset] = (operand >> 8) & 0xff;
+                frame[offset + 1] = operand & 0xff;
+            } else if (width > 0 && (size_t)(offset + 2) <= len) {
+                uint16_t cur = (frame[offset] << 8) | frame[offset + 1];
+                uint16_t mask = (uint16_t)(((1u << width) - 1) << position);
+                cur = (cur & ~mask) | (operand & mask);
+                frame[offset] = (cur >> 8) & 0xff;
+                frame[offset + 1] = cur & 0xff;
+            }
+            break;
+        }
         case XPE_OP_NOP:
         default:
-            return len;  /* terminator */
+            return len;  /* defensive terminator (length-delimited normally) */
         }
     }
     return len;
