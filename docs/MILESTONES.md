@@ -104,3 +104,19 @@ intermediate checkpoint, not the deliverable.
   device (4.19.294), the RE container (dev-reverse running), dev-build (x86_64).
   Inherited WiFi-effort infra/recovery memory. User constraint added: no connectivity-breaking
   live tests for now.
+- 2026-06-21: **On-silicon ABI validation (WiFi-style graft, exclusive window).** Mainline kernel
+  CANNOT boot on this unit (RSA secure-boot enforced + no kexec + stock 4.19) → validate the HW ABI
+  via the stock driver's bdmf `bs` shell (safe oracle) + a 4.19 graft probe (`tools/stock-watch/
+  xrdp_peek.c`). Proven: HW-watchdog auto-revert recovers a host-wide wedge in ~74 s (serial-free).
+  CAUGHT+FIXED real silicon mismatches: (1) RX/TX descriptor layout was from the wrong XRDP gen
+  (416L05) — corrected to 6813, proven vs live `bs Vrpd` samples; (2) XPE cmd_list emitter byte-
+  encoding was a wrong uniform packing — rewrote each emitter byte-exact from xpe_api.armb53_6813.o,
+  live-confirmed. Offload key (incl. vtag_num + multi-flow tcp_ack/tos keying), FC_UCAST context
+  fields, cmd_list encoding, and VLAN action (vtag_num in key, tx_adjust +4/tag) all silicon-
+  confirmed via `bs /Bdmf/Examine ucast`. Driver + QEMU model synced to the corrected encoding;
+  **QEMU offload regression PASSES end-to-end** (slow-path + L2/VLAN + L3/NAT, CPU bypassed) with the
+  corrected code. Commits 2298c77/eb931da/875a57e/246e4ad. Scope refined: device is an AP → NAT
+  deferred; deliverable = 10G L2/VLAN HW forward, CPU idle. REMAINING for on-silicon 10G-accel proof:
+  capture a real `is_l2_accel=1` forward flow (CPU-bypassed) — needs a 2nd active port (only eth0 is
+  cabled) or WiFi up. Note: kernel builds the driver IN-TREE (CONFIG_BCM4916_RUNNER=y); keep
+  drivers/net/ethernet/broadcom + drivers/net/pcs copies synced with driver/runner + driver/pcs.
