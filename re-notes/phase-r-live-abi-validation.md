@@ -84,6 +84,26 @@ the device's own IP, so CPU/gdx-delivery flows, NOT NAPT-rewrite):
   - This is a CPU/gdx-delivery cmd_list (is_routed=0/is_l2_accel=0), so it validates the cmd_list
     ENCODING/framing + the context layout, not a NAPT IP/port rewrite.
 
+## Offload: VLAN-tagged flow vs untagged (VLAN-action validation)
+The GT-BE98 here is single-uplink (only eth0 cabled) bridge/AP mode → it only ACCELERATES flows
+terminating at itself (no transit; routing/NAT is upstream at 10.0.x.254). To exercise the VLAN path
+we gave `br50` (VLAN 50 "dev") a temporary IP and drove a TCP flow from a host on the VLAN-50
+subnet to it (then removed the IP). Comparing the tagged flow to the untagged admin flow
+isolates the VLAN handling exactly:
+
+| field | untagged (admin, br0) | VLAN-50 tagged (br50) |
+|---|---|---|
+| key `vtag_num` | **0** | **1** (VLAN tag is in the NAT-C key) |
+| `tx_adjust` | -10 | **-6** (+4 bytes = the 802.1Q tag) |
+| `cmd_list` (40B) | `6014 eb98 3f00 6014 00*5 39 0000 2000 14 **18** 04 **8d**00 00*3 1894ffff08800021b080c188b08000` | `6014 871d 3f00 6014 00*5 41 0000 2000 14 **23** 04 **91**00 00*3 1894ffff08800021b080c188b08000` |
+
+So the VLAN-50 flow differs only in: (a) `vtag_num=1` in the key, (b) `tx_adjust` larger by 4, (c) two
+cmd_list operands shifted (the `8d`→`91` byte is +4 = the tag length; the `18`→`23` operand and the
+`eb98`→`871d` REPLACE constant track the header/csum delta). The per-entry counter byte (39/41…) just
+indexes the context. This confirms our offload must put `vtag_num` in the key and emit the VLAN
+length/offset adjustment — and that the live `NATC_VLAN_ACTION_TBL` path is what we model. (All flows
+here are CPU/gdx-delivery, is_routed=0/is_l2_accel=0.)
+
 ## Next
 1. ✅ Corrected RX/TX/feed descriptor layout applied to header + QEMU model (commit 2298c77).
 2. Per-core TX doorbell: pin `CPU_TX_RING_INDICES` (RE: per-core ~0x2368–0x29c8, not 0x0) — RE'd from
