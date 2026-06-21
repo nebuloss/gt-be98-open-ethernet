@@ -46,6 +46,29 @@
  * Packet byte offsets (from SOP): the 802.1Q tag sits at offset 12 (after the
  * 12-byte MAC DA+SA); the TCI (PCP[15:13]|DEI[12]|VID[11:0]) is at offset 14.
  */
+/*
+ * STOCK L2-FORWARD op sequence — DERIVED from the cmdlist_l2_ucast.armb53_6813.o
+ * compiler (cmdlist_l2_ucast_create_bin, ordered CALL26 trace) + the per-op
+ * encoding pinned from xpe_api.o:
+ *
+ *   - plain L2 forward, no VLAN change: the cmdlist is (nearly) EMPTY. The
+ *     forwarding decision is the CONTEXT (vport / service_queue_id / is_l2_accel),
+ *     not the cmdlist. The stock compiler still wraps optional save_16/
+ *     compute_csum_16 for a CSO flow, but no header edit is emitted. So our
+ *     empty-body + end() is correct for the no-op forward case.
+ *   - VLAN PUSH:  move_packet(open 4B hole @12) ; replace the 4-byte tag.
+ *                 Stock uses sop_push_replace; the equivalent primitive pair is
+ *                 move_packet + a single 32-bit replace of [TPID|TCI].
+ *   - VLAN POP:   move_packet(remove 4B @12)  (stock sop_pull_replace).
+ *   - VLAN MANGLE (VID/PCP remark, no length change): replace_bits_16 on the TCI
+ *     at offset 14 — exactly what the stock compiler emits (replace_bits_16/
+ *     copy_bits_16 #9/#17/#18 in the trace).
+ *
+ * NB the two LIVE captured samples (untagged/VLAN-50) are is_l2_accel=0 CPU/gdx
+ * delivery flows, so they pin the ENCODING (byte0=op<<2, byte1=(off>>1)+1, the
+ * tag-length operand 8d->91 = +4, tx_adjust -10 vs -6) but NOT this forward op
+ * shape; the shape above comes from the L2 compiler's call sequence.
+ */
 void xrdp_build_l2_cmdlist(const struct xrdp_flow *f, struct xpe_cmdlist *cl)
 {
 	xpe_cmdlist_init(cl);
@@ -53,18 +76,20 @@ void xrdp_build_l2_cmdlist(const struct xrdp_flow *f, struct xpe_cmdlist *cl)
 	if (f->vlan_push) {
 		u16 tci = ((f->vlan_push_pcp & 0x7) << 13) |
 			  (f->vlan_push_vid & 0xfff);
+		u32 tag = ((u32)ETH_P_8021Q << 16) | tci;
 
-		/* make room for the 4-byte tag at offset 12 (sop push) */
+		/* open a 4-byte hole for the tag at offset 12 (move_packet) */
 		xpe_cmd_insert_16(cl, 12, VLAN_HLEN);
-		/* write TPID (0x8100) at offset 12 */
-		xpe_cmd_replace_bits_16(cl, 12, 0, 16, ETH_P_8021Q);
-		/* write TCI at offset 14 */
-		xpe_cmd_replace_bits_16(cl, 14, 0, 16, tci);
+		/* write the full 4-byte 802.1Q tag (TPID|TCI) at offset 12 with a
+		 * single 32-bit replace (byte0 0x60), matching the replace family
+		 * the stock emits for a fixed multi-byte header write */
+		xpe_cmd_replace_32(cl, 12, tag);
 	} else if (f->vlan_pop) {
-		/* strip the 4-byte tag at offset 12 (sop pull) */
+		/* strip the 4-byte tag at offset 12 (move_packet) */
 		xpe_cmd_delete_16(cl, 12, VLAN_HLEN);
 	} else if (f->vlan_mangle) {
-		/* rewrite only the VID bits [11:0] of the TCI at offset 14 */
+		/* rewrite only the VID bits [11:0] of the TCI at offset 14
+		 * (replace_bits_16: position 0, width 12) */
 		xpe_cmd_replace_bits_16(cl, 14, 0, 12,
 					f->vlan_mangle_vid & 0xfff);
 	}
@@ -153,18 +178,24 @@ void xrdp_build_ctx(const struct xrdp_flow *f, const struct xpe_cmdlist *cl,
 	if (f->is_hw_cso)
 		ctx->buf[CTX_OFF_IS_HW_CSO] = BIT(0);
 
-	/* Embed the cmdlist inline at +16. Copy the full padded buffer (clen
-	 * bytes = executable dlen + the trailing 0xfc slot pad emitted by
-	 * xpe_cmd_end), so the context's command_list[] slack matches the stock
-	 * 0xfc fill. The Runner executes only the first dlen bytes
-	 * (length-delimited; the 0xfc pad is never decoded). */
+	/* Embed the cmdlist inline at struct byte +24 (XPE_CTX_CMDLIST_OFF, pinned
+	 * from the live FC_UCAST capture). Copy the full padded buffer (clen bytes =
+	 * executable dlen + the trailing 0xfc slot pad emitted by xpe_cmd_end), so
+	 * the context's command_list[] slack matches the stock 0xfc fill. The Runner
+	 * executes only the first dlen bytes (length-delimited; 0xfc never decoded). */
 	if (clen > XPE_CMDLIST_MAX_BYTES)
 		clen = XPE_CMDLIST_MAX_BYTES;
 	memcpy(&ctx->buf[XPE_CTX_CMDLIST_OFF], cl->buf, clen);
 
-	/* the TWO length fields (live-flow-dump.md "CORRECTS") */
+	/* the TWO length fields (live-flow-dump.md "CORRECTS").
+	 * REAL SILICON: the length is carried as command_list_length_32 in 32-bit
+	 * WORD units (stock-watch-capture.md sec 2: cmd_list_length=40 -> 0x0a). Our
+	 * driver<->model contract stores raw byte counts; a real-HW context builder
+	 * must instead write round_up(clen,4)/4 into the command_list_length_32
+	 * bitfield of WORD 1. */
 	ctx->buf[CTX_OFF_CMDLIST_DLEN] = dlen;
-	ctx->buf[CTX_OFF_CMDLIST_LEN]  = clen;
+	ctx->buf[CTX_OFF_CMDLIST_LEN]  = clen;	/* model contract: byte count.
+						 * real HW: clen/4 in length_32. */
 	ctx->buf[CTX_OFF_VALID]        = 1;
 
 	ctx->len = CTX_OFF_VALID + 1;

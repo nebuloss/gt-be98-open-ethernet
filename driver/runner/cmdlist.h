@@ -27,19 +27,33 @@
 
 #include <linux/types.h>
 
-/* XPE opcode values, bits[31:26] of the (host-order) 32-bit command word.
- * Pinned in xrdp-offload-abi.md sec 2.2. */
+/*
+ * XPE opcode values = bits[31:26] of the 32-bit command word (= byte0 >> 2).
+ *
+ * NOW PINNED BYTE-FOR-BYTE from the stock emitters in xpe_api.armb53_6813.o
+ * (objdump). The per-op byte0 (and thus the emitted opcode) is:
+ *   replace_bits_16   byte0 0x50  -> opcode 0x14   (@0x1e20)
+ *   __cmd_move_packet byte0 0x4c  -> opcode 0x13   (@0xd30; VLAN push/pop primitive)
+ *   __cmd_replace     byte0 0x60  -> opcode 0x18   (@0x1290; replace_16/_32, LIVE-confirmed)
+ *   decrement_8       byte0 0x6a  -> opcode 0x1a (ADD), byte3 0xff   (@0x2c50)
+ *   apply_icsum_16    byte0 0x70  -> opcode 0x1c, 16-bit imm in low half (@0x2d60)
+ * These supersede the generic >>26 table values below (kept for defensive
+ * decoding only). The ACTUAL byte structure is built directly in cmdlist.c.
+ *
+ * !! QEMU MODEL CONTRACT: qemu/ runner model must be updated to decode this
+ *    real byte layout (byte0=op<<2|flags, byte1=(off>>1)+1, op-specific
+ *    bytes 2/3) instead of the old uniform offset8<<18|position<<13 split. !!
+ */
 #define XPE_OP_CMP_JMP	0x01
 #define XPE_OP_JMPCOND	0x02
 #define XPE_OP_JMPREG	0x03
-#define XPE_OP_MCOPY	0x13
-#define XPE_OP_REPLACE	0x18
+#define XPE_OP_MCOPY	0x13	/* move-packet (VLAN push/pop), byte0 0x4c */
+#define XPE_OP_REPLACE_BITS 0x14 /* replace_bits_16 (VLAN/ToS edit), byte0 0x50 */
+#define XPE_OP_REPLACE	0x18	/* replace_16/_32 (full field), byte0 0x60 */
+#define XPE_OP_ICSUM	0x1c	/* apply_icsum_16, byte0 0x70 (emitted value) */
+#define XPE_OP_ADD	0x1a	/* decrement_8 = ADD(-1), byte0 0x6a, byte3 0xff */
 #define XPE_OP_GDMA	0x1c
-#define XPE_OP_ADD	0x1a	/* ADD immediate to a field; decrement_8 = ADD(-1).
-				 * INFER (ABI sec 2.2 "ADD ~0x18 group"); the open
-				 * driver + QEMU model agree on this value. */
 #define XPE_OP_MOVE	0x2c
-#define XPE_OP_ICSUM	0x36
 /*
  * 0x3f is the opcode-switch "default" (csel fallback) in xpe_api_opcode_name -
  * it is NOT used as a list terminator. The stock list is length-delimited by
@@ -89,9 +103,17 @@ void xpe_cmd_replace_bits_16(struct xpe_cmdlist *cl, u8 offset, u8 position,
 			     u8 width, u16 data16);
 
 /*
+ * MOVE-packet primitive (opcode 0x13, byte0 0x4c): shift 'nbytes' bytes from
+ * 'from' to 'to' within the packet. The building block of VLAN push/pop
+ * (pinned from __cmd_move_packet @0xd30). offsets are RAW byte offsets.
+ */
+void xpe_cmd_move_packet(struct xpe_cmdlist *cl, u8 from, u8 to, u8 nbytes);
+
+/*
  * INSERT bytes at SOP-relative 'offset' (header expand). Used for VLAN_PUSH:
  * make room for the 4-byte 802.1Q tag, then replace_bits to write TPID+TCI.
- * Modelled as a sop_push_replace (xrdp-offload-abi.md sec 2.3/2.4b).
+ * Modelled as a move_packet (stock uses sop_push_replace; the in-place move is
+ * the equivalent primitive — xrdp-offload-abi.md sec 2.3/2.4b).
  */
 void xpe_cmd_insert_16(struct xpe_cmdlist *cl, u8 offset, u8 nbytes);
 

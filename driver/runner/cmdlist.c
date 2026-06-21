@@ -96,34 +96,87 @@ static void xpe_emit_cmd32(struct xpe_cmdlist *cl, u32 cmd)
 	xpe_emit16(cl, cmd & 0xffff);
 }
 
-static u32 xpe_pack_cmd(u8 opcode, u8 offset8, u8 position, u8 width, u8 nbytes)
+/*
+ * SILICON COMMAND-WORD LAYOUT — PINNED BYTE-FOR-BYTE FROM xpe_api.armb53_6813.o
+ * (objdump -d, file offsets quoted below). The earlier uniform field split
+ * (opcode<<26 | offset8<<18 | position<<13 | width<<8 | nbytes) was WRONG: the
+ * stock emitters pack a DIFFERENT 32-bit big-endian word per op family. The two
+ * facts common to every family (also live-confirmed):
+ *   byte0 = (opcode << 2) | sub-flags     (so opcode = word>>26 = byte0>>2)
+ *   byte1 = "to" word-index = (offset >> 1) + 1   [for the offset-based ops]
+ * The remaining two bytes are op-specific (see each emitter).
+ *
+ * NOTE on offsets: the offset-based ops index a 16-bit WORD slot, so the byte
+ * offset MUST be even; byte1 = (offset>>1)+1. A 32-bit word lands MSB-first.
+ */
+
+/* word-index helper: byte1 = (byte_offset >> 1) + 1  (xpe_api.o, every emitter:
+ * `lsr w,offset,#1` then `add w,#1`, e.g. replace_bits_16 @0x1e64/0x1eb8). */
+static inline u8 xpe_to_idx(u8 offset)
 {
-	return ((u32)(opcode & 0x3f) << 26) |
-	       ((u32)offset8 << 18) |
-	       ((u32)(position & 0x1f) << 13) |
-	       ((u32)(width & 0x1f) << 8) |
-	       ((u32)nbytes);
+	return (u8)((offset >> 1) + 1);
 }
 
-/* REPLACE bit-field: VLAN VID/PCP edit, ToS mangle (sec 2.3 replace_bits_16). */
+/*
+ * REPLACE bit-field: VLAN VID/PCP edit, ToS mangle.
+ * PINNED from sym.xpe_cmd_replace_bits_16 @0x1e20:
+ *   base word 0x50000000  -> byte0 = 0x50  (opcode 0x14, "replace-bits")
+ *   byte1 = (offset>>1)+1                              (bfi #16,#8)
+ *   byte2 = data-region "from" ref, 0x94-relative      (bfi #8,#8; relocated
+ *           later by xpe_cmd_end — for our flat single-buffer emit we point it
+ *           at the inline data word that immediately follows)
+ *   byte3 = (position & 0xf) | (((width-1)+position) << 4)   (the pos/width nibble pack)
+ *   inline data word = data16 << position               (strh, rev16 in __command_add)
+ * (Was: XPE_OP_REPLACE=0x18 with the generic pack -> byte0 would have been 0x60,
+ *  wrong op, and position/width were in the wrong bits.)
+ */
 void xpe_cmd_replace_bits_16(struct xpe_cmdlist *cl, u8 offset, u8 position,
 			     u8 width, u16 data16)
 {
-	xpe_emit_cmd32(cl, xpe_pack_cmd(XPE_OP_REPLACE, offset, position,
-					width, 0));
-	xpe_emit16(cl, data16);		/* inline operand data (.data region) */
+	u8 b0 = 0x50;					/* opcode 0x14 << 2 */
+	u8 b1 = xpe_to_idx(offset);
+	u8 b2 = 0x94;					/* .data "from" base (pre-reloc) */
+	u8 b3 = (u8)((position & 0xf) |
+		     ((((width - 1) + position) & 0xf) << 4));
+
+	xpe_emit_cmd32(cl, ((u32)b0 << 24) | ((u32)b1 << 16) |
+			   ((u32)b2 << 8) | b3);
+	xpe_emit16(cl, (u16)(data16 << position));	/* inline operand (.data) */
 }
 
-/* INSERT bytes (VLAN push / header expand; sec 2.3 insert_16 / sop_push). */
+/*
+ * MOVE-packet (shift packet bytes) — the primitive behind VLAN push/pop.
+ * PINNED from sym.__cmd_move_packet @0xd30:
+ *   base word 0x4c000000  -> byte0 = 0x4c  (opcode 0x13)
+ *   byte1 = from  (RAW byte offset, NOT /2)             (bfi #16,#8)
+ *   byte2 = to    (RAW byte offset)                     (bfi #8,#8)
+ *   byte3[6:0] = nbytes                                 (bfxil #0,#7)
+ *   no inline data.
+ * VLAN PUSH = move_packet(from=12,to=12+4) to open a 4-byte hole, then
+ * replace_bits to write TPID+TCI. VLAN POP = move_packet(from=16,to=12) only.
+ * (stock uses sop_push_replace/sop_pull_replace which wrap this in a GDMA SOP
+ *  descriptor; for the in-place L2 tag at offset 12 the plain move_packet word
+ *  is the equivalent primitive and is what the model decodes.)
+ */
+void xpe_cmd_move_packet(struct xpe_cmdlist *cl, u8 from, u8 to, u8 nbytes)
+{
+	xpe_emit_cmd32(cl, (0x4cU << 24) | ((u32)from << 16) |
+			   ((u32)to << 8) | (nbytes & 0x7f));
+}
+
+/* INSERT bytes (VLAN push / header expand): open a hole of nbytes at 'offset'
+ * by moving the bytes from 'offset' forward by nbytes (caller then writes the
+ * new bytes with replace_bits_16). */
 void xpe_cmd_insert_16(struct xpe_cmdlist *cl, u8 offset, u8 nbytes)
 {
-	xpe_emit_cmd32(cl, xpe_pack_cmd(XPE_OP_MCOPY, offset, 0, 0, nbytes));
+	xpe_cmd_move_packet(cl, offset, offset + nbytes, nbytes);
 }
 
-/* DELETE bytes (VLAN pop / header shrink; sec 2.3 delete_16 / sop_pull). */
+/* DELETE bytes (VLAN pop / header shrink): move the bytes after the deleted
+ * region (offset+nbytes) back to 'offset'. */
 void xpe_cmd_delete_16(struct xpe_cmdlist *cl, u8 offset, u8 nbytes)
 {
-	xpe_emit_cmd32(cl, xpe_pack_cmd(XPE_OP_MOVE, offset, 0, 0, nbytes));
+	xpe_cmd_move_packet(cl, offset + nbytes, offset, nbytes);
 }
 
 /*
@@ -183,7 +236,19 @@ void xpe_cmd_end(struct xpe_cmdlist *cl)
  */
 void xpe_cmd_decrement_8(struct xpe_cmdlist *cl, u8 offset)
 {
-	xpe_emit_cmd32(cl, xpe_pack_cmd(XPE_OP_ADD, offset, 0, 8, 0));
+	/*
+	 * PINNED from sym.xpe_cmd_decrement_8 @0x2c50:
+	 *   base 0x64000000; byte0 forced to 0x6a  (opcode 0x1a = ADD, sub-flag 0b10)
+	 *   byte1 = (offset>>1)+1                         (bfi #16,#8)
+	 *   byte2 = (offset>>1)+1   (same word index)     (bfi #8,#8)
+	 *   byte3 = 0xff sentinel ("all bytes / to end")  (orr ...,#0xff)
+	 *   no inline data; the -1 delta is implicit in the opcode.
+	 * (odd offsets set byte0 bits[25:24]=1 -> 0x6a|..; even offset path = 0x6a.)
+	 */
+	u8 b1 = xpe_to_idx(offset);
+
+	xpe_emit_cmd32(cl, (0x6aU << 24) | ((u32)b1 << 16) |
+			   ((u32)b1 << 8) | 0xff);
 }
 
 /*
@@ -195,7 +260,20 @@ void xpe_cmd_decrement_8(struct xpe_cmdlist *cl, u8 offset)
  */
 void xpe_cmd_replace_32(struct xpe_cmdlist *cl, u8 offset, u32 data32)
 {
-	xpe_emit_cmd32(cl, xpe_pack_cmd(XPE_OP_REPLACE, offset, 0, 0, 4));
+	/*
+	 * PINNED from sym.xpe_cmd_replace_32 @0x1da0 -> __cmd_replace @0x1290:
+	 *   byte0 = 0x60  (opcode 0x18 = REPLACE; live-confirmed: live W0 byte0=0x60)
+	 *   byte1 = (offset>>1)+1                          (= w19 in __cmd_replace)
+	 *   byte2 = data-region "from" ref (0x94-relative; relocated by xpe_cmd_end)
+	 *   byte3 = nbytes/sentinel slot for the replace
+	 *   data appended to .data as words32 (rev'd 32-bit). For our flat single
+	 *   buffer we emit the 4 immediate bytes right after the command word.
+	 * nbytes field encodes a 4-byte (2-word) replace: __cmd_replace gets w1 =
+	 * 2*words = 4 here (replace_32 passes words*2). We mark byte3 = 4.
+	 */
+	u8 b1 = xpe_to_idx(offset);
+
+	xpe_emit_cmd32(cl, (0x60U << 24) | ((u32)b1 << 16) | (0x94U << 8) | 0x04);
 	xpe_emit16(cl, (data32 >> 16) & 0xffff);	/* high half (BE) */
 	xpe_emit16(cl, data32 & 0xffff);		/* low  half (BE) */
 }
@@ -207,7 +285,12 @@ void xpe_cmd_replace_32(struct xpe_cmdlist *cl, u8 offset, u32 data32)
  */
 void xpe_cmd_replace_16(struct xpe_cmdlist *cl, u8 offset, u16 data16)
 {
-	xpe_emit_cmd32(cl, xpe_pack_cmd(XPE_OP_REPLACE, offset, 0, 0, 2));
+	/* PINNED from sym.xpe_cmd_replace_16 @0x1d20 -> __cmd_replace @0x1290:
+	 * byte0 = 0x60 (REPLACE), byte1 = (offset>>1)+1, byte2 = 0x94 .data ref,
+	 * byte3 = 2 (2-byte replace); 16-bit immediate appended to .data. */
+	u8 b1 = xpe_to_idx(offset);
+
+	xpe_emit_cmd32(cl, (0x60U << 24) | ((u32)b1 << 16) | (0x94U << 8) | 0x02);
 	xpe_emit16(cl, data16);
 }
 
@@ -220,5 +303,17 @@ void xpe_cmd_replace_16(struct xpe_cmdlist *cl, u8 offset, u16 data16)
  */
 void xpe_cmd_apply_icsum_16(struct xpe_cmdlist *cl, u8 offset)
 {
-	xpe_emit_cmd32(cl, xpe_pack_cmd(XPE_OP_ICSUM, offset, 0, 16, 0));
+	/*
+	 * PINNED from sym.xpe_cmd_apply_icsum_16 @0x2d60:
+	 *   base 0x70000000  -> byte0 = 0x70  (opcode 0x1c, "apply-icsum")
+	 *   byte1 = (offset>>1)+1                          (bfi #16,#8)
+	 *   bits[15:0] = the 16-bit csum immediate INLINE in the command word's
+	 *                low half (bfxil #0,#16) -- NO separate data word.
+	 * Here we have no precomputed delta (the Runner recomputes it from the
+	 * fields the preceding replace/decrement touched), so the immediate is 0;
+	 * byte1 still tells HW which 16-bit checksum slot to fix.
+	 */
+	u8 b1 = xpe_to_idx(offset);
+
+	xpe_emit_cmd32(cl, (0x70U << 24) | ((u32)b1 << 16) | 0x0000);
 }
