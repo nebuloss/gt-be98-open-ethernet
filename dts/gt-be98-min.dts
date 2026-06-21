@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * gt-be98-min.dts — DIAGNOSTIC minimal board DT for the GT-BE98 (BCM4916/6813).
+ *
+ * Purpose: isolate "does mainline + NAND reach userspace?" from "does our custom
+ * datapath overlay crash early boot?".  This DT is the UPSTREAM-PROVEN SoC dtsi
+ * (bcm6813.dtsi — same one the upstream bcm96813.dts reference board boots) PLUS
+ * only: memory, the ATF/PMC reserved region, the PL011 console, and the NAND
+ * controller (for the /data breadcrumb).  It deliberately does NOT include
+ * bcm4916-enet.dtsi and enables NONE of our runner/switch/xport/MAC/PHY nodes —
+ * so the built-in bcm4916_runner driver has no node to probe and nothing touches
+ * the (unpowered, no-PMC, no-microcode) XRDP/Runner MMIO that can hang the SoC.
+ *
+ * If a /data breadcrumb appears with this DT, mainline reaches userspace and the
+ * datapath overlay/driver probe was the early-boot hang in cycles 01-04.
+ */
+
+/dts-v1/;
+
+/memreserve/ 0x0000000000000000 0x0000000000100000;	/* ATF/BL31+PMC, see gt-be98.dts */
+
+#include "bcm6813.dtsi"
+
+/ {
+	model = "ASUS GT-BE98 (diagnostic minimal)";
+	compatible = "asus,gt-be98", "brcm,bcm4916", "brcm,bcm6813", "brcm,bcmbca";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x0 0x0 0x80000000>;	/* 2 GiB */
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		atf_pmc@0 {
+			reg = <0x0 0x0 0x0 0x00100000>;
+			no-map;
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&nand_controller {
+	status = "okay";
+};
+
+&nandcs {
+	nand-on-flash-bbt;
+
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		partition@0 {
+			label = "loader";
+			reg = <0x0 0x200000>;
+			read-only;
+		};
+		partition@200000 {
+			label = "image";
+			reg = <0x200000 0xfce0000>;
+		};
+	};
+};
