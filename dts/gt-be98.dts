@@ -96,6 +96,48 @@
 	status = "okay";
 };
 
+/* ---- NAND (boot device) — OBSERVABILITY LIFELINE -------------------------- *
+ * Upstream bcm6813.dtsi ships nand_controller@1800 status="disabled", so a
+ * mainline boot has NO MTD device at all -> no UBI -> the /data breadcrumb the
+ * trial initramfs writes is impossible (it silently falls back to a tmpfs log
+ * that dies with the kernel). That is why trial cycles 01-03 produced ZERO
+ * persistent signal regardless of whether mainline reached userspace.
+ *
+ * Enable it. mainline brcmnand (CONFIG_MTD_NAND_BRCMNAND_BCMBCA=y) binds
+ * "brcm,nand-bcm63138"/"brcm,brcmnand-v7.1" and INHERITS the ECC config the
+ * bootloader programmed into the controller — so, exactly like the stock GT-BE98
+ * DT (which also omits nand-ecc-* on nandcs@0), we specify no ECC properties.
+ * Geometry confirmed on silicon: 2 KiB page, 108 B OOB, 128 KiB erase,
+ * on-flash BBT.  The fixed-partitions node reproduces the bootloader's
+ * mtdparts (loader 2 MiB @0, image 253 MiB @0x200000) so /proc/mtd carries the
+ * "image" label the init greps for to ubiattach the UBI that holds /data.
+ * [silicon: /proc/mtd + /proc/device-tree/periph/nand + stock cmdline mtdparts]
+ */
+&nand_controller {
+	status = "okay";
+};
+
+&nandcs {
+	nand-on-flash-bbt;	/* [stock GT-BE98 nandcs@0] */
+
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/* mirrors bootloader mtdparts=brcmnand.0:2097152(loader),265289728@2097152(image) */
+		partition@0 {
+			label = "loader";
+			reg = <0x0 0x200000>;	/* 2 MiB U-Boot — read-only, NEVER written */
+			read-only;
+		};
+		partition@200000 {
+			label = "image";
+			reg = <0x200000 0xfce0000>;	/* 265289728 B: the single UBI (bootfs/rootfs/data) */
+		};
+	};
+};
+
 /* ---- MDIO PHYs ------------------------------------------------------------ */
 
 &mdio {
