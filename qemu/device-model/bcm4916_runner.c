@@ -17,16 +17,21 @@
  *   - FPM pool: alloc(read 0x400)/free(write 0x400) returning ABI-3.1 tokens;
  *     POOL1_CFG1 (chunk size), POOL1_CFG2 (pool DDR base), FPM_CTL INIT_MEM /
  *     POOL1_ENABLE, POOL1_STAT2 tokens-available.
- *   - Ring discovery: the driver memcpy_toio()'s a 16-B CPU_RING_DESCRIPTOR into
- *     PSRAM at 0x0000 (RX) and 0x0080 (TX); we parse them to learn ring DDR
- *     base + depth + entry size.
- *   - RX inject: a frame from the netdev backend is DMA'd into the FPM/DDR
- *     buffer the descriptor points at, word0/word2 are filled (ownership=HOST
- *     last), and the queue0 IRQ (SPI 75) is raised.
- *   - TX consume: the u16 BE index write into RNR_MEM[n]+0x0 is the doorbell;
- *     on it we read each newly-produced 16-B TX descriptor, resolve the FPM
- *     token in word3 to a guest buffer, emit the frame to the backend, and free
- *     the token.
+ *   - Ring discovery: the driver memcpy_toio()'s 16-B CPU_RING_DESCRIPTORs into
+ *     per-core RNR data SRAM (NOT PSRAM): RX delivery ring @ core3 +0x3000, TX
+ *     ring @ core2 +0x33e0, FEED ring @ core3 +0x0f70; we parse them to learn
+ *     each ring's DDR base + depth + entry size.
+ *   - RX inject (FEED-ring model): the driver posts empty DDR buffers into the
+ *     FEED ring (8-B CPU_FEED_DESCRIPTOR, 40-bit ABS ptr) and rings the feed
+ *     doorbell (write_idx@+6). On a backend frame we take the next unconsumed
+ *     feed buffer, DMA the frame into it, write a 16-B CPU_RX_DESCRIPTOR into the
+ *     delivery ring, advance the delivery write_idx (@+6), advance the feed
+ *     read_idx (@+12), and raise the queue0 IRQ (SPI 75).
+ *   - TX consume: the u16 BE write_idx write into the TX indices entry
+ *     (core2 +0x29c8 +2) is the doorbell; on it we read each newly-produced 16-B
+ *     TX descriptor, resolve the FPM token in word3 to a guest buffer, emit the
+ *     frame to the backend, free the token, and advance the runner read_idx
+ *     (mirrored back into the indices entry @+0).
  *
  * BUILD: copied to hw/net/bcm4916_runner.c on dev-build, added to
  * hw/net/meson.build, wired into hw/arm/virt.c create_bcm4916(). Never build on
@@ -58,8 +63,35 @@
 #define XRDP_OFF_RNR_MEM0    0x00700000ULL
 #define XRDP_RNR_MEM_STRIDE  0x00020000ULL
 #define XRDP_RNR_CORES       8
+#define XRDP_OFF_RNR_REGS0   0x00800000ULL   /* per-core ctl regs, stride 0x1000 */
+#define XRDP_RNR_REGS_STRIDE 0x00001000ULL
 #define XRDP_OFF_FPM         0x00a00000ULL
 #define XRDP_OFF_NATC        0x00950000ULL   /* NAT-C engine (ABI 1.1) */
+
+/* CPU host rings live on specific Runner cores (matches driver header). */
+#define CPU_RX_RING_CORE     3
+#define CPU_TX_RING_CORE     2
+
+/* RDD table offsets WITHIN a core's RNR_MEM data SRAM (match driver). */
+#define RDD_RX_DELIV_RING_OFF   0x3000   /* core3: RX delivery CPU_RING_DESCRIPTOR */
+#define RDD_FEED_RING_OFF       0x0f70   /* core3: FEED ring CPU_RING_DESCRIPTOR  */
+#define RDD_TX_RING_OFF         0x33e0   /* core2: TX ring CPU_RING_DESCRIPTOR    */
+#define CPU_TX_RING_INDICES_OFF 0x29c8   /* core2: {read_idx@+0, write_idx@+2}    */
+
+/* field offsets within a 16-B CPU_RING_DESCRIPTOR control block (big-endian) */
+#define RING_CFG_WRITE_IDX_OFF  6        /* runner advances on RX delivery */
+#define RING_CFG_READ_IDX_OFF   12       /* host advances as it consumes   */
+
+/* RNR_REGS per-core: the TX thread is edge-woken per frame by CFG_CPU_WAKEUP. */
+#define RNR_CFG_CPU_WAKEUP      0x04
+
+/* FEED descriptor (8-B CPU_FEED_DESCRIPTOR, big-endian; matches driver header):
+ *   ptr_low@+0 = low32 of a 40-bit DMA phys; byte+6 bit0 = ABS/type; byte+7 =
+ *   ptr_hi[39:32]. */
+#define FEED_DESC_SIZE          8
+#define FEED_W1_ABS             (1u << 8)     /* host word1 bit8 == byte+6 bit0 */
+#define FEED_W1_PTR_HI_SHIFT    0             /* host word1 [7:0] == byte+7     */
+#define FEED_W1_PTR_HI_MASK     0xff
 
 /* FPM registers (offsets within the FPM block) */
 #define FPM_CTL                  0x0000
@@ -80,11 +112,6 @@
 #define FPM_TOKEN_INDEX_SHIFT    12
 #define FPM_TOKEN_INDEX_MASK     (0x1ffffu << FPM_TOKEN_INDEX_SHIFT)
 #define FPM_TOKEN_INDEX(t)       (((t) & FPM_TOKEN_INDEX_MASK) >> FPM_TOKEN_INDEX_SHIFT)
-
-/* PSRAM ring-config table offsets (contract placeholders) */
-#define PSRAM_CPU_RX_RING_DESC   0x0000
-#define PSRAM_CPU_TX_RING_DESC   0x0080
-#define CPU_TX_RING_INDICES_OFF  0x0000   /* within each RNR_MEM[n] */
 
 /* -------- NAT-C offload contract (matches driver/runner/flow_offload.h) ---- */
 #define PSRAM_NATC_STAGE_KEY     0x0100   /* 16-byte masked BE key */
@@ -205,16 +232,22 @@ struct Bcm4916RunnerState {
     uint32_t alloc_hint;       /* round-robin search start */
 
     /* rings */
-    RunnerRing rx;             /* CPU RX data ring (producer = rx.idx) */
-    RunnerRing tx;             /* CPU TX ring (consumer = tx.idx) */
+    RunnerRing rx;             /* CPU RX *delivery* ring (runner-written, 16B) */
+    RunnerRing tx;             /* CPU TX ring (consumer = tx.idx)             */
+    RunnerRing feed;           /* host-posted FEED ring (8B empty-buf ptrs)   */
+    uint32_t feed_rcons;       /* runner's feed read_idx (buffers consumed)   */
 
     bool irq_asserted;
     QEMUTimer *rx_timer;   /* polls ring drain to deassert level IRQ */
-    uint32_t rx_cons;      /* model view of guest consumer index */
 
     /* captured ring-cfg bytes (driver memcpy_toio's word-by-word) */
     uint8_t rx_cfg[DESC_SIZE];
     uint8_t tx_cfg[DESC_SIZE];
+    uint8_t feed_cfg[DESC_SIZE];
+    /* TX indices entry {read_idx@+0, write_idx@+2} (BE u16 each), core2 SRAM.
+     * The runner advances read_idx@+0 as it consumes; the driver reads it back
+     * (ringstat) to confirm consumption. */
+    uint8_t tx_indices[4];
 
     /* ---- NAT-C connection table (HW flow-offload model) ---- */
     uint8_t  natc_stage_key[16];          /* staged 16-byte BE key */
@@ -291,23 +324,20 @@ static uint64_t fpm_token_to_phys(Bcm4916RunnerState *s, uint32_t token)
 /* ===================== ring discovery ===================== */
 
 /*
- * ★★ ON-SILICON CONTRACT DIVERGENCE (2026-06-22) — THIS MODEL NEEDS A RESYNC ★★
- * The driver evolved against real BCM6813 silicon and the ring contract changed
- * from what this model emulates. To make the model a valid validator again,
- * resync these (see re-notes/realhw/10-runner-bringup-spec.md Wave 4-9):
- *   1. RING LOCATION: rings are no longer in PSRAM. They live in per-core RNR_MEM
- *      data SRAM: RX delivery @ core3 (0x82700000+3*0x20000)+0x3000; TX @ core2
- *      +0x33e0; FEED ring @ core3 +0x0f70; TX indices table @ core2 +0x29c8.
- *      (This model still watches PSRAM 0x0000/0x0080 - it won't see the publishes.)
- *   2. number_of_entries field is in RESOLUTION units: real depth = field<<5 for
- *      RX/TX (32-res), field<<6 for FEED (64-res). size_of_entry is in BYTES.
- *   3. FEED RING: RX buffers come from a host-posted feed ring (40-bit ABS ptrs)
- *      + a feed doorbell (write_idx@+6 of the feed cfg); model must consume it.
- *   4. TX doorbell: write_idx at +2 of the indices entry (core2 +0x29c8) PLUS a
- *      per-frame CFG_CPU_WAKEUP write to RNR_REGS(core2)+0x04.
- *   5. Microcode is loaded BE (inst byte-swapped, pred u16->u32) - model ignores it.
- * The encoding fix below (bytes + resolution) is applied; the location/feed/
- * doorbell rewrite is the remaining scoped work.
+ * ★ ON-SILICON CONTRACT (resynced 2026-06-22) — matches driver/runner/ {c,h} ★
+ * The ring contract was resynced from the live BCM6813 silicon driver:
+ *   1. RINGS live in per-core RNR_MEM data SRAM (NOT PSRAM): RX delivery @ core3
+ *      +0x3000, TX @ core2 +0x33e0, FEED ring @ core3 +0x0f70, TX indices entry
+ *      @ core2 +0x29c8. The model watches those window offsets (see runner_write).
+ *   2. number_of_entries field is in RESOLUTION units: depth = field<<5 for RX/TX
+ *      (32-res), field<<6 for FEED (64-res). size_of_entry is in BYTES.
+ *   3. FEED RING: RX buffers come from a host-posted feed ring (8-B 40-bit ABS
+ *      ptrs) + a feed doorbell (write_idx@+6); the model consumes the feed ring
+ *      to find a buffer to DMA each RX frame into (runner_receive).
+ *   4. TX doorbell: the BE u16 write_idx at +2 of the indices entry (core2
+ *      +0x29c8) is the kick; the per-frame CFG_CPU_WAKEUP write (RNR_REGS core2
+ *      +0x04) is accepted and ignored (the index write already triggers consume).
+ *   5. Microcode is loaded BE but the emulator IS the runner, so it is ignored.
  *
  * Parse a 16-B CPU_RING_DESCRIPTOR (big-endian). Layout:
  *   w0 [31:27]=size_of_entry(BYTES), [26:16]=number_of_entries(>>res), [15:0]=irq
@@ -329,7 +359,7 @@ static void runner_parse_ring(const uint8_t *d, RunnerRing *r, uint32_t res_shif
     r->depth = depth;
     r->base = base;
     r->idx = 0;
-    r->valid = (depth != 0 && base != 0 && r->entry_size == DESC_SIZE);
+    r->valid = (depth != 0 && base != 0 && entry_sz != 0);
 }
 
 /* ===================== NAT-C connection table (offload) ================== */
@@ -741,18 +771,38 @@ static size_t natc_run_cmdlist(const uint8_t *ctx, uint8_t *frame, size_t len)
 /* ===================== RX inject (backend -> guest) ===================== */
 
 /*
- * Level-IRQ drain check. The contract says: keep queue0 asserted while the
- * model has produced RX slots the guest has not yet consumed, and deassert when
- * caught up. The guest re-arms a consumed slot by clearing the ownership bit
- * (word2 bit31) back to RUNNER. We advance our consumer view over slots that
- * are no longer HOST-owned, and lower the IRQ line(s) when consumer == producer.
- * Re-armed periodically while the line is high so the guest's NAPI drain is
- * eventually observed (there is no MMIO ack on this path).
+ * The runner-advanced indices live in the per-core RNR_MEM cfg blocks the driver
+ * reads back: the RX delivery ring's write_idx @+6 of its cfg, and the FEED
+ * ring's read_idx @+12 of its cfg. The driver polls these (BE u16). We keep them
+ * in our captured cfg byte buffers and serve them from runner_read().
+ */
+static void rx_set_deliv_write_idx(Bcm4916RunnerState *s, uint16_t widx)
+{
+    stw_be_p(s->rx_cfg + RING_CFG_WRITE_IDX_OFF, widx);
+}
+static void rx_set_feed_read_idx(Bcm4916RunnerState *s, uint16_t ridx)
+{
+    stw_be_p(s->feed_cfg + RING_CFG_READ_IDX_OFF, ridx);
+}
+
+/* feed write_idx (host-advanced) is captured live in feed_cfg @+6 on every feed
+ * doorbell publish; read it back here. */
+static uint16_t feed_write_idx(Bcm4916RunnerState *s)
+{
+    return lduw_be_p(s->feed_cfg + RING_CFG_WRITE_IDX_OFF);
+}
+
+/*
+ * Level-IRQ drain check. Keep queue0 asserted while the runner has delivered RX
+ * slots the guest has not yet consumed (delivery write_idx != host read_idx),
+ * deassert when caught up. The host read_idx is published into the delivery cfg
+ * @+12; the driver writes it via the RNR_MEM window, which we capture live in
+ * rx_cfg, so we just compare our write_idx against the captured read_idx.
  */
 static void runner_rx_drain_check(void *opaque)
 {
     Bcm4916RunnerState *s = opaque;
-    AddressSpace *as = runner_dma_as(s);
+    uint16_t widx, hrd;
 
     if (!s->rx.valid) {
         /* ring not up yet - keep the heartbeat alive so we re-check */
@@ -760,22 +810,11 @@ static void runner_rx_drain_check(void *opaque)
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000); /* 1ms */
         return;
     }
-    while (s->rx_cons != s->rx.idx) {
-        uint8_t desc[DESC_SIZE];
-        hwaddr pa = s->rx.base + (uint64_t)s->rx_cons * DESC_SIZE;
-        uint32_t w1;
-        if (dma_memory_read(as, pa, desc, DESC_SIZE,
-                            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
-            break;
-        }
-        w1 = ldl_be_p(desc + 4);
-        if ((w1 >> RXD_W1_PKT_LEN_SHIFT) & RXD_W1_PKT_LEN_MASK) {
-            break;   /* slot still carries a packet: guest not consumed yet */
-        }
-        s->rx_cons = (s->rx_cons + 1) % s->rx.depth;
-    }
 
-    if (s->rx_cons == s->rx.idx) {
+    widx = lduw_be_p(s->rx_cfg + RING_CFG_WRITE_IDX_OFF);
+    hrd  = lduw_be_p(s->rx_cfg + RING_CFG_READ_IDX_OFF);
+
+    if (widx == hrd) {
         /* ring drained -> deassert level */
         if (s->irq_asserted) {
             qemu_set_irq(s->irq[RUNNER_IRQ_QUEUE0], 0);
@@ -784,9 +823,9 @@ static void runner_rx_drain_check(void *opaque)
         }
         /*
          * Re-enable the backend RX poll. A dgram/socket backend disables its
-         * read handler once a receive is deferred (or returns a short result);
-         * flushing here re-arms it so queued frames keep flowing. Without this
-         * only the first injected datagram is ever delivered.
+         * read handler once a receive is deferred; flushing here re-arms it so
+         * queued frames keep flowing. Without this only the first injected
+         * datagram is ever delivered.
          */
         qemu_flush_queued_packets(qemu_get_queue(s->nic));
     } else {
@@ -808,22 +847,28 @@ static void runner_rx_drain_check(void *opaque)
 static bool runner_can_receive(NetClientState *nc)
 {
     Bcm4916RunnerState *s = qemu_get_nic_opaque(nc);
-    return s->rx.valid;
+
+    /* need the delivery ring up AND a posted (unconsumed) feed buffer */
+    return s->rx.valid && s->feed.valid &&
+           (uint16_t)s->feed_rcons != feed_write_idx(s);
 }
 
 static ssize_t runner_receive(NetClientState *nc, const uint8_t *buf, size_t len)
 {
     Bcm4916RunnerState *s = qemu_get_nic_opaque(nc);
     AddressSpace *as = runner_dma_as(s);
-    hwaddr desc_pa;
+    hwaddr desc_pa, feed_pa;
     uint8_t desc[DESC_SIZE];
-    uint32_t w0, w1;
+    uint8_t feed[FEED_DESC_SIZE];
+    uint32_t fw0, fw1;
     uint64_t buf_pa;
     uint32_t copylen;
+    uint16_t fwidx, widx;
 
-    qemu_log("bcm4916-runner: RX recv len=%zu rx.valid=%d idx=%u\n", len, s->rx.valid, s->rx.idx);
-    if (!s->rx.valid) {
-        return -1;   /* ring not up yet; tell backend we couldn't take it */
+    qemu_log("bcm4916-runner: RX recv len=%zu rx.valid=%d feed.valid=%d\n",
+             len, s->rx.valid, s->feed.valid);
+    if (!s->rx.valid || !s->feed.valid) {
+        return -1;   /* rings not up yet; tell backend we couldn't take it */
     }
     if (len > RX_BUF_MAX) {
         len = RX_BUF_MAX;   /* truncate jumbo to one chunk for first light */
@@ -883,48 +928,62 @@ static ssize_t runner_receive(NetClientState *nc, const uint8_t *buf, size_t len
                  s->off_misses);
     }
 
-    desc_pa = s->rx.base + (uint64_t)s->rx.idx * DESC_SIZE;
-    if (dma_memory_read(as, desc_pa, desc, DESC_SIZE,
+    /*
+     * 0. Take the next UNCONSUMED feed buffer. The host posts empty buffers into
+     * the feed ring and bumps feed write_idx (@+6); we track feed_rcons (the
+     * runner read_idx) and pull the buffer at that slot.
+     */
+    fwidx = feed_write_idx(s);
+    if ((uint16_t)s->feed_rcons == fwidx) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "bcm4916-runner: feed ring empty (rcons=%u widx=%u), drop\n",
+                      s->feed_rcons, fwidx);
+        return len;   /* consumed (dropped): no buffer to DMA into */
+    }
+    feed_pa = s->feed.base +
+              (uint64_t)(s->feed_rcons % s->feed.depth) * FEED_DESC_SIZE;
+    if (dma_memory_read(as, feed_pa, feed, FEED_DESC_SIZE,
                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         return -1;
     }
-
-    w0 = ldl_be_p(desc + 0);     /* abs buf phys, low 32 */
-    w1 = ldl_be_p(desc + 4);     /* abs(b16)|packet_length|ptr_hi */
-    if ((w1 >> RXD_W1_PKT_LEN_SHIFT) & RXD_W1_PKT_LEN_MASK) {
-        /* slot still carries an unconsumed packet -> ring full, drop */
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "bcm4916-runner: RX ring full at idx %u, dropping\n",
-                      s->rx.idx);
-        return len;   /* consumed (dropped) */
-    }
-
-    /* abs phys = ptr_hi(word1[31:24]) << 32 | word0 */
-    buf_pa = ((uint64_t)(w1 >> RXD_W1_PTR_HI_SHIFT) << 32) | w0;
+    fw0 = ldl_be_p(feed + 0);     /* ptr_low[31:0] */
+    fw1 = ldl_be_p(feed + 4);     /* type/abs(b8) | ptr_hi[7:0] */
+    buf_pa = ((uint64_t)((fw1 >> FEED_W1_PTR_HI_SHIFT) & FEED_W1_PTR_HI_MASK)
+              << 32) | fw0;
     copylen = len;
 
-    /* 1. DMA the frame into the host-provided buffer */
+    /* 1. DMA the frame into the feed-provided buffer */
     if (dma_memory_write(as, buf_pa, buf, copylen,
                          MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         return -1;
     }
 
-    /* 2. word2 = source: LAN, source_port 0 (single pipe), is_src_lan=1 */
-    stl_be_p(desc + 8, RXD_W2_IS_SRC_LAN);
-    /* word3 flags: 0 (plain LAN unicast) */
-    stl_be_p(desc + 12, 0);
-
-    /* 3. publish: word1 with packet_length set (abs kept). LAST write. */
+    /*
+     * 2. Write a 16-B CPU_RX_DESCRIPTOR into the DELIVERY ring at the runner
+     * producer slot (s->rx.idx). word0 = buf phys low32; word1 = abs |
+     * packet_length<<2 | ptr_hi<<24; word2 = is_src_lan; word3 = flags(0).
+     */
+    desc_pa = s->rx.base + (uint64_t)s->rx.idx * DESC_SIZE;
+    stl_be_p(desc + 0, (uint32_t)buf_pa);
     stl_be_p(desc + 4, RXD_W1_ABS |
                        ((copylen & RXD_W1_PKT_LEN_MASK) << RXD_W1_PKT_LEN_SHIFT) |
-                       ((w1 >> RXD_W1_PTR_HI_SHIFT) << RXD_W1_PTR_HI_SHIFT));
-
+                       (((uint32_t)(buf_pa >> 32) & 0xff) << RXD_W1_PTR_HI_SHIFT));
+    stl_be_p(desc + 8, RXD_W2_IS_SRC_LAN);   /* LAN, source_port 0, single pipe */
+    stl_be_p(desc + 12, 0);                  /* plain LAN unicast */
     if (dma_memory_write(as, desc_pa, desc, DESC_SIZE,
                          MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         return -1;
     }
 
+    /* 3. advance the runner producer (delivery write_idx) and feed read_idx */
     s->rx.idx = (s->rx.idx + 1) % s->rx.depth;
+    s->feed_rcons = (uint16_t)(s->feed_rcons + 1);
+    widx = (uint16_t)s->rx.idx;
+    rx_set_deliv_write_idx(s, widx);   /* dma_wmb-equivalent: desc written first */
+    rx_set_feed_read_idx(s, (uint16_t)s->feed_rcons);
+    qemu_log("bcm4916-runner: RX deliver slot=%u buf=0x%" PRIx64
+             " len=%u deliv_widx=%u feed_rcons=%u\n",
+             (widx - 1) & 0xffff, buf_pa, copylen, widx, s->feed_rcons);
 
     /*
      * Raise queue0 (level, hold asserted). The driver's ISR does
@@ -1000,6 +1059,10 @@ static void runner_tx_kick(Bcm4916RunnerState *s, uint16_t new_widx)
 
         s->tx.idx = (s->tx.idx + 1) % s->tx.depth;
     }
+
+    /* mirror the runner read_idx back into the indices entry @+0 (BE u16) so the
+     * driver's ringstat sees the runner consuming TX. */
+    stw_be_p(s->tx_indices + 0, (uint16_t)s->tx.idx);
 }
 
 /* ===================== MMIO decode ===================== */
@@ -1045,7 +1108,36 @@ static uint64_t runner_read(void *opaque, hwaddr addr, unsigned size)
         }
     }
 
-    /* everything else reads 0 (PSRAM/RNR_MEM reads are not used by the driver) */
+    /*
+     * Per-core RNR_MEM data SRAM: serve the runner-advanced indices the driver
+     * polls (BE u16 each). The driver does be16_to_cpu(ioread16(...)), so we
+     * return the byte-swapped value (== cpu_to_be16 as the LE guest sees it).
+     *   RX delivery write_idx : core3 +0x3000+6 (runner advances on delivery)
+     *   FEED read_idx         : core3 +0x0f70+12 (runner advances pulling bufs)
+     *   TX read_idx           : core2 +0x29c8+0 (runner advances consuming TX)
+     */
+    if (addr >= XRDP_OFF_RNR_MEM0 &&
+        addr < XRDP_OFF_RNR_MEM0 + XRDP_RNR_CORES * XRDP_RNR_MEM_STRIDE) {
+        hwaddr rel = addr - XRDP_OFF_RNR_MEM0;
+        uint32_t core = rel / XRDP_RNR_MEM_STRIDE;
+        hwaddr in_core = rel % XRDP_RNR_MEM_STRIDE;
+
+        if (core == CPU_RX_RING_CORE &&
+            in_core == RDD_RX_DELIV_RING_OFF + RING_CFG_WRITE_IDX_OFF) {
+            return bswap16(lduw_be_p(s->rx_cfg + RING_CFG_WRITE_IDX_OFF));
+        }
+        if (core == CPU_RX_RING_CORE &&
+            in_core == RDD_FEED_RING_OFF + RING_CFG_READ_IDX_OFF) {
+            return bswap16(lduw_be_p(s->feed_cfg + RING_CFG_READ_IDX_OFF));
+        }
+        if (core == CPU_TX_RING_CORE &&
+            in_core == CPU_TX_RING_INDICES_OFF + 0) {
+            return bswap16(lduw_be_p(s->tx_indices + 0));
+        }
+        return 0;
+    }
+
+    /* everything else reads 0 (other RNR_MEM/PSRAM reads are not used) */
     return 0;
 }
 
@@ -1089,44 +1181,12 @@ static void runner_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         }
     }
 
-    /* PSRAM ring-config publish (memcpy_toio from the driver) */
+    /*
+     * PSRAM block: only NAT-C offload staging lives here now. The CPU rings
+     * moved to per-core RNR_MEM data SRAM (handled below).
+     */
     if (addr >= XRDP_OFF_PSRAM && addr < XRDP_OFF_PSRAM + 0x10000) {
         hwaddr off = addr - XRDP_OFF_PSRAM;
-        /*
-         * The driver memcpy_toio's the 16-B ring-cfg word by word (32-bit
-         * accesses). Capture the bytes for the RX (0x00..0x0f) and TX
-         * (0x80..0x8f) descriptors, then (re)parse on the last word.
-         */
-        if (off >= PSRAM_CPU_RX_RING_DESC &&
-            off < PSRAM_CPU_RX_RING_DESC + DESC_SIZE && size == 4) {
-            /*
-             * memcpy_toio() writes the BE-in-memory cfg word with a raw (no
-             * swap) store, so on this LE guest the value reaching us is the
-             * big-endian byte sequence reinterpreted as an integer. Store it
-             * little-endian to reconstruct the original BE byte order, which
-             * runner_parse_ring() then reads back with ldl_be_p().
-             */
-            stl_le_p(s->rx_cfg + off, (uint32_t)val);
-            if (off == PSRAM_CPU_RX_RING_DESC + DESC_SIZE - 4) {
-                runner_parse_ring(s->rx_cfg, &s->rx, RING_RES_32);
-                qemu_log("bcm4916-runner: RX ring base=0x%" PRIx64
-                         " depth=%u esz=%u valid=%d\n",
-                         s->rx.base, s->rx.depth, s->rx.entry_size, s->rx.valid);
-            }
-            return;
-        }
-        if (off >= PSRAM_CPU_TX_RING_DESC &&
-            off < PSRAM_CPU_TX_RING_DESC + DESC_SIZE && size == 4) {
-            stl_le_p(s->tx_cfg + (off - PSRAM_CPU_TX_RING_DESC), (uint32_t)val);
-            if (off == PSRAM_CPU_TX_RING_DESC + DESC_SIZE - 4) {
-                runner_parse_ring(s->tx_cfg, &s->tx, RING_RES_32);
-                qemu_log("bcm4916-runner: TX ring base=0x%" PRIx64
-                         " depth=%u esz=%u valid=%d\n",
-                         s->tx.base, s->tx.depth, s->tx.entry_size, s->tx.valid);
-            }
-            return;
-        }
-
         /*
          * NAT-C offload staging. The driver memcpy_toio's the 16-byte BE key
          * and the context entry (word-by-word, 32-bit), then writel's the index
@@ -1167,25 +1227,113 @@ static void runner_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         return;
     }
 
-    /* RNR_MEM[n] TX index doorbell: u16 BE write at offset 0x0 of each core */
+    /*
+     * Per-core RNR_MEM data SRAM: the CPU rings live here now (NOT PSRAM).
+     *   core3 +0x3000 : RX delivery ring CPU_RING_DESCRIPTOR (16B)
+     *   core3 +0x0f70 : FEED ring CPU_RING_DESCRIPTOR (16B; entry size 8B)
+     *   core2 +0x33e0 : TX ring CPU_RING_DESCRIPTOR (16B)
+     *   core2 +0x29c8 : TX indices entry {read_idx@+0, write_idx@+2} (BE u16)
+     * The driver memcpy_toio's the cfg blocks (raw word stores: the BE-in-memory
+     * bytes reinterpreted as a native int, so store byte-wise from the LE value
+     * to reconstruct the original BE byte order). It then runtime-updates the
+     * indices via iowrite16(cpu_to_be16()) at +6 (feed/RX) / +2 (TX), which on a
+     * LE guest arrive byte-swapped.
+     */
     if (addr >= XRDP_OFF_RNR_MEM0 &&
         addr < XRDP_OFF_RNR_MEM0 + XRDP_RNR_CORES * XRDP_RNR_MEM_STRIDE) {
         hwaddr rel = addr - XRDP_OFF_RNR_MEM0;
+        uint32_t core = rel / XRDP_RNR_MEM_STRIDE;
         hwaddr in_core = rel % XRDP_RNR_MEM_STRIDE;
-        if (in_core == CPU_TX_RING_INDICES_OFF) {
-            /*
-             * The driver does iowrite16(cpu_to_be16(widx)). On a LE guest the
-             * value reaching the model's MMIO handler is therefore the
-             * byte-swapped index; undo the swap to recover write_idx.
-             */
-            uint16_t widx;
-            if (size == 2) {
-                widx = bswap16((uint16_t)val);
-            } else {
-                widx = bswap16((uint16_t)(val & 0xffff));
+        unsigned i;
+
+        /* capture a cfg control block (memcpy_toio raw bytes) into 'cfg', then
+         * (re)parse it on the block-completing store. */
+        #define CAPTURE_CFG(base_off, cfgbuf, ring, res) do {                  \
+            hwaddr o = in_core - (base_off);                                   \
+            for (i = 0; i < size && o + i < DESC_SIZE; i++) {                  \
+                (cfgbuf)[o + i] = (val >> (8 * i)) & 0xff;                     \
+            }                                                                  \
+            if (o + size >= DESC_SIZE) {                                       \
+                runner_parse_ring((cfgbuf), &(ring), (res));                   \
+            }                                                                  \
+        } while (0)
+
+        /* RX delivery ring cfg (core3 +0x3000) */
+        if (core == CPU_RX_RING_CORE &&
+            in_core >= RDD_RX_DELIV_RING_OFF &&
+            in_core < RDD_RX_DELIV_RING_OFF + DESC_SIZE) {
+            CAPTURE_CFG(RDD_RX_DELIV_RING_OFF, s->rx_cfg, s->rx, RING_RES_32);
+            if (in_core - RDD_RX_DELIV_RING_OFF + size >= DESC_SIZE) {
+                s->rx.idx = 0;
+                qemu_log("bcm4916-runner: RX deliv ring base=0x%" PRIx64
+                         " depth=%u esz=%u valid=%d\n",
+                         s->rx.base, s->rx.depth, s->rx.entry_size, s->rx.valid);
             }
-            runner_tx_kick(s, widx);
+            return;
         }
+        /* FEED ring cfg (core3 +0x0f70) */
+        if (core == CPU_RX_RING_CORE &&
+            in_core >= RDD_FEED_RING_OFF &&
+            in_core < RDD_FEED_RING_OFF + DESC_SIZE) {
+            CAPTURE_CFG(RDD_FEED_RING_OFF, s->feed_cfg, s->feed, RING_RES_64);
+            if (in_core - RDD_FEED_RING_OFF + size >= DESC_SIZE) {
+                s->feed_rcons = 0;
+                qemu_log("bcm4916-runner: FEED ring base=0x%" PRIx64
+                         " depth=%u esz=%u valid=%d feed_widx=%u\n",
+                         s->feed.base, s->feed.depth, s->feed.entry_size,
+                         s->feed.valid, feed_write_idx(s));
+            }
+            return;
+        }
+        /* feed doorbell: BE u16 write_idx @ +6 of the feed cfg (runtime bump) */
+        if (core == CPU_RX_RING_CORE &&
+            in_core == RDD_FEED_RING_OFF + RING_CFG_WRITE_IDX_OFF && size == 2) {
+            stw_be_p(s->feed_cfg + RING_CFG_WRITE_IDX_OFF, bswap16((uint16_t)val));
+            /* a freshly posted buffer may unblock a deferred backend RX */
+            qemu_flush_queued_packets(qemu_get_queue(s->nic));
+            return;
+        }
+        /* RX delivery read_idx @ +12 (host advances as it consumes) */
+        if (core == CPU_RX_RING_CORE &&
+            in_core == RDD_RX_DELIV_RING_OFF + RING_CFG_READ_IDX_OFF && size == 2) {
+            stw_be_p(s->rx_cfg + RING_CFG_READ_IDX_OFF, bswap16((uint16_t)val));
+            return;
+        }
+
+        /* TX ring cfg (core2 +0x33e0) */
+        if (core == CPU_TX_RING_CORE &&
+            in_core >= RDD_TX_RING_OFF &&
+            in_core < RDD_TX_RING_OFF + DESC_SIZE) {
+            CAPTURE_CFG(RDD_TX_RING_OFF, s->tx_cfg, s->tx, RING_RES_32);
+            if (in_core - RDD_TX_RING_OFF + size >= DESC_SIZE) {
+                s->tx.idx = 0;
+                qemu_log("bcm4916-runner: TX ring base=0x%" PRIx64
+                         " depth=%u esz=%u valid=%d\n",
+                         s->tx.base, s->tx.depth, s->tx.entry_size, s->tx.valid);
+            }
+            return;
+        }
+        /* TX doorbell: BE u16 write_idx @ +2 of the indices entry (core2) */
+        if (core == CPU_TX_RING_CORE &&
+            in_core == CPU_TX_RING_INDICES_OFF + 2 && size == 2) {
+            uint16_t widx = bswap16((uint16_t)val);
+            stw_be_p(s->tx_indices + 2, widx);
+            runner_tx_kick(s, widx);
+            return;
+        }
+        /* TX indices read_idx slot @ +0 (host never writes it; ignore) */
+        return;
+        #undef CAPTURE_CFG
+    }
+
+    /*
+     * Per-core RNR_REGS control block. The driver pokes many regs during
+     * bring-up (GEN_CFG zero-mem, SCH/PSRAM/DDR cfg, GLOBAL_CTRL.EN) and a
+     * per-frame CFG_CPU_WAKEUP for the TX thread. The emulator IS the runner, so
+     * accept and ignore them (the TX index write already triggers consume).
+     */
+    if (addr >= XRDP_OFF_RNR_REGS0 &&
+        addr < XRDP_OFF_RNR_REGS0 + XRDP_RNR_CORES * XRDP_RNR_REGS_STRIDE) {
         return;
     }
 
@@ -1229,10 +1377,13 @@ static void bcm4916_runner_reset(DeviceState *dev)
     s->pool_pbase = 0;
     s->irq_asserted = false;
     memset(&s->rx, 0, sizeof(s->rx));
-    s->rx_cons = 0;
     memset(&s->tx, 0, sizeof(s->tx));
+    memset(&s->feed, 0, sizeof(s->feed));
+    s->feed_rcons = 0;
     memset(s->rx_cfg, 0, sizeof(s->rx_cfg));
     memset(s->tx_cfg, 0, sizeof(s->tx_cfg));
+    memset(s->feed_cfg, 0, sizeof(s->feed_cfg));
+    memset(s->tx_indices, 0, sizeof(s->tx_indices));
     memset(s->natc, 0, sizeof(s->natc));
     memset(s->natc_stage_key, 0, sizeof(s->natc_stage_key));
     memset(s->natc_stage_ctx, 0, sizeof(s->natc_stage_ctx));
