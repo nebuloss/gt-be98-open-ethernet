@@ -549,14 +549,18 @@ static int runner_load_microcode(struct runner_priv *p)
  */
 static void runner_ubus_decode_init(struct runner_priv *p)
 {
-	/* ABI 5bis-G3 step 2: UBUS_SLV address-decode windows. The exact
-	 * register offsets within UBUS_SLV are not individually pinned; the
-	 * window *values* are (FPM/QM/DQM/VPB/APB). Emulator ignores these,
-	 * real HW needs them. Stubbed with the documented values for clarity. */
-	/* TODO: pin UBUS_SLV per-window register offsets, then write:
-	 *   dev0 0x82A00000..0x82C00000 (FPM), dev1 0x82C00000..0x82C80000 (QM),
-	 *   dev2 0x82C80000..0x82D00000 (DQM), vpb 0x82700000..0x82900000,
-	 *   apb 0x82900000..0x82A00000. */
+	/* UBUS_SLV address-decode windows [PINNED vs SDK ubus_bridge_init,
+	 * XRDP_CFE2/.../BCM6813/data_path_init.c:405; offsets XRDP_AG.h:21360].
+	 * Each window = START reg + END reg, each holding a FULL 32-bit address
+	 * (no size-mask, no enable bit — active purely by [start,end) bounds).
+	 * Program order matches the SDK: dev0, dev1, dev2, vpb, apb. */
+	void __iomem *u = p->xrdp + XRDP_OFF_UBUS_SLV;
+
+	writel(0x82a00000, u + 0x14); writel(0x82c00000, u + 0x18); /* dev0 FPM */
+	writel(0x82c00000, u + 0x1c); writel(0x82c80000, u + 0x20); /* dev1 QM  */
+	writel(0x82c80000, u + 0x24); writel(0x82d00000, u + 0x28); /* dev2 DQM */
+	writel(0x82700000, u + 0x04); writel(0x82900000, u + 0x08); /* vpb      */
+	writel(0x82900000, u + 0x0c); writel(0x82a00000, u + 0x10); /* apb      */
 }
 
 /* ============================ offload self-test (debugfs) =============== *

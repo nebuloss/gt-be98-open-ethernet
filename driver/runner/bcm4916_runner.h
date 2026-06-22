@@ -67,7 +67,7 @@
 #define XRDP_OFF_UNIMAC_RDP0	0x008a8004UL	/* 4, stride 0x1000 */
 #define XRDP_OFF_FPM		0x00a00000UL
 #define XRDP_OFF_QM		0x00c00000UL
-#define XRDP_OFF_DQM		0x00c80034UL
+#define XRDP_OFF_DQM		0x00c80000UL	/* [PINNED vs SDK: block base; 0xc80034 was base+0x34, a register] */
 
 /* ----------------------------------------------------------------------------
  * FPM register block. Layout from the GPL FpmControl struct (fpm_priv.h):
