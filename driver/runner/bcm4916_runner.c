@@ -411,23 +411,18 @@ static irqreturn_t runner_rx_isr(int irq, void *dev_id)
  */
 static void tx_ring_doorbell(struct runner_priv *p, u16 write_idx)
 {
-	__be16 be = cpu_to_be16(write_idx);
-	int core;
-
 	/* dmb oshst before publishing the index (ABI 5bis-G2 step 6) */
 	dma_wmb();
 
 	/*
-	 * Bump CPU_TX_RING_INDICES_VALUES_TABLE write_idx in each serving
-	 * core's RNR_MEM SRAM. For the dumb-pipe v1 / emulator a single
-	 * serving core is sufficient; real HW writes all cores whose address
-	 * is not the 0xffffff "not-serving" sentinel.
+	 * CPU_TX_RING_INDICES_VALUES_TABLE entry = { read_idx@+0, write_idx@+2 }
+	 * (BE u16 each), on Runner core 2 [SDK + descriptor RE]. The runner reads
+	 * write_idx from +2; the WRITE of write_idx IS the doorbell. (Previously
+	 * this wrote +0 = the read_idx slot on every core -> the runner never saw
+	 * a TX and our write_idx clobbered read_idx.)
 	 */
-	for (core = 0; core < XRDP_RNR_CORES; core++) {
-		if (!p->rnr_mem[core])
-			continue;
-		iowrite16(be, p->rnr_mem[core] + CPU_TX_RING_INDICES_OFF);
-	}
+	iowrite16(cpu_to_be16(write_idx),
+		  p->rnr_mem[CPU_TX_RING_CORE] + CPU_TX_RING_INDICES_OFF + 2);
 }
 
 static netdev_tx_t runner_start_xmit(struct sk_buff *skb,
@@ -889,6 +884,54 @@ static const struct file_operations runner_nat_selftest_fops = {
 	.write	= runner_nat_selftest_write,
 };
 
+/*
+ * ringstat: dump the host/runner ring indices so we can SEE whether the Runner
+ * microcode is actually executing our CPU datapath (consuming TX descriptors,
+ * pulling feed buffers, delivering RX). All reads go through the driver's normal
+ * ioread paths (safe). The runner-owned indices are BE u16 in core-2/3 SRAM.
+ */
+static ssize_t runner_ringstat_read(struct file *file, char __user *ubuf,
+				    size_t count, loff_t *ppos)
+{
+	struct runner_priv *p = file->private_data;
+	u16 tx_runner_rd, rx_runner_wr, feed_runner_rd;
+	char buf[480];
+	int n;
+
+	/* TX indices entry {read_idx@+0, write_idx@+2} on core 2: read_idx is
+	 * advanced by the runner as it consumes our TX descriptors. */
+	tx_runner_rd = be16_to_cpu(ioread16(p->rnr_mem[CPU_TX_RING_CORE] +
+					    CPU_TX_RING_INDICES_OFF + 0));
+	/* RX delivery ring write_idx@+6 (runner advances it on delivery). */
+	rx_runner_wr = be16_to_cpu(ioread16(p->rnr_mem[CPU_RX_RING_CORE] +
+				   PSRAM_CPU_RING_DESC_TABLE + RING_CFG_WRITE_IDX_OFF));
+	/* FEED ring read_idx@+12 (runner advances it as it pulls buffers). */
+	feed_runner_rd = be16_to_cpu(ioread16(p->rnr_mem[CPU_RX_RING_CORE] +
+				     RDD_FEED_RING_DESC_TABLE + RING_CFG_READ_IDX_OFF));
+
+	n = scnprintf(buf, sizeof(buf),
+		"TX  : host_write_idx=%u  runner_read_idx=%u  %s\n"
+		"RX  : runner_write_idx=%u host_read_idx=%u  %s\n"
+		"FEED: host_write_idx=%u  runner_read_idx=%u  %s\n"
+		"FPM : tokens_avail=%u\n"
+		"stats: tx=%lu rx=%lu txerr=%lu rxerr=%lu\n",
+		p->tx_write_idx, tx_runner_rd,
+		tx_runner_rd ? "(runner CONSUMING tx)" : "(runner not consuming tx)",
+		rx_runner_wr, p->rx_head,
+		rx_runner_wr ? "(runner DELIVERED rx)" : "(no rx delivered)",
+		p->feed_widx, feed_runner_rd,
+		feed_runner_rd ? "(runner PULLING feed bufs)" : "(feed untouched)",
+		readl(p->fpm + FPM_POOL1_STAT2) & FPM_STAT2_TOKENS_AVAIL_MASK,
+		p->ndev->stats.tx_packets, p->ndev->stats.rx_packets,
+		p->ndev->stats.tx_errors, p->ndev->stats.rx_errors);
+	return simple_read_from_buffer(ubuf, count, ppos, buf, n);
+}
+
+static const struct file_operations runner_ringstat_fops = {
+	.open	= simple_open,
+	.read	= runner_ringstat_read,
+};
+
 static void runner_debugfs_init(struct runner_priv *p)
 {
 	p->dbg = debugfs_create_dir(DRV_NAME, NULL);
@@ -896,6 +939,7 @@ static void runner_debugfs_init(struct runner_priv *p)
 			    &runner_selftest_fops);
 	debugfs_create_file("offload_nat_selftest", 0200, p->dbg, p,
 			    &runner_nat_selftest_fops);
+	debugfs_create_file("ringstat", 0400, p->dbg, p, &runner_ringstat_fops);
 }
 
 /* ============================ netdev / probe ============================ */
