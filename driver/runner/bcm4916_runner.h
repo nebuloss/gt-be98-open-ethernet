@@ -118,6 +118,24 @@
 #define DSPTCHR_REORDER_CFG_EN		BIT(0)
 #define DSPTCHR_REORDER_CFG_AUTO_INIT	BIT(4)
 #define DSPTCHR_REORDER_CFG_RDY		BIT(8)
+/* CPU_RX wake config [spec Wave-8/9; data_path_init.c dispatcher_reorder_*].
+ * RAM regs: addr = base + REG + 4*index. The Runner CPU_RX thread is woken by
+ * the dispatcher, so a VIQ (== bbh_id) must be created, put in a runner group,
+ * and the group pointed at the CPU_RX PD-table address. */
+#define DSPTCHR_VQ_EN			0x004	/* bitmask of enabled VIQs */
+#define DSPTCHR_QUEUE_CRDT_CFG		0x400	/* +4*viq: bb_id + bbh target */
+#define DSPTCHR_PD_DSPTCH_ADD		0x480	/* +4*core: base_add[15:0]|offset_add[31:16] */
+#define DSPTCHR_Q_DEST			0x4c0	/* +4*viq: 0=disp,1=reor */
+#define DSPTCHR_MASK_MSK_TSK		0x500	/* +4*(grp*8+word): 8 words/grp, word0=tasks[255:224] */
+#define DSPTCHR_MASK_MSK_Q		0x600	/* +4*grp: VIQ bitmask for the group */
+#define DSPTCHR_TSK_TO_RG_MAPPING	0x900	/* +4*(task/8): 8x3-bit group idx */
+#define DSPTCHR_RG_AVLABL_TSK_0_3	0x980	/* 4x8-bit available-task counts grp0-3 */
+#define BBH_BBID_RX_BBH0		31	/* RX_BBH_n bb_id = 31 + 2*n */
+#define DSPTCHR_VIQ_TARGET_NORMAL	2	/* bbh target = normal */
+#define DSPTCHR_CPU_RX_GROUP		1	/* runner group for the LAN->CPU_RX path */
+/* CPU_RX PD-table the dispatcher delivers to (full-SDK IMAGE_3_PD_FIFO_TABLE
+ * 0x3940 >> 3); matches the CPU_RX thread regfile R8/R17. */
+#define DSPTCHR_CPU_RX_PD_ADDR		(0x3940 >> 3)
 
 /* ----------------------------------------------------------------------------
  * BBH_RX / BBH_TX per-port config (bases XRDP_OFF_BBH_RX0 / XRDP_OFF_BBH_TX0).

@@ -832,10 +832,61 @@ static int runner_sbpm_init(struct runner_priv *p)
 	return 0;	/* non-fatal for first-light */
 }
 
+/*
+ * Wire the CPU_RX path through the dispatcher [spec Wave-8/9]: create the feeding
+ * VIQ (== bbh_id of our ingress port), place the CPU_RX core/thread in a runner
+ * group that consumes that VIQ, and point the group's delivery at the CPU_RX
+ * PD-table address. Without this the BBH enqueues PDs but nothing wakes the
+ * CPU_RX thread, so the RX delivery ring never fills.
+ * ★Several field encodings (CRDT_CFG layout, the TSK_TO_RG global task id) are
+ * RE-derived but unconfirmed on silicon - tune when RX is tested.
+ */
+static void runner_dsptchr_cpu_rx_setup(struct runner_priv *p)
+{
+	void __iomem *d = p->xrdp + XRDP_OFF_DSPTCHR;
+	u32 viq   = RUNNER_FIRST_PORT;			/* VIQ == bbh_id */
+	u32 grp   = DSPTCHR_CPU_RX_GROUP;
+	u32 bb_id = BBH_BBID_RX_BBH0 + 2 * RUNNER_FIRST_PORT;
+	u32 tword = CPU_RX_RING_CORE / 2;		/* MASK_MSK_TSK word for the core */
+	u32 tval  = (1u << RNR_CPU_RX_THREAD) << ((CPU_RX_RING_CORE & 1) * 16);
+	u32 task  = RNR_CPU_RX_THREAD;
+	void __iomem *m;
+	u32 cur;
+
+	/* feeding VIQ: bb_id of the RX BBH + normal bbh target; dest = dispatcher */
+	writel(bb_id | (DSPTCHR_VIQ_TARGET_NORMAL << 8),
+	       d + DSPTCHR_QUEUE_CRDT_CFG + 4 * viq);
+	writel(0, d + DSPTCHR_Q_DEST + 4 * viq);
+	/* place CPU_RX core/thread into the group, and make the group consume VIQ */
+	writel(tval, d + DSPTCHR_MASK_MSK_TSK + 4 * (grp * 8 + tword));
+	writel(1u << viq, d + DSPTCHR_MASK_MSK_Q + 4 * grp);
+	/* task -> runner-group (3-bit field) */
+	m = d + DSPTCHR_TSK_TO_RG_MAPPING + 4 * (task / 8);
+	cur = readl(m);
+	cur &= ~(0x7u << ((task % 8) * 3));
+	cur |= (grp & 0x7) << ((task % 8) * 3);
+	writel(cur, m);
+	/* available-task count for the group */
+	cur = readl(d + DSPTCHR_RG_AVLABL_TSK_0_3);
+	cur &= ~(0xffu << (grp * 8));
+	cur |= (1u << (grp * 8));
+	writel(cur, d + DSPTCHR_RG_AVLABL_TSK_0_3);
+	/* THE wake target: where the dispatcher delivers PDs for the CPU_RX core */
+	writel(DSPTCHR_CPU_RX_PD_ADDR & 0xffff,
+	       d + DSPTCHR_PD_DSPTCH_ADD + 4 * CPU_RX_RING_CORE);
+	/* enable the feeding VIQ */
+	writel(1u << viq, d + DSPTCHR_VQ_EN);
+	dev_info(p->dev, "bring-up: DSPTCHR CPU_RX wired (viq=%u grp=%u core%d/thr%d pd=0x%x)\n",
+		 viq, grp, CPU_RX_RING_CORE, RNR_CPU_RX_THREAD, DSPTCHR_CPU_RX_PD_ADDR);
+}
+
 static int runner_dsptchr_init(struct runner_priv *p)
 {
 	void __iomem *d = p->xrdp + XRDP_OFF_DSPTCHR;
 	int i;
+
+	/* configure the CPU_RX VIQ/group BEFORE enabling the reorder engine */
+	runner_dsptchr_cpu_rx_setup(p);
 
 	/* let the HW auto-init the free linked list, then enable the reorder
 	 * engine; poll RDY (bit8). (Hand-seeding 1024 nodes is the alternative.) */
