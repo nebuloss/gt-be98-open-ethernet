@@ -69,6 +69,63 @@
 #define XRDP_OFF_DQM		0x00c80034UL	/* [rdpa.ko DQM_ADDRS[0]=0x82c80034 — stock accessor base; revert] */
 
 /* ----------------------------------------------------------------------------
+ * RNR_REGS per-core control block (base XRDP_OFF_RNR_REGS0 + core*stride).
+ * Offsets/values pinned vs BCM6813 rdpa.ko + CFE2 data_path_init / rdp_drv_rnr.c
+ * (re-notes/realhw/10-runner-bringup-spec.md secs 1, Wave-3/6). Bring-up step 2.
+ * -------------------------------------------------------------------------- */
+#define RNR_CFG_GLOBAL_CTRL	0x00	/* EN b0 (core run enable) */
+#define RNR_CFG_GLOBAL_CTRL_EN	BIT(0)
+#define RNR_CFG_CPU_WAKEUP	0x04	/* THREAD_NUM[3:0]; the WRITE starts that thread */
+#define RNR_CFG_CPU_WAKEUP_THREAD_MASK	0xf
+#define RNR_CFG_GEN_CFG		0x30	/* zero data/context mem; self-clears when done */
+#define RNR_CFG_GEN_CFG_DIS_DMA_OLD_FC	BIT(0)
+#define RNR_CFG_GEN_CFG_ZERO_DATA_MEM	BIT(2)
+#define RNR_CFG_GEN_CFG_ZERO_CTX_MEM	BIT(3)
+#define RNR_CFG_DDR_CFG		0x40	/* DDR buffer-memory base, encoded >>20 */
+#define RNR_CFG_PSRAM_CFG	0x44	/* PSRAM base >>20 = 0x82000000>>20 = 0x820 */
+#define RNR_CFG_PSRAM_CFG_VAL	0x820
+#define RNR_CFG_SCH_CFG		0x4c	/* scheduler cfg = 4 (DRV_RNR_16SP) */
+#define RNR_CFG_SCH_CFG_VAL	0x4
+/* CPU-host threads (rdpa runtime, core->image identity): RX core3/thr1, TX core2/thr6. */
+#define RNR_CPU_RX_THREAD	1	/* IMAGE_3_CPU_RX_THREAD_NUMBER (core 3) */
+#define RNR_CPU_TX_THREAD	6	/* IMAGE_2_CPU_TX_0_THREAD_NUMBER (core 2) */
+
+/* ----------------------------------------------------------------------------
+ * SBPM (base XRDP_OFF_SBPM). Spec sec 4: trigger the free-list init, poll RDY.
+ * -------------------------------------------------------------------------- */
+#define SBPM_INIT_FREE_LIST	0x000
+#define SBPM_INIT_FREE_LIST_VAL	0x03FFC000	/* INIT_OFFSET 0xFFF<<14 -> 0x1000 bufs */
+#define SBPM_INIT_FREE_LIST_RDY	BIT(31)
+
+/* ----------------------------------------------------------------------------
+ * DSPTCHR / reorder block (base XRDP_OFF_DSPTCHR). Spec sec 5: for first-light
+ * we trigger the HW auto-init of the free linked list rather than hand-seeding
+ * 1024 nodes, then enable the reorder engine and poll RDY.
+ * -------------------------------------------------------------------------- */
+#define DSPTCHR_REORDER_CFG		0x000
+#define DSPTCHR_REORDER_CFG_EN		BIT(0)
+#define DSPTCHR_REORDER_CFG_AUTO_INIT	BIT(4)
+#define DSPTCHR_REORDER_CFG_RDY		BIT(8)
+
+/* ----------------------------------------------------------------------------
+ * BBH_RX / BBH_TX per-port config (bases XRDP_OFF_BBH_RX0 / XRDP_OFF_BBH_TX0).
+ * Spec secs 7/8. Fixed BB (block) IDs on BCM6813:
+ *   DISPATCHER_REORDER=18, FPM=23, SBPM=56, SDMA0=21/SDMA1=22.
+ * -------------------------------------------------------------------------- */
+#define BBH_BBID_DISPATCHER	18
+#define BBH_BBID_FPM		23
+#define BBH_BBID_SBPM		56
+/* BBH_RX */
+#define BBH_RX_BBCFG		0x00	/* DISPBBID[15:8], SBPMBBID[23:16] */
+#define BBH_RX_ENABLE		0x3c	/* PKTEN b0, SBPMEN b1 (LAST) */
+#define BBH_RX_ENABLE_PKTEN	BIT(0)
+#define BBH_RX_ENABLE_SBPMEN	BIT(1)
+/* BBH_TX */
+#define BBH_TX_MACTYPE		0x00	/* = 1 (GPON; 7 is invalid) */
+#define BBH_TX_MACTYPE_VAL	1
+#define BBH_TX_BBCFG_1		0x04	/* FPMSRC[31:24], SBPMSRC[23:16] */
+
+/* ----------------------------------------------------------------------------
  * FPM register block. Layout from the GPL FpmControl struct (fpm_priv.h):
  *   ctrl  @ 0x0000, pool(broadcast) @ 0x0200, pool0 @ 0x0400, pool1 @ 0x0600.
  * The alloc/dealloc register is at +0x000 of the pool0 management block,
@@ -303,6 +360,26 @@ struct runner_ring_cfg {
 /* [PINNED 2026-06-22 vs SDK oracle: RDD_CPU_TX_RING_INDICES_VALUES_TABLE_ADDRESS_ARR = 0x29c8
  * (BCM6813_FPI). RDD/core-data-memory offset; + per-core RNR base for the absolute addr. */
 #define CPU_TX_RING_INDICES_OFF		0x29c8	/* RDD off [SDK BCM6813_FPI] */
+
+/*
+ * Field offsets WITHIN a runner_ring_cfg control block (16B, big-endian) for the
+ * indices the host and runner exchange at runtime (CPU_RING_DESCRIPTOR):
+ *   write_idx : u16 @ +6  (runner advances it as it delivers RX frames)
+ *   read_idx  : u16 @ +12 (host advances it as it consumes)
+ * Spec Wave-5: RX delivery is detected by polling write_idx vs the host read_idx,
+ * NOT a per-descriptor word2 ownership bit.
+ */
+#define RING_CFG_WRITE_IDX_OFF		6
+#define RING_CFG_READ_IDX_OFF		12
+
+/*
+ * FEED ring (MPM-free first-light): the host posts empty DDR buffers as 40-bit
+ * ABS pointers (CPU_FEED_DESCRIPTOR, 8B) so the runner has somewhere to DMA the
+ * next RX frame. Feed-ring control block lives in IMAGE_3 (core3) RDD @ 0x0f70;
+ * the host bumps its write_idx (the "feed doorbell", rdd_cpu_inc_feed_ring_write_idx).
+ * [SDK BCM6813 rdd_runner_defs_auto.h FEED ring; Wave-4/5.]
+ */
+#define RDD_FEED_RING_DESC_TABLE	0x0f70	/* RDD off, core 3 [SDK BCM6813] */
 
 /* ----------------------------------------------------------------------------
  * OFFLOAD (Phase 1: L2 + VLAN HW flow-offload). The offload context bundles the

@@ -55,9 +55,10 @@
 #define RUNNER_FW_NAME		"brcm/bcm4916-runner-microcode.bin"
 
 /* Ring geometry. Depth must fit number_of_entries[10:0] (<=2047). */
-#define RX_RING_DEPTH		256
+#define RX_RING_DEPTH		256	/* runner-written delivery ring */
+#define FEED_RING_DEPTH		256	/* host-posted empty-buffer ring */
 #define TX_RING_DEPTH		256
-#define RX_BUF_SIZE		2048	/* one FPM/DDR chunk per RX buffer */
+#define RX_BUF_SIZE		2048	/* one DDR buffer per RX frame */
 #define RX_NAPI_BUDGET		64
 
 static bool runner_emulated;
@@ -73,7 +74,8 @@ struct runner_priv {
 
 	void __iomem		*xrdp;		/* whole rdpa window */
 	void __iomem		*fpm;		/* xrdp + XRDP_OFF_FPM */
-	void __iomem		*rnr_mem[XRDP_RNR_CORES];
+	void __iomem		*rnr_mem[XRDP_RNR_CORES];	/* per-core data SRAM */
+	void __iomem		*rnr_regs[XRDP_RNR_CORES];	/* per-core ctl regs */
 
 	/* FPM pool (slow-path RX/TX buffers) */
 	void			*pool_vbase;
@@ -81,12 +83,18 @@ struct runner_priv {
 	u32			pool_size;
 	u32			chunk_size;
 
-	/* CPU-RX data ring (self-refilling, enet impl7 model) */
-	struct runner_rx_desc	*rx_ring;	/* coherent DDR */
+	/* CPU-RX delivery ring (runner-written) + host-fed FEED ring (MPM-free) */
+	struct runner_rx_desc	*rx_ring;	/* coherent DDR (runner fills) */
 	dma_addr_t		rx_ring_phys;
-	void			**rx_buf;	/* virt of each posted buffer */
-	dma_addr_t		*rx_buf_phys;
-	u32			rx_head;	/* host consumer index */
+	u32			rx_head;	/* host read_idx into rx_ring */
+
+	struct runner_feed_desc	*feed_ring;	/* coherent DDR (host posts bufs) */
+	dma_addr_t		feed_ring_phys;
+	u32			feed_widx;	/* host feed write_idx */
+	/* shared RX buffer pool fed to the runner; phys<->virt is arithmetic */
+	void			*rx_pool_vbase;
+	dma_addr_t		rx_pool_pbase;
+
 	int			rx_irq;
 	struct napi_struct	napi;
 
@@ -187,123 +195,158 @@ static int fpm_pool_init(struct runner_priv *p)
 	return 0;
 }
 
-/* ============================ CPU RX data ring =========================== *
- * Self-refilling data ring, enet impl7 model (enet_ring.c create_ring /
- * runner_get_pkt_from_ring / rdpa_cpu_ring_rest_desc). Each descriptor owns a
- * DDR buffer; word2 = swap4(buf_phys & 0x7fffffff) with ownership bit cleared
- * hands the slot to the Runner. The Runner DMAs a frame in, sets ownership and
- * packet_length, the host consumes and re-arms in place.
- */
-
-/* hand descriptor 'd' a fresh buffer at buf_phys, ownership -> RUNNER.
+/* ====================== CPU RX feed + delivery rings ===================== *
+ * MPM-free first-light model (spec Wave-4/5). The host owns a contiguous RX
+ * buffer pool and posts empty buffers as 40-bit ABS pointers into a FEED ring;
+ * the Runner pulls a feed entry, DMAs an incoming frame into that buffer and
+ * writes a CPU_RX_DESCRIPTOR into the DELIVERY ring, advancing the delivery
+ * ring's write_idx. The host polls write_idx vs its own read_idx (NOT a
+ * per-descriptor ownership bit - wave-1 was wrong), consumes the frame, and
+ * recycles the buffer back to the feed ring (re-post + feed doorbell).
  *
- * XRDP abs-address ring (CPU_RX_DESCRIPTOR, rdp_cpu_ring_defs.h / rdpa_cpu_helper.h):
- * the host stages the next buffer's abs phys pointer and marks abs mode, then
- * zeroes word1's length so the slot reads "empty" until the runner DMAs a frame
- * and writes packet_length (and source/flags). word0 = phys[31:0],
- * word1 = abs(b16) | ptr_hi[31:24]; length field left 0 (RUNNER will fill).
+ *   feed ring  : host -> runner   (empty buffers, CPU_FEED_DESCRIPTOR 8B)
+ *   delivery   : runner -> host   (filled CPU_RX_DESCRIPTOR 16B)
+ *
+ * Sources: CPU_FEED_DESCRIPTOR / CPU_RX_DESCRIPTOR (rdp_cpu_ring_defs.h),
+ * rdd_cpu_inc_feed_ring_write_idx (feed doorbell), enet impl7 ring model.
  */
-static void rx_rest_desc(struct runner_rx_desc *d, dma_addr_t buf_phys)
-{
-	u32 w1 = RXD_W1_ABS |
-		 (((u32)(buf_phys >> 32) & RXD_W1_PTR_HI_MASK) << RXD_W1_PTR_HI_SHIFT);
+#define PSRAM_CPU_RING_DESC_TABLE	0x3000	/* RX delivery ring cfg, core 3 */
 
-	d->word0 = cpu_to_be32((u32)buf_phys);
-	d->word1 = cpu_to_be32(w1);	/* packet_length == 0 => RUNNER owns / empty */
-	d->word2 = 0;
-	d->word3 = 0;
+/* phys<->virt within the contiguous RX buffer pool (slot index == buffer #) */
+static inline dma_addr_t rx_buf_phys(struct runner_priv *p, u32 i)
+{
+	return p->rx_pool_pbase + (dma_addr_t)i * RX_BUF_SIZE;
+}
+static inline void *rx_buf_virt(struct runner_priv *p, u32 i)
+{
+	return (u8 *)p->rx_pool_vbase + (size_t)i * RX_BUF_SIZE;
+}
+static inline u32 rx_buf_index(struct runner_priv *p, u64 phys)
+{
+	return (u32)((phys - p->rx_pool_pbase) / RX_BUF_SIZE);
+}
+
+/* write feed slot 'slot' to point at buffer 'buf_idx' (ABS 40-bit pointer) */
+static void feed_post(struct runner_priv *p, u32 slot, u32 buf_idx)
+{
+	struct runner_feed_desc *fd = &p->feed_ring[slot];
+	dma_addr_t bp = rx_buf_phys(p, buf_idx);
+	u32 w1 = FEED_W1_ABS |
+		 (((u32)(bp >> 32) & FEED_W1_PTR_HI_MASK) << FEED_W1_PTR_HI_SHIFT);
+
+	fd->ptr_low = cpu_to_be32((u32)bp);
+	fd->w1 = cpu_to_be32(w1);
+}
+
+/* feed doorbell: publish the feed ring's write_idx (BE u16 @ +6 of its cfg) */
+static void feed_doorbell(struct runner_priv *p, u16 widx)
+{
+	dma_wmb();
+	iowrite16(cpu_to_be16(widx),
+		  p->rnr_mem[CPU_RX_RING_CORE] + RDD_FEED_RING_DESC_TABLE +
+		  RING_CFG_WRITE_IDX_OFF);
+}
+
+/* delivery ring write_idx (runner-advanced) / read_idx (host-advanced) */
+static u16 rx_deliv_write_idx(struct runner_priv *p)
+{
+	__be16 be = ioread16(p->rnr_mem[CPU_RX_RING_CORE] +
+			     PSRAM_CPU_RING_DESC_TABLE + RING_CFG_WRITE_IDX_OFF);
+	return be16_to_cpu(be);
+}
+static void rx_deliv_set_read_idx(struct runner_priv *p, u16 idx)
+{
+	iowrite16(cpu_to_be16(idx), p->rnr_mem[CPU_RX_RING_CORE] +
+		  PSRAM_CPU_RING_DESC_TABLE + RING_CFG_READ_IDX_OFF);
+}
+
+/* publish a CPU_RING_DESCRIPTOR control block into a runner core's data SRAM */
+static void ring_publish(struct runner_priv *p, int core, u32 tbl_off,
+			 dma_addr_t phys, u32 depth, u32 entry_sz, u16 irq)
+{
+	struct runner_ring_cfg cfg = {};
+	u8 size_code = ilog2(entry_sz);
+
+	/* w0: byte0[7:3]=size_of_entry, half@0[10:0]=number_of_entries,
+	 *     half@2=interrupt_id. w1 (drop_counter, write_idx)=0;
+	 *     w3 (read_idx=0 | base_addr_high). All big-endian. */
+	cfg.w0 = cpu_to_be32(((u32)(size_code & 0x1f) << 27) |
+			     ((depth & 0x7ff) << 16) | irq);
+	cfg.base_addr_low = cpu_to_be32((u32)phys);
+	cfg.w3 = cpu_to_be32((u32)(phys >> 32) & 0xff);
+	memcpy_toio(p->rnr_mem[core] + tbl_off, &cfg, sizeof(cfg));
 }
 
 static int rx_ring_alloc(struct runner_priv *p)
 {
-	int i;
+	u32 i;
 
 	p->rx_ring = dmam_alloc_coherent(p->dev,
 					 RX_RING_DEPTH * sizeof(*p->rx_ring),
 					 &p->rx_ring_phys, GFP_KERNEL);
-	if (!p->rx_ring)
+	p->feed_ring = dmam_alloc_coherent(p->dev,
+					   FEED_RING_DEPTH * sizeof(*p->feed_ring),
+					   &p->feed_ring_phys, GFP_KERNEL);
+	p->rx_pool_vbase = dmam_alloc_coherent(p->dev,
+					       FEED_RING_DEPTH * RX_BUF_SIZE,
+					       &p->rx_pool_pbase, GFP_KERNEL);
+	if (!p->rx_ring || !p->feed_ring || !p->rx_pool_vbase)
 		return -ENOMEM;
 
-	p->rx_buf = devm_kcalloc(p->dev, RX_RING_DEPTH, sizeof(void *),
-				 GFP_KERNEL);
-	p->rx_buf_phys = devm_kcalloc(p->dev, RX_RING_DEPTH, sizeof(dma_addr_t),
-				      GFP_KERNEL);
-	if (!p->rx_buf || !p->rx_buf_phys)
-		return -ENOMEM;
-
-	for (i = 0; i < RX_RING_DEPTH; i++) {
-		void *buf = dmam_alloc_coherent(p->dev, RX_BUF_SIZE,
-						&p->rx_buf_phys[i], GFP_KERNEL);
-		if (!buf)
-			return -ENOMEM;
-		p->rx_buf[i] = buf;
-		rx_rest_desc(&p->rx_ring[i], p->rx_buf_phys[i]);
-	}
+	/* delivery ring starts empty (runner writes it); host read_idx = 0 */
 	p->rx_head = 0;
+
+	/* post depth-1 empty buffers (leave one slot free => not "full"==empty) */
+	for (i = 0; i < FEED_RING_DEPTH - 1; i++)
+		feed_post(p, i, i);
+	p->feed_widx = FEED_RING_DEPTH - 1;
 	return 0;
 }
 
-/*
- * Publish the RX ring to the Runner via a CPU_RING_DESCRIPTOR in PSRAM.
- * ABI sec 2.1 / bring-up step 8. The PSRAM table offset for the data ring
- * (CPU_RING_DESCRIPTORS_TABLE) is an RDD symbol not yet pinned from the GPL
- * map; the emulator accepts the ring-cfg at the contract offset.
- */
-/* [PINNED 2026-06-22 vs BCM6813 SDK oracle: rdp/projects/BCM6813_FPI/drivers/rdd/auto/
- * rdd_data_structures_auto.c RDD_CPU_RING_DESCRIPTORS_TABLE_ADDRESS_ARR = 0x3000 on
- * Runner core 3 (others INVALID). RDD/core-data-memory offset; absolute XRDP-window addr
- * still needs the per-core RNR data-memory base added (RNR-MEM base = remaining gap). */
-#define PSRAM_CPU_RING_DESC_TABLE	0x3000	/* RDD off, core 3 [SDK BCM6813_FPI] */
-
 static void rx_ring_publish(struct runner_priv *p)
 {
-	struct runner_ring_cfg cfg = {};
-	u8 size_code = ilog2(sizeof(struct runner_rx_desc)); /* 16B -> 4 */
-	u64 phys = p->rx_ring_phys;
-
-	/* w0: byte0[7:3]=size_of_entry, half@0[10:0]=number_of_entries,
-	 *     half@2=interrupt_id. Big-endian. */
-	cfg.w0 = cpu_to_be32(((u32)(size_code & 0x1f) << 27) |
-			     ((RX_RING_DEPTH & 0x7ff) << 16) |
-			     (p->rx_irq & 0xffff));
-	cfg.w1 = 0;					/* drop_counter, write_idx */
-	cfg.base_addr_low = cpu_to_be32((u32)phys);
-	/* w3: half@c read_idx=0, byte@f = base_addr_high */
-	cfg.w3 = cpu_to_be32((u32)(phys >> 32) & 0xff);
-
-	/* RX ring descriptor table lives in RNR core-3 data memory (not PSRAM)
-	 * [SDK RDD_CPU_RING_DESCRIPTORS_TABLE_ADDRESS_ARR core 3]. */
-	memcpy_toio(p->rnr_mem[CPU_RX_RING_CORE] + PSRAM_CPU_RING_DESC_TABLE,
-		    &cfg, sizeof(cfg));
+	/* delivery ring (runner -> host), 16B descriptors, on core 3 */
+	ring_publish(p, CPU_RX_RING_CORE, PSRAM_CPU_RING_DESC_TABLE,
+		     p->rx_ring_phys, RX_RING_DEPTH,
+		     sizeof(struct runner_rx_desc), p->rx_irq & 0xffff);
+	/* feed ring (host -> runner), 8B descriptors, on core 3 */
+	ring_publish(p, CPU_RX_RING_CORE, RDD_FEED_RING_DESC_TABLE,
+		     p->feed_ring_phys, FEED_RING_DEPTH,
+		     sizeof(struct runner_feed_desc), 0);
+	/* ring the feed doorbell so the runner sees the pre-posted buffers */
+	feed_doorbell(p, p->feed_widx);
 }
 
 static int runner_rx_poll(struct napi_struct *napi, int budget)
 {
 	struct runner_priv *p = container_of(napi, struct runner_priv, napi);
+	u16 widx = rx_deliv_write_idx(p);
 	int done = 0;
 
-	while (done < budget) {
+	while (done < budget && (u16)p->rx_head != widx) {
 		struct runner_rx_desc *d = &p->rx_ring[p->rx_head];
+		u32 w0 = be32_to_cpu(d->word0);
 		u32 w1 = be32_to_cpu(d->word1);
-		u16 len;
+		u64 bphys = w0 | ((u64)((w1 >> RXD_W1_PTR_HI_SHIFT) &
+					RXD_W1_PTR_HI_MASK) << 32);
+		u16 len = (w1 >> RXD_W1_PKT_LEN_SHIFT) & RXD_W1_PKT_LEN_MASK;
+		u32 bidx = rx_buf_index(p, bphys);
 		struct sk_buff *skb;
-		void *buf;
 
-		/* XRDP: a filled abs descriptor has a non-zero packet_length in
-		 * word1[15:2]; the empty (RUNNER-owned) slot we staged has len 0. */
-		len = (w1 >> RXD_W1_PKT_LEN_SHIFT) & RXD_W1_PKT_LEN_MASK;
-		if (!len)
-			break;
-
-		buf = p->rx_buf[p->rx_head];
-
-		dma_sync_single_for_cpu(p->dev, p->rx_buf_phys[p->rx_head],
-					RX_BUF_SIZE, DMA_FROM_DEVICE);
+		if (bidx >= FEED_RING_DEPTH) {
+			/* descriptor points outside our pool: cannot recycle */
+			p->ndev->stats.rx_errors++;
+			p->rx_head = (p->rx_head + 1) % RX_RING_DEPTH;
+			done++;
+			continue;
+		}
 
 		if (len && len <= RX_BUF_SIZE) {
+			dma_sync_single_for_cpu(p->dev, bphys, len,
+						DMA_FROM_DEVICE);
 			skb = napi_alloc_skb(napi, len);
 			if (skb) {
-				skb_put_data(skb, buf, len);
+				skb_put_data(skb, rx_buf_virt(p, bidx), len);
 				skb->protocol = eth_type_trans(skb, p->ndev);
 				p->ndev->stats.rx_packets++;
 				p->ndev->stats.rx_bytes += len;
@@ -315,13 +358,19 @@ static int runner_rx_poll(struct napi_struct *napi, int budget)
 			p->ndev->stats.rx_errors++;
 		}
 
-		/* re-arm slot in place (same buffer), ownership -> RUNNER */
-		dma_sync_single_for_device(p->dev, p->rx_buf_phys[p->rx_head],
+		/* recycle this buffer back to the feed ring */
+		dma_sync_single_for_device(p->dev, rx_buf_phys(p, bidx),
 					   RX_BUF_SIZE, DMA_FROM_DEVICE);
-		rx_rest_desc(d, p->rx_buf_phys[p->rx_head]);
+		feed_post(p, p->feed_widx % FEED_RING_DEPTH, bidx);
+		p->feed_widx++;
 
 		p->rx_head = (p->rx_head + 1) % RX_RING_DEPTH;
 		done++;
+	}
+
+	if (done) {
+		feed_doorbell(p, p->feed_widx);
+		rx_deliv_set_read_idx(p, p->rx_head);
 	}
 
 	if (done < budget) {
@@ -603,6 +652,124 @@ static void runner_ubus_decode_init(struct runner_priv *p)
 	writel(0x82900000, u + 0x0c); writel(0x82a00000, u + 0x10); /* apb      */
 }
 
+/* ========================= RNR core enable / wakeup ====================== *
+ * Bring-up step 2 (spec sec 1 + Wave-3/6). Split in two:
+ *   runner_rnr_precfg() - BEFORE microcode: zero each core's data+context SRAM
+ *     (so a stale ring/feed table can't be mistaken for valid) and program the
+ *     scheduler + PSRAM/DDR base config. Zeroing happens before the microcode
+ *     load, which targets the separate INST/PRED SRAM (+0x10000/+0x1c000).
+ *   runner_rnr_enable() - LAST (after all blocks + rings are published): set
+ *     CFG_GLOBAL_CTRL.EN on every core, then start the CPU host threads via
+ *     CFG_CPU_WAKEUP (the write IS the wake): RX core3/thread1, TX core2/thread6.
+ */
+static void runner_rnr_precfg(struct runner_priv *p)
+{
+	int c, i;
+
+	for (c = 0; c < XRDP_RNR_CORES; c++) {
+		void __iomem *r = p->rnr_regs[c];
+
+		if (!r)
+			continue;
+		/* zero data + context memory; the bits self-clear when done */
+		writel(RNR_CFG_GEN_CFG_ZERO_DATA_MEM | RNR_CFG_GEN_CFG_ZERO_CTX_MEM,
+		       r + RNR_CFG_GEN_CFG);
+		for (i = 0; i < 1000; i++) {
+			if (!(readl(r + RNR_CFG_GEN_CFG) &
+			      (RNR_CFG_GEN_CFG_ZERO_DATA_MEM |
+			       RNR_CFG_GEN_CFG_ZERO_CTX_MEM)))
+				break;
+			udelay(10);
+		}
+		/* scheduler mode + memory base config */
+		writel(RNR_CFG_SCH_CFG_VAL,   r + RNR_CFG_SCH_CFG);
+		writel(RNR_CFG_PSRAM_CFG_VAL, r + RNR_CFG_PSRAM_CFG);
+		/* DDR buffer-memory base, encoded as phys>>20 (best-effort; the exact
+		 * field packing is flagged for on-silicon confirmation in the spec). */
+		writel((u32)(p->pool_pbase >> 20), r + RNR_CFG_DDR_CFG);
+	}
+}
+
+static void runner_rnr_enable(struct runner_priv *p)
+{
+	int c;
+
+	/* run all cores that carry microcode */
+	for (c = 0; c < XRDP_RNR_CORES; c++) {
+		void __iomem *r = p->rnr_regs[c];
+		u32 v;
+
+		if (!r)
+			continue;
+		v = readl(r + RNR_CFG_GLOBAL_CTRL);
+		writel(v | RNR_CFG_GLOBAL_CTRL_EN, r + RNR_CFG_GLOBAL_CTRL);
+	}
+
+	/* wake the CPU host threads (the write to CFG_CPU_WAKEUP starts them) */
+	dma_wmb();
+	writel(RNR_CPU_RX_THREAD & RNR_CFG_CPU_WAKEUP_THREAD_MASK,
+	       p->rnr_regs[CPU_RX_RING_CORE] + RNR_CFG_CPU_WAKEUP);
+	writel(RNR_CPU_TX_THREAD & RNR_CFG_CPU_WAKEUP_THREAD_MASK,
+	       p->rnr_regs[CPU_TX_RING_CORE] + RNR_CFG_CPU_WAKEUP);
+}
+
+/* ========================= SBPM / DSPTCHR / BBH ========================== *
+ * Bring-up step 3 (spec secs 4,5,7,8). Minimal first-light block init: just
+ * enough to let one MAC port DMA frames through the Runner to the CPU rings.
+ * Per-port BBH values still need on-silicon iteration (flagged in the spec).
+ */
+static int runner_sbpm_init(struct runner_priv *p)
+{
+	void __iomem *s = p->xrdp + XRDP_OFF_SBPM;
+	int i;
+
+	/* trigger the SBPM free-list init, then poll RDY (bit31) */
+	writel(SBPM_INIT_FREE_LIST_VAL, s + SBPM_INIT_FREE_LIST);
+	for (i = 0; i < 1000; i++) {
+		if (readl(s + SBPM_INIT_FREE_LIST) & SBPM_INIT_FREE_LIST_RDY)
+			return 0;
+		udelay(10);
+	}
+	dev_warn(p->dev, "SBPM free-list init did not signal RDY\n");
+	return 0;	/* non-fatal for first-light */
+}
+
+static int runner_dsptchr_init(struct runner_priv *p)
+{
+	void __iomem *d = p->xrdp + XRDP_OFF_DSPTCHR;
+	int i;
+
+	/* let the HW auto-init the free linked list, then enable the reorder
+	 * engine; poll RDY (bit8). (Hand-seeding 1024 nodes is the alternative.) */
+	writel(DSPTCHR_REORDER_CFG_EN | DSPTCHR_REORDER_CFG_AUTO_INIT,
+	       d + DSPTCHR_REORDER_CFG);
+	for (i = 0; i < 1000; i++) {
+		if (readl(d + DSPTCHR_REORDER_CFG) & DSPTCHR_REORDER_CFG_RDY)
+			return 0;
+		udelay(10);
+	}
+	dev_warn(p->dev, "DSPTCHR reorder init did not signal RDY\n");
+	return 0;	/* non-fatal for first-light */
+}
+
+/* configure + enable one BBH_RX MAC port and the LAN BBH_TX instance */
+static void runner_bbh_init(struct runner_priv *p, int rx_port)
+{
+	void __iomem *rx = p->xrdp + XRDP_OFF_BBH_RX0 +
+			   (u32)rx_port * XRDP_BBH_RX_STRIDE;
+	void __iomem *tx = p->xrdp + XRDP_OFF_BBH_TX0;	/* BBH_TX_ID_LAN = 0 */
+
+	/* BBH_RX: point the dispatcher + SBPM block IDs, then enable last */
+	writel(((u32)BBH_BBID_DISPATCHER << 8) | ((u32)BBH_BBID_SBPM << 16),
+	       rx + BBH_RX_BBCFG);
+	writel(BBH_RX_ENABLE_PKTEN | BBH_RX_ENABLE_SBPMEN, rx + BBH_RX_ENABLE);
+
+	/* BBH_TX: MAC type + FPM/SBPM source block IDs */
+	writel(BBH_TX_MACTYPE_VAL, tx + BBH_TX_MACTYPE);
+	writel(((u32)BBH_BBID_FPM << 24) | ((u32)BBH_BBID_SBPM << 16),
+	       tx + BBH_TX_BBCFG_1);
+}
+
 /* ============================ offload self-test (debugfs) =============== *
  * Writing "<vlan_op> <vid>" to .../offload_selftest programs one NAT-C L2 flow
  * keyed on the fixed test DA/SA below (so frames the dgram peer injects HIT).
@@ -768,22 +935,34 @@ static int runner_probe(struct platform_device *pdev)
 		return PTR_ERR(p->xrdp);
 	p->fpm = p->xrdp + XRDP_OFF_FPM;
 	p->natc = p->xrdp + XRDP_OFF_NATC;
-	for (i = 0; i < XRDP_RNR_CORES; i++)
+	for (i = 0; i < XRDP_RNR_CORES; i++) {
 		p->rnr_mem[i] = p->xrdp + XRDP_OFF_RNR_MEM0 +
 				i * XRDP_RNR_MEM_STRIDE;
+		p->rnr_regs[i] = p->xrdp + XRDP_OFF_RNR_REGS0 +
+				 i * XRDP_RNR_REGS_STRIDE;
+	}
 
 	p->rx_irq = platform_get_irq_byname_optional(pdev, "queue0");
 	if (p->rx_irq < 0)
 		p->rx_irq = 0;	/* poll mode */
 
-	/* bring-up (ABI sec 4) */
+	/*
+	 * Runner bring-up (spec re-notes/realhw/10-runner-bringup-spec.md):
+	 *   UBUS decode -> FPM pool -> RNR pre-cfg (zero mem) -> microcode load ->
+	 *   SBPM -> DSPTCHR -> rings (alloc+publish) -> BBH -> RNR enable (LAST).
+	 * All MMIO below only runs under a real probe (a DT node with our
+	 * compatible), so it is inert on a stock kernel that lacks the node.
+	 */
 	runner_ubus_decode_init(p);
 	ret = fpm_pool_init(p);
 	if (ret)
 		return ret;
+	runner_rnr_precfg(p);		/* zero core SRAM + cfg, before microcode */
 	ret = runner_load_microcode(p);
 	if (ret)
 		return ret;
+	runner_sbpm_init(p);
+	runner_dsptchr_init(p);
 	ret = rx_ring_alloc(p);
 	if (ret)
 		return ret;
@@ -791,6 +970,10 @@ static int runner_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	rx_ring_publish(p);
+	/* one MAC port for first-light; the real port map needs on-silicon
+	 * iteration (BBH_RX has 11 MAC instances) - flagged in the spec. */
+	runner_bbh_init(p, 0);
+	runner_rnr_enable(p);		/* CFG_GLOBAL_CTRL.EN + cpu_wakeup, LAST */
 
 	netif_napi_add(ndev, &p->napi, runner_rx_poll);
 	ndev->netdev_ops = &runner_netdev_ops;
