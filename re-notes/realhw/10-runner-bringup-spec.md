@@ -168,3 +168,32 @@ RMW → POOL_CFG_0..3 ({8,4,2,1}×512) → PHYS/VIRT_BASE=bufmem → CORE_CONFIG
 BFREE ptr cfg → per-client(0x11)/per-ring(1) init → BUF_INIT (write 0xf6 @+0x100+4, poll &0x2c@+8)
 → master enable (DMA_COMMON+0x30 |=1, +0x3c|=0x80000000, etc.). Needs PMC + bufmem base + SYSRAM
 rings. Gaps: exact bitfield names + per-ring strides (one read-only mpm_reg_dump on silicon resolves).
+
+## Wave-5 (2026-06-22): microcode artifact + feed-ring ABI + ★PROJECT-VARIANT WARNING★
+★Microcode blob BUILT (dev-build /tmp/bcm4916-runner-microcode.bin, 270496 B, sha256
+e1141770967a34146efcfa4aa97e56df83c1c71cce4933225f1f9c909a95e69b; generator /tmp/gen_runner_fw.py).
+Layout: 32B header "RFW1"|ver1|num_cores8|hdr32|entry16|total|rsvd2, then 8×{inst_off,inst_len,
+pred_off,pred_len} (entry i==core i), then 8 inst(32KB) + 8 pred(1KB). ★pred is uint16_t = 1024B
+(NOT u32). Loader: per core memcpy RNR_INST[c]=0x82700000+c*0x20000+0x10000 (32KB), RNR_PRED[c]
+=+0x1c000 (1KB). GPLv2+linking-exception → MODULE_FIRMWARE ok.
+
+Feed-ring/CPU-ring ABI (MPM-free, confirmed): FEED ring desc @ IMAGE_3 RDD 0x0f70 (CPU_FEED_DESCRIPTOR
+8B: ptr_low@0, type@6b0=ABS_TYPE=1, ptr_hi@7); host fills + bumps WRITE_IDX (in the ring desc),
+doorbell rdd_cpu_inc_feed_ring_write_idx, batch thr 128, CPU_RING_SIZE_64_RESOLUTION=6. RX delivery
+ring desc table @ 0x3000 core3; **host polls read_idx(@12) vs write_idx(@6)** of CPU_RING_DESCRIPTOR
+(NOT a word2 ownership bit — corrects wave-1). TX ring desc + indices(4B: read@0/write@2) + the
+rdd_ring_init field recipe known (GPL legacy ref rdd_cpu_ring.c:248). DSPTCHR: CPU_TX_EGRESS=VIQ13,
+CPU_RX=direct-processing(thread, not a VIQ). DMA/SDMA base 0x828b2000 (DMA1 +0x800).
+
+★★PROJECT-VARIANT WARNING — values DIFFER across SDK rdp projects; use the one the DEVICE's rdpa.ko
+matches before coding any MMIO:
+- CPU_TX_RING_DESCRIPTOR: BCM6813 = 0x33e0 vs BCM6813_FPI = 0x3360. (RX ring 0x3000 + TX indices
+  0x29c8 agree across both.)
+- SBPM INIT_FREE_LIST: CFE2 basic-dump = 0x5fc000 (0x17F buffers) vs FPI/earlier = 0x03FFC000 (0xFFF).
+  DIS_REOR linked-list = 512 (CFE2) vs 1024 (FPI). BBH_TX stride 0x4000 (CFE2 dump) vs 0x2000.
+- CPU thread numbers: CFE2 single-image CPU_RX=0/CPU_TX=1; rdpa-runtime CPU_RX=core3/thread1,
+  CPU_TX=core2/thread6. The CFE2 datapath is the bootloader (single CFE core image); the rdpa Linux
+  runtime is multi-image — the DEVICE runs rdpa, so the rdpa/runtime values are authoritative for us.
+→ NEXT (pre-implementation): pin which rdp project the targets/96813GW build = device rdpa.ko uses,
+  and take CPU ring/feed/index addrs + SBPM init + thread nums from THAT (cross-check vs the actual
+  rdpa.ko). Block bases already came from the device rdpa.ko (wave-4) and are authoritative.
