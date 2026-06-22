@@ -82,7 +82,7 @@ BB_IDs: DISPATCHER_REORDER=18, FPM=23, SBPM=56, SDMA0=21/SDMA1=22, TX_LAN=32.
 - **ENABLE 0x3C: PKTEN b0=1, SBPMEN b1=1 (LAST, in rdp_block_enable).**
 
 ## 8. BBH_TX (base 0x82890000+id*0x2000, BBH_TX_ID_LAN=0)
-- MACTYPE 0x00 = 7 (GPON unified); BBCFG_1_TX 0x04: FPMSRC[31:24]=**23**, SBPMSRC[23:16]=**56**.
+- MACTYPE 0x00 = 1 (MAC_TYPE_GPON; 7 is invalid); BBCFG_1_TX 0x04: FPMSRC[31:24]=**23**, SBPMSRC[23:16]=**56**.
 - RNR_SRC_ID (runner core+CPU_TX task); DMACFG 0x20 / SDMACFG 0x24 (src=21, desc base/size 16);
   DDRTMBASEL/H 0x2c (FPM packet pool phys); LAN PDBASE/PDSIZE/Q2RNR per-queue FIFOs.
 
@@ -100,3 +100,36 @@ BB_IDs: DISPATCHER_REORDER=18, FPM=23, SBPM=56, SDMA0=21/SDMA1=22, TX_LAN=32.
 - Exact FPM/MPM ordered HW init — in bcm_mpm.ko (register map known; sequence not).
 - BCM6813 RNR_REGS absolute base — re-confirm from build-generated XRDP_RNR_REGS_AG.c or live read.
 - Several runtime values (fpm_base, buf_size, VQ bitmask, SOP_OFFSET) are p_dpi_cfg/enum-derived.
+
+## Wave-3 closures (2026-06-22) + ★MPM blocker★
+Adversarial verification PASSED: every offset/value/bit above MATCHES BCM6813 source
+(autogen/XRDP_AG.h + CFE2 data_path_init). Only fix: BBH_TX MAC_TYPE = **1** (GPON), not 7.
+
+Core start (rnr_image_first_task is debug-only/zeros): cores start per-subsystem via
+`cfg_cpu_wakeup_set(get_runner_idx(image), IMAGE_n_*_THREAD_NUMBER)`. core→image = identity.
+**CPU RX = core 3, thread 1** (IMAGE_3_CPU_RX_THREAD_NUMBER); **CPU TX = core 2, thread 6**
+(IMAGE_2_CPU_TX_0_THREAD_NUMBER).
+
+RNR_REGS base 0x82800000 stride 0x1000 (rdpa.ko RNR_REGS_ADDRS). CFG_SCH_CFG@0x4c=4 (DRV_RNR_16SP).
+CFG_PSRAM_CFG@0x44 = 0x820 (psram base 0x82000000>>20). CFG_DDR_CFG@0x40 = (bufmem_phys>>20) encoded.
+
+QM (from rdpa.ko drv_qm_init disasm): FPM_CONTROL@0x0c fixed bits = override_bb_id_en + bb_id=0x3e(FPM)
++ pool_bp_enable → 0x7D000001 | (prefetch_min_pool_size<<8); DDR_SOP_OFFSET@0x3c = 0; FPM_BASE_ADDR@0x34
+= bufmem_phys>>8 (full, also COHERENT@0x38); MPM pool sizes@0x180/4/8 = buf_size×{8,4,2,1} cap 0x3fff
+(runtime); QM_ENABLE_CTRL@0x00 = 0x307 (set in data_path_init, runtime). FPM buf size default 512B.
+
+★★MPM = HARD BLOCKER for a fully-open COLD datapath★★
+- MPM is a SEPARATE HW DMA engine, DT node `brcm,mpm` @ **0x80020000 / 0x4000** (kernel/dts/6813),
+  NOT in the XRDP 0x82xxxxxx window, NOT Runner-core logic.
+- Its HW bring-up (mpm_init/mpm_pool_init/mpm_enable, the BALLOC/BFREE DMA rings, DQM_INTERFACE_CFG)
+  is ONLY in proprietary `bcmdrivers/broadcom/char/mpm/impl1/{bcm_mpm.ko,mpm.6813.o_saved}` — GPL
+  source stripped (rdp_drv_fpm.c/xrdp_drv_fpm_ag.* dangling on 6813). drv_mpm_init() (GPL) is
+  software bookkeeping only.
+- FPM-direct path is `#ifndef RUNNER_MPM_SUPPORT` + CHIP_VER<RDP_GEN_62 gated → OFF on 6813.
+- GPL Runner microcode does NOT contain MPM/buffer-alloc logic.
+→ Routes to a working datapath: (1) CLEAN-ROOM the MPM block (RE bcm_mpm.ko register sequence —
+  block strings enumerate MPM_COMMON/DMA_COMMON/BALLOC/BFREE/CORE; highest effort, only fully-open
+  route); (2) software-managed CPU-ring buffers for slow-path FIRST-LIGHT (rdp_cpu_fpm_alloc /
+  QEMU-M5 path — may move CPU-forwarded frames without the MPM DMA rings); (3) interim: user loads
+  their own bcm_mpm.ko. The control plane + microcode (GPL) + the rest of the bring-up are open;
+  the buffer allocator is the one closed dependency.
