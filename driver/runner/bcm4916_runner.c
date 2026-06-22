@@ -270,7 +270,9 @@ static void rx_ring_publish(struct runner_priv *p)
 	/* w3: half@c read_idx=0, byte@f = base_addr_high */
 	cfg.w3 = cpu_to_be32((u32)(phys >> 32) & 0xff);
 
-	memcpy_toio(p->xrdp + XRDP_OFF_PSRAM + PSRAM_CPU_RING_DESC_TABLE,
+	/* RX ring descriptor table lives in RNR core-3 data memory (not PSRAM)
+	 * [SDK RDD_CPU_RING_DESCRIPTORS_TABLE_ADDRESS_ARR core 3]. */
+	memcpy_toio(p->rnr_mem[CPU_RX_RING_CORE] + PSRAM_CPU_RING_DESC_TABLE,
 		    &cfg, sizeof(cfg));
 }
 
@@ -434,7 +436,9 @@ static int tx_ring_alloc(struct runner_priv *p)
 			     ((TX_RING_DEPTH & 0x7ff) << 16));
 	cfg.base_addr_low = cpu_to_be32((u32)phys);
 	cfg.w3 = cpu_to_be32((u32)(phys >> 32) & 0xff);
-	memcpy_toio(p->xrdp + XRDP_OFF_PSRAM + PSRAM_CPU_TX_RING_DESC_TABLE,
+	/* TX ring descriptor table lives in RNR core-2 data memory (not PSRAM)
+	 * [SDK RDD_CPU_TX_RING_DESCRIPTOR_TABLE_ADDRESS_ARR core 2]. */
+	memcpy_toio(p->rnr_mem[CPU_TX_RING_CORE] + PSRAM_CPU_TX_RING_DESC_TABLE,
 		    &cfg, sizeof(cfg));
 	return 0;
 }

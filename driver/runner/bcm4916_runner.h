@@ -38,10 +38,19 @@
 #define XRDP_WINDOW_BASE	0x82000000UL
 #define XRDP_WINDOW_SIZE	0x00caf004UL
 
-#define XRDP_OFF_PSRAM		0x00000000UL	/* RDD tables live here */
-#define XRDP_OFF_RNR_MEM0	0x00700000UL	/* per-core data SRAM, stride 0x20000 */
+#define XRDP_OFF_PSRAM		0x00000000UL	/* PSRAM (NAT-C staging etc.) */
+/* [PINNED 2026-06-22 vs SDK oracle: RNR_MEM_ADDRS[] (BCM6837/6888 autogen, same XRDP gen) =
+ * 0x82600000 base, stride 0x20000; BCM6813_FPI runner_fw addrs (0x82610000=core0+inst,
+ * 0x82648000=core2+data ...) confirm base 0x82600000 for 6813. Was 0x00700000 (wrong: that is
+ * core-8 in the 14-core 6888 map, past the 6813's 8 cores). The CPU RX/TX ring descriptor
+ * tables live in per-core RNR data memory, NOT PSRAM. */
+#define XRDP_OFF_RNR_MEM0	0x00600000UL	/* per-core data SRAM base [SDK RNR_MEM_ADDRS] */
 #define XRDP_RNR_MEM_STRIDE	0x00020000UL
 #define XRDP_RNR_CORES		8
+/* CPU host rings live on specific Runner cores per the RDD ADDRESS_ARR:
+ * RX descriptors core 3, TX descriptors core 2 [SDK BCM6813_FPI rdd_data_structures_auto.c]. */
+#define CPU_RX_RING_CORE	3
+#define CPU_TX_RING_CORE	2
 #define XRDP_OFF_RNR_REGS0	0x00800000UL	/* per-core ctl, stride 0x1000 */
 #define XRDP_RNR_REGS_STRIDE	0x00001000UL
 #define XRDP_RNR_INST_OFF	0x00010000UL	/* core_base + this = inst SRAM */
