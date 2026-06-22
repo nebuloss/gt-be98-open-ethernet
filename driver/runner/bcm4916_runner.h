@@ -292,7 +292,9 @@ struct runner_ring_cfg {
  * yet pinned from the GPL RDD map; it is a fixed contract offset the emulator
  * honours (see qemu/device-model/runner-emulation-contract.md).
  */
-#define CPU_TX_RING_INDICES_OFF		0x0000	/* TODO: pin RDD table offset */
+/* [PINNED 2026-06-22 vs SDK oracle: RDD_CPU_TX_RING_INDICES_VALUES_TABLE_ADDRESS_ARR = 0x29c8
+ * (BCM6813_FPI). RDD/core-data-memory offset; + per-core RNR base for the absolute addr. */
+#define CPU_TX_RING_INDICES_OFF		0x29c8	/* RDD off [SDK BCM6813_FPI] */
 
 /* ----------------------------------------------------------------------------
  * OFFLOAD (Phase 1: L2 + VLAN HW flow-offload). The offload context bundles the

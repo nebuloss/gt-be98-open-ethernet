@@ -248,7 +248,11 @@ static int rx_ring_alloc(struct runner_priv *p)
  * (CPU_RING_DESCRIPTORS_TABLE) is an RDD symbol not yet pinned from the GPL
  * map; the emulator accepts the ring-cfg at the contract offset.
  */
-#define PSRAM_CPU_RING_DESC_TABLE	0x0000	/* TODO: pin RDD offset */
+/* [PINNED 2026-06-22 vs BCM6813 SDK oracle: rdp/projects/BCM6813_FPI/drivers/rdd/auto/
+ * rdd_data_structures_auto.c RDD_CPU_RING_DESCRIPTORS_TABLE_ADDRESS_ARR = 0x3000 on
+ * Runner core 3 (others INVALID). RDD/core-data-memory offset; absolute XRDP-window addr
+ * still needs the per-core RNR data-memory base added (RNR-MEM base = remaining gap). */
+#define PSRAM_CPU_RING_DESC_TABLE	0x3000	/* RDD off, core 3 [SDK BCM6813_FPI] */
 
 static void rx_ring_publish(struct runner_priv *p)
 {
@@ -409,7 +413,9 @@ static netdev_tx_t runner_start_xmit(struct sk_buff *skb,
 	return NETDEV_TX_OK;
 }
 
-#define PSRAM_CPU_TX_RING_DESC_TABLE	0x0080	/* TODO: pin RDD offset */
+/* [PINNED 2026-06-22 vs SDK oracle: RDD_CPU_TX_RING_DESCRIPTOR_TABLE_ADDRESS_ARR = 0x3360
+ * on Runner core 2 (BCM6813_FPI). RDD/core-data-memory offset; + per-core RNR base for abs. */
+#define PSRAM_CPU_TX_RING_DESC_TABLE	0x3360	/* RDD off, core 2 [SDK BCM6813_FPI] */
 
 static int tx_ring_alloc(struct runner_priv *p)
 {
