@@ -26,6 +26,7 @@
 #include <linux/platform_device.h>
 #include <linux/ioport.h>
 #include <linux/dma-mapping.h>
+#include <linux/of_device.h>
 
 #define XRDP_BASE	0x82000000UL
 #define XRDP_SIZE	0x00caf004UL
@@ -50,7 +51,15 @@ static int __init runner_pdev_init(void)
 		       PTR_ERR(runner_pdev));
 		return PTR_ERR(runner_pdev);
 	}
-	pr_info("bcm4916-runner-pdev: device registered (MEM 0x%08lx+0x%lx, poll mode)\n",
+	/*
+	 * A bare (non-DT) platform_device gets NO of_dma_configure(), so it has
+	 * no dma_ops and dma_set_mask() returns -EIO -> the driver's probe fails
+	 * before any bring-up. Configure default (arch/swiotlb) DMA ops for the
+	 * whole address space here so the conduit's coherent rings/pool allocate.
+	 */
+	of_dma_configure(&runner_pdev->dev, NULL, true);
+
+	pr_info("bcm4916-runner-pdev: device registered + DMA-configured (MEM 0x%08lx+0x%lx, poll mode)\n",
 		XRDP_BASE, XRDP_SIZE);
 	return 0;
 }

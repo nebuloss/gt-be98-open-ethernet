@@ -949,8 +949,15 @@ static int runner_probe(struct platform_device *pdev)
 	int ret, i;
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(40));
-	if (ret)
-		return ret;
+	if (ret) {
+		/* a non-DT (shim) device may not honor 40-bit; try 32, and don't
+		 * abort if even that is refused - the coherent allocs below will
+		 * surface a real DMA failure with a clearer error. */
+		ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+		if (ret)
+			dev_warn(dev, "DMA mask not honored (%d); continuing best-effort\n",
+				 ret);
+	}
 
 	ndev = devm_alloc_etherdev(dev, sizeof(*p));
 	if (!ndev)

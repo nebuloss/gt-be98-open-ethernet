@@ -11,7 +11,10 @@
 # skipped) the box auto-reverts to committed slot2 in ~WINDOW s. We therefore do
 # NOT touch wdtctl/bcm_bootstate here; we just take over and breadcrumb to /data.
 set +e
+# Modules/microcode load from the baked rootfs path, but a /data override (if
+# present) wins -> iterate the driver via a /data push WITHOUT re-flashing.
 RO=/usr/lib/open-enet			# baked into the trial rootfs
+[ -f /data/open-enet/bcm4916-runner.ko ] && RO=/data/open-enet
 LOG=/data/open-enet			# writable, survives the revert
 BC=$LOG/trial.log
 mkdir -p "$LOG"
