@@ -636,14 +636,31 @@ static int runner_load_microcode(struct runner_priv *p)
 			u32 po = get_unaligned_le32(e + 8);
 			u32 pl = get_unaligned_le32(e + 12);
 
+			u32 j;
+
 			if (!p->rnr_mem[c] ||
 			    (u64)io + il > fw->size || (u64)po + pl > fw->size) {
 				dev_err(p->dev, "runner fw: core %u bad extent\n", c);
 				release_firmware(fw);
 				return -EINVAL;
 			}
-			memcpy_toio(p->rnr_mem[c] + XRDP_RNR_INST_OFF, d + io, il);
-			memcpy_toio(p->rnr_mem[c] + XRDP_RNR_PRED_OFF, d + po, pl);
+			/*
+			 * The Runner SRAM is BIG-ENDIAN (the stock loader byte-swaps
+			 * every word - MWRITE_32). The RFW1 blob stores inst/pred as
+			 * native LITTLE-ENDIAN, so a plain memcpy_toio would load
+			 * byte-swapped instructions + a packed prediction RAM -> the
+			 * cores execute garbage and idle. Match the stock loader:
+			 *  - INST: each native u32 -> iowrite32be (== swap4) [rdp_drv_rnr.c]
+			 *  - PRED: each native u16 -> a u32 RAM slot (stride 4), BE
+			 *    (memcpyl_prediction: read u16, MWRITE_32; RNR_PRED is 512
+			 *    u32 slots each holding a 16-bit pred value).
+			 */
+			for (j = 0; j + 4 <= il; j += 4)
+				iowrite32be(get_unaligned_le32(d + io + j),
+					    p->rnr_mem[c] + XRDP_RNR_INST_OFF + j);
+			for (j = 0; j + 2 <= pl; j += 2)
+				iowrite32be(get_unaligned_le16(d + po + j),
+					    p->rnr_mem[c] + XRDP_RNR_PRED_OFF + (j / 2) * 4);
 		}
 		dev_info(p->dev, "Runner microcode loaded: %u cores, %zu bytes\n",
 			 ncores, fw->size);
