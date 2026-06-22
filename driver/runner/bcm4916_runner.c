@@ -44,6 +44,7 @@
 #include <linux/firmware.h>
 #include <linux/delay.h>
 #include <linux/byteorder/generic.h>
+#include <asm/unaligned.h>
 #include <linux/in.h>
 #include <linux/debugfs.h>
 
@@ -528,15 +529,52 @@ static int runner_load_microcode(struct runner_priv *p)
 	}
 
 	/*
-	 * Real-HW path (ABI bring-up step 7 / 5bis-G3 step 11): block-copy
-	 * fw_binary_n (32KB) into RNR_INST[n] and fw_predict_n (1KB) into
-	 * RNR_PRED[n] for each of 8 cores, then enable cores via RNR_REGS[n].
-	 * Left as a structured TODO: the exact blob sub-layout + per-core
-	 * enable handshake are not pinned (ABI sec 6, "Microcode load fine
-	 * detail"). Not needed for the emulator.
+	 * Real-HW path: the firmware is the "RFW1" blob built from the SDK's GPL
+	 * per-core microcode arrays. Layout [re-notes/realhw/10-runner-bringup-spec.md]:
+	 *   32B header: 'R','F','W','1' | u32 ver | u32 num_cores | u32 hdr_size |
+	 *               u32 entry_size | u32 total | u32 rsvd[2]   (all little-endian)
+	 *   num_cores x { u32 inst_off, inst_len, pred_off, pred_len }  (entry i == core i)
+	 *   payload: 8 inst images (32KB) then 8 pred images (1KB, u16-packed).
+	 * Copy each core's inst image to RNR_INST[c] (=rnr_mem[c]+0x10000) and pred to
+	 * RNR_PRED[c] (=rnr_mem[c]+0x1c000). Core enable/wakeup happens in runner_init.
 	 */
-	dev_info(p->dev, "Runner microcode %zu bytes loaded (HW path TODO)\n",
-		 fw->size);
+	{
+		const u8 *d = fw->data;
+		u32 ncores, hdr_size, entry_size, c;
+
+		if (fw->size < 32 || memcmp(d, "RFW1", 4)) {
+			dev_err(p->dev, "runner fw: bad magic or short (%zu)\n", fw->size);
+			release_firmware(fw);
+			return -EINVAL;
+		}
+		ncores     = get_unaligned_le32(d + 8);
+		hdr_size   = get_unaligned_le32(d + 12);
+		entry_size = get_unaligned_le32(d + 16);
+		if (ncores > XRDP_RNR_CORES || entry_size < 16 ||
+		    (u64)hdr_size + (u64)ncores * entry_size > fw->size) {
+			dev_err(p->dev, "runner fw: bad table (cores=%u)\n", ncores);
+			release_firmware(fw);
+			return -EINVAL;
+		}
+		for (c = 0; c < ncores; c++) {
+			const u8 *e = d + hdr_size + (size_t)c * entry_size;
+			u32 io = get_unaligned_le32(e + 0);
+			u32 il = get_unaligned_le32(e + 4);
+			u32 po = get_unaligned_le32(e + 8);
+			u32 pl = get_unaligned_le32(e + 12);
+
+			if (!p->rnr_mem[c] ||
+			    (u64)io + il > fw->size || (u64)po + pl > fw->size) {
+				dev_err(p->dev, "runner fw: core %u bad extent\n", c);
+				release_firmware(fw);
+				return -EINVAL;
+			}
+			memcpy_toio(p->rnr_mem[c] + XRDP_RNR_INST_OFF, d + io, il);
+			memcpy_toio(p->rnr_mem[c] + XRDP_RNR_PRED_OFF, d + po, pl);
+		}
+		dev_info(p->dev, "Runner microcode loaded: %u cores, %zu bytes\n",
+			 ncores, fw->size);
+	}
 	p->fw_loaded = true;
 	release_firmware(fw);
 	return 0;
