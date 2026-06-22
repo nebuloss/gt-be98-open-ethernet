@@ -1113,6 +1113,22 @@ static int runner_probe(struct platform_device *pdev)
 static void runner_remove(struct platform_device *pdev)
 {
 	struct runner_priv *p = platform_get_drvdata(pdev);
+	int c;
+
+	/*
+	 * QUIESCE the Runner before devm frees the DMA rings/pool: the microcode'd
+	 * cores were woken in probe and keep DMAing into the feed/RX/TX rings, so
+	 * tearing those down (or re-probing) while the cores run hangs the SoC.
+	 * Disable each core's run-enable (CFG_GLOBAL_CTRL.EN=0) so a clean re-probe
+	 * starts the bring-up from a halted state.
+	 */
+	for (c = 0; c < XRDP_RNR_CORES; c++) {
+		if (p->rnr_regs[c])
+			writel(0, p->rnr_regs[c] + RNR_CFG_GLOBAL_CTRL);
+	}
+	/* let in-flight DMA settle before devm releases the coherent rings */
+	wmb();
+	mdelay(2);
 
 	debugfs_remove_recursive(p->dbg);
 	xrdp_offload_deinit(&p->offload);
