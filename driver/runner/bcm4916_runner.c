@@ -454,7 +454,16 @@ static netdev_tx_t runner_start_xmit(struct sk_buff *skb,
 	 * token mode), egress port left 0 - DSA tags select the real egress.
 	 */
 	d->word2 = cpu_to_be32(TXD_W2_IS_EMAC);
-	d->word3 = cpu_to_be32(token);
+	/*
+	 * abs=0 (FPM-token) egress: word3 is the FPM buffer-number / start-of-
+	 * packet split (fpm_bn0[19:0] | fpm_sop[29:20]), NOT the raw token
+	 * [verified vs RING_CPU_TX_DESCRIPTOR, rdd_data_structures_auto.h:2330].
+	 * bn0 = the token's FPM buffer index; SOP = 0 (we copied the frame to the
+	 * buffer start). The exact token->bn0 derivation in the closed
+	 * rdpa_cpu_send is flagged for on-silicon confirmation.
+	 */
+	d->word3 = cpu_to_be32((FPM_TOKEN_INDEX(token) & TXD_W3_FPM_BN0_MASK) |
+			       ((0u & TXD_W3_FPM_SOP_MASK) << TXD_W3_FPM_SOP_SHIFT));
 
 	p->tx_write_idx = (p->tx_write_idx + 1) % TX_RING_DEPTH;
 	tx_ring_doorbell(p, p->tx_write_idx);
