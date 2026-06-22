@@ -39,12 +39,11 @@
 #define XRDP_WINDOW_SIZE	0x00caf004UL
 
 #define XRDP_OFF_PSRAM		0x00000000UL	/* PSRAM (NAT-C staging etc.) */
-/* [PINNED 2026-06-22 vs SDK oracle: RNR_MEM_ADDRS[] (BCM6837/6888 autogen, same XRDP gen) =
- * 0x82600000 base, stride 0x20000; BCM6813_FPI runner_fw addrs (0x82610000=core0+inst,
- * 0x82648000=core2+data ...) confirm base 0x82600000 for 6813. Was 0x00700000 (wrong: that is
- * core-8 in the 14-core 6888 map, past the 6813's 8 cores). The CPU RX/TX ring descriptor
- * tables live in per-core RNR data memory, NOT PSRAM. */
-#define XRDP_OFF_RNR_MEM0	0x00600000UL	/* per-core data SRAM base [SDK RNR_MEM_ADDRS] */
+/* [PINNED 2026-06-22 vs BCM6813's OWN rdpa.ko RNR_MEM_ADDRS[] = 0x82700000 base, stride 0x20000,
+ * 8 cores (per-core: MEM+0, INST+0x10000, PRED+0x1c000, CNTXT+0x18000). The BCM6837/6888 autogen
+ * proxy (0x82600000) is WRONG for 6813 by +0x100000 — caught by adversarial binary verification.
+ * The CPU RX/TX ring descriptor tables live in per-core RNR data memory, NOT PSRAM. */
+#define XRDP_OFF_RNR_MEM0	0x00700000UL	/* per-core data SRAM base [rdpa.ko RNR_MEM_ADDRS] */
 #define XRDP_RNR_MEM_STRIDE	0x00020000UL
 #define XRDP_RNR_CORES		8
 /* CPU host rings live on specific Runner cores per the RDD ADDRESS_ARR:
@@ -67,7 +66,7 @@
 #define XRDP_OFF_UNIMAC_RDP0	0x008a8004UL	/* 4, stride 0x1000 */
 #define XRDP_OFF_FPM		0x00a00000UL
 #define XRDP_OFF_QM		0x00c00000UL
-#define XRDP_OFF_DQM		0x00c80000UL	/* [PINNED vs SDK: block base; 0xc80034 was base+0x34, a register] */
+#define XRDP_OFF_DQM		0x00c80034UL	/* [rdpa.ko DQM_ADDRS[0]=0x82c80034 — stock accessor base; revert] */
 
 /* ----------------------------------------------------------------------------
  * FPM register block. Layout from the GPL FpmControl struct (fpm_priv.h):

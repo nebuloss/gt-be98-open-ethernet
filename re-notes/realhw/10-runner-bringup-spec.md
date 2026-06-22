@@ -133,3 +133,38 @@ QM (from rdpa.ko drv_qm_init disasm): FPM_CONTROL@0x0c fixed bits = override_bb_
   QEMU-M5 path — may move CPU-forwarded frames without the MPM DMA rings); (3) interim: user loads
   their own bcm_mpm.ko. The control plane + microcode (GPL) + the rest of the bring-up are open;
   the buffer allocator is the one closed dependency.
+
+## Wave-4 (2026-06-22): binary-confirmed bases + MPM-free first-light + MPM clean-room
+★CORRECTION via BCM6813's OWN rdpa.ko *_ADDRS (authoritative; reverted earlier proxy fixes):
+- **RNR_MEM base = 0x82700000** (offset 0x700000), stride 0x20000, 8 cores; per-core MEM+0,
+  INST+0x10000, PRED+0x1c000, CNTXT+0x18000. (6837/6888 proxy 0x82600000 was WRONG by +0x100000.)
+  → abs CPU RX ring = 0x82763000 (core3), TX ring = 0x82743360 (core2), TX indices = 0x827429c8.
+- **DQM = 0x82c80034** (stock accessor base; reverted my 0xc80000). RNR_QUAD 0x82808400.
+- Other bases CONFIRMED from rdpa.ko: FPM 0x82a00000, QM 0x82c00000, SBPM 0x828a1000,
+  DSPTCHR 0x82880000, BBH_RX 0x82898000/0x400, BBH_TX 0x82890000/0x2000, RNR_REGS 0x82800000/0x1000,
+  PSRAM 0x82000000, PSRAM1 0x82200000, UBUS_SLV 0x828a0000. NATC 0x82950000 (KEY 0x829503b0/0x20,
+  TBL 0x829502d0/0x10), TCAM 0x82900000, HASH 0x82920000, CNPL 0x82948000.
+
+★MPM-FREE FIRST-LIGHT = FEASIBLE (the near-term path):
+- CPU-RX buffers come from a host-managed **FEED ring** (host-allocated DDR buffers as 40-bit ABS
+  pointers, CPU_FEED_DESCRIPTOR @ rdp_cpu_ring_defs.h:38; host fills via __rdp_prepare_feed_desc +
+  doorbell rdd_cpu_inc_feed_ring_write_idx) — NOT MPM. MPM is only the bulk/offload DMA front-end
+  over the SAME FPM token pool. BCM6813 runs feed-ring + MPM side-by-side (CONFIG_RNR_FEED_RING on).
+- Driver correction: real CPU-RX uses a DEDICATED feed ring + write-idx doorbell, not in-place
+  re-arm of the RX data ring (our current rx_rest_desc). Add the feed ring + recycle→feed.
+- FPM token use (TX): alloc = READ POOL0_ALLOC_DEALLOC + check FPM_TOKEN_VALID; free = WRITE token
+  (GPL fpm driver bcmdrivers/opensource/.../fpm/impl1 is the clean-room ref). No MPM needed.
+- MINIMAL first-light block set (from CFE2 _data_path_init): UBUS decode + RNR(microcode load+enable
+  core2/3) + BBH_RX + BBH_TX + SBPM + DMA/SDMA + DSPTCHR(CPU_RX direct-processing group + CPU_TX
+  egress VIQ). **SKIP QM (stub) + MPM.** Hard external dep = the proprietary Runner microcode + the
+  RDD IMAGE_0 CPU-thread/ring-base table addresses (clean-room-able), NOT the buffer engine.
+
+★MPM clean-room (for full offload later): recovered from bcm_mpm.ko disasm. MPM @ 0x80020000/0x4000
+(separate from XRDP). Sub-blocks: COMMON@0x3d00 (CONFIG/CONTROL/STATUS, POOL_CFG_0..3@0x3d20..2c),
+DMA_COMMON@0x2d00 (CONFIG, PHYS_BASE@0x2d10, VIRT_BASE_LO/HI@0x2d14/18, DQM_INTERFACE_CFG@0x2d30),
+CORE@0x3000, BALLOC@0x0 (PSB@0x20/24/28, rings@0x30+), BFREE@0x2000 (CSB@0x2020/24/28, CPU_PTR@0x21f0,
+SKB/FKB ptr offs@0x21f4-fc). Ordered init: pmc_mpm_en+settle → memset shadow → DMA_COMMON_CONFIG
+RMW → POOL_CFG_0..3 ({8,4,2,1}×512) → PHYS/VIRT_BASE=bufmem → CORE_CONFIG (buf_size_log2<<4) →
+BFREE ptr cfg → per-client(0x11)/per-ring(1) init → BUF_INIT (write 0xf6 @+0x100+4, poll &0x2c@+8)
+→ master enable (DMA_COMMON+0x30 |=1, +0x3c|=0x80000000, etc.). Needs PMC + bufmem base + SYSRAM
+rings. Gaps: exact bitfield names + per-ring strides (one read-only mpm_reg_dump on silicon resolves).
