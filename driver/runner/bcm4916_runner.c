@@ -723,6 +723,43 @@ static void runner_rnr_precfg(struct runner_priv *p)
 		 ddr_base);
 }
 
+/*
+ * Per-thread INITIAL REGISTER FILE for the CPU RX/TX threads, written into the
+ * RNR_CNTXT context SRAM (rnr_mem[core]+0x18000, thread*128 + reg*4, big-endian)
+ * AFTER zero-mem + microcode load, BEFORE core enable/wakeup. Without this a woken
+ * thread runs on zeroed registers (no entry PC / stack / FIFO ptrs) and does
+ * nothing -> our rings never get serviced.
+ * [RE rdpa.o rdd_data_structures_init + RNR_CNTXT_ADDRS; values are for THIS
+ * BCM6813 microcode image (R0 = the *_cpu_*_wakeup_request label). re-derive R0
+ * from firmware_bin/rdd_runner_labels.h if a different microcode is loaded.]
+ */
+static void runner_thread_regfile_init(struct runner_priv *p)
+{
+	void __iomem *rx = p->rnr_mem[CPU_RX_RING_CORE] + XRDP_RNR_CNTXT_OFF +
+			   RNR_CPU_RX_THREAD * 128;
+	void __iomem *tx = p->rnr_mem[CPU_TX_RING_CORE] + XRDP_RNR_CNTXT_OFF +
+			   RNR_CPU_TX_THREAD * 128;
+
+	/* CPU_RX: image_3 / core3 / thread1 */
+	iowrite32be(0x00001624, rx + 0  * 4);	/* R0  entry: cpu_rx_wakeup_request */
+	iowrite32be(0x00003940, rx + 8  * 4);	/* R8  PD_FIFO_TABLE */
+	iowrite32be(0x00003840, rx + 9  * 4);	/* R9  UPDATE_FIFO_TABLE */
+	iowrite32be(0x00003940, rx + 17 * 4);	/* R17 PD_FIFO_TABLE */
+	iowrite32be(0x00003840, rx + 18 * 4);	/* R18 UPDATE_FIFO_TABLE */
+	iowrite32be(0x00002bd0, rx + 30 * 4);	/* R30 stack top */
+	iowrite32be(0x00000001, rx + 31 * 4);	/* R31 CONST_1 */
+
+	/* CPU_TX: image_2 / core2 / thread6 */
+	iowrite32be(0x00000215, tx + 0  * 4);	/* R0  entry: cpu_tx_wakeup_request */
+	iowrite32be(0x00000006, tx + 8  * 4);	/* R8  thread number */
+	iowrite32be(0x00003340, tx + 30 * 4);	/* R30 stack top */
+	iowrite32be(0x00000001, tx + 31 * 4);	/* R31 CONST_1 */
+
+	dev_info(p->dev, "bring-up: CPU thread regfiles initialized (RX c%d/t%d, TX c%d/t%d)\n",
+		 CPU_RX_RING_CORE, RNR_CPU_RX_THREAD,
+		 CPU_TX_RING_CORE, RNR_CPU_TX_THREAD);
+}
+
 static void runner_rnr_enable(struct runner_priv *p)
 {
 	int c;
@@ -1082,6 +1119,7 @@ static int runner_probe(struct platform_device *pdev)
 	/* one MAC port for first-light; the real port map needs on-silicon
 	 * iteration (BBH_RX has 11 MAC instances) - flagged in the spec. */
 	runner_bbh_init(p, 0);
+	runner_thread_regfile_init(p);	/* CPU thread initial registers (post-zero, pre-enable) */
 	runner_rnr_enable(p);		/* CFG_GLOBAL_CTRL.EN + cpu_wakeup, LAST */
 
 	netif_napi_add(ndev, &p->napi, runner_rx_poll);

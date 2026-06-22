@@ -54,6 +54,10 @@
 #define XRDP_RNR_REGS_STRIDE	0x00001000UL
 #define XRDP_RNR_INST_OFF	0x00010000UL	/* core_base + this = inst SRAM */
 #define XRDP_RNR_PRED_OFF	0x0001c000UL	/* core_base + this = pred RAM */
+#define XRDP_RNR_CNTXT_OFF	0x00018000UL	/* core_base + this = per-thread context regfile SRAM
+						 * [RE rdpa.o RNR_CNTXT_ADDRS: core0=0x82718000,
+						 * stride 0x20000; == rnr_mem[core]+0x18000].
+						 * thread T reg R -> +T*128 + R*4, big-endian. */
 #define XRDP_OFF_DSPTCHR	0x00880000UL
 #define XRDP_OFF_SBPM		0x008a1000UL
 #define XRDP_OFF_UBUS_SLV	0x008a0000UL
