@@ -709,6 +709,8 @@ static void runner_rnr_precfg(struct runner_priv *p)
 		writel(RNR_CFG_PSRAM_CFG_VAL, r + RNR_CFG_PSRAM_CFG);
 		writel(ddr_cfg,               r + RNR_CFG_DDR_CFG);
 	}
+	dev_info(p->dev, "bring-up: RNR pre-cfg done (ddr_base=0x%05x)\n",
+		 ddr_base);
 }
 
 static void runner_rnr_enable(struct runner_priv *p)
@@ -732,6 +734,10 @@ static void runner_rnr_enable(struct runner_priv *p)
 	       p->rnr_regs[CPU_RX_RING_CORE] + RNR_CFG_CPU_WAKEUP);
 	writel(RNR_CPU_TX_THREAD & RNR_CFG_CPU_WAKEUP_THREAD_MASK,
 	       p->rnr_regs[CPU_TX_RING_CORE] + RNR_CFG_CPU_WAKEUP);
+	dev_info(p->dev,
+		 "bring-up: RNR enabled + CPU threads woken (RX core%d/thr%d, TX core%d/thr%d)\n",
+		 CPU_RX_RING_CORE, RNR_CPU_RX_THREAD,
+		 CPU_TX_RING_CORE, RNR_CPU_TX_THREAD);
 }
 
 /* ========================= SBPM / DSPTCHR / BBH ========================== *
@@ -747,11 +753,13 @@ static int runner_sbpm_init(struct runner_priv *p)
 	/* trigger the SBPM free-list init, then poll RDY (bit31) */
 	writel(SBPM_INIT_FREE_LIST_VAL, s + SBPM_INIT_FREE_LIST);
 	for (i = 0; i < 1000; i++) {
-		if (readl(s + SBPM_INIT_FREE_LIST) & SBPM_INIT_FREE_LIST_RDY)
+		if (readl(s + SBPM_INIT_FREE_LIST) & SBPM_INIT_FREE_LIST_RDY) {
+			dev_info(p->dev, "bring-up: SBPM free-list ready\n");
 			return 0;
+		}
 		udelay(10);
 	}
-	dev_warn(p->dev, "SBPM free-list init did not signal RDY\n");
+	dev_warn(p->dev, "bring-up: SBPM free-list init did not signal RDY\n");
 	return 0;	/* non-fatal for first-light */
 }
 
@@ -765,11 +773,13 @@ static int runner_dsptchr_init(struct runner_priv *p)
 	writel(DSPTCHR_REORDER_CFG_EN | DSPTCHR_REORDER_CFG_AUTO_INIT,
 	       d + DSPTCHR_REORDER_CFG);
 	for (i = 0; i < 1000; i++) {
-		if (readl(d + DSPTCHR_REORDER_CFG) & DSPTCHR_REORDER_CFG_RDY)
+		if (readl(d + DSPTCHR_REORDER_CFG) & DSPTCHR_REORDER_CFG_RDY) {
+			dev_info(p->dev, "bring-up: DSPTCHR reorder ready\n");
 			return 0;
+		}
 		udelay(10);
 	}
-	dev_warn(p->dev, "DSPTCHR reorder init did not signal RDY\n");
+	dev_warn(p->dev, "bring-up: DSPTCHR reorder init did not signal RDY\n");
 	return 0;	/* non-fatal for first-light */
 }
 
@@ -789,6 +799,8 @@ static void runner_bbh_init(struct runner_priv *p, int rx_port)
 	writel(BBH_TX_MACTYPE_VAL, tx + BBH_TX_MACTYPE);
 	writel(((u32)BBH_BBID_FPM << 24) | ((u32)BBH_BBID_SBPM << 16),
 	       tx + BBH_TX_BBCFG_1);
+	dev_info(p->dev, "bring-up: BBH_RX port %d + LAN BBH_TX configured\n",
+		 rx_port);
 }
 
 /* ============================ offload self-test (debugfs) =============== *
