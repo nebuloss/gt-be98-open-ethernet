@@ -197,3 +197,24 @@ matches before coding any MMIO:
 → NEXT (pre-implementation): pin which rdp project the targets/96813GW build = device rdpa.ko uses,
   and take CPU ring/feed/index addrs + SBPM init + thread nums from THAT (cross-check vs the actual
   rdpa.ko). Block bases already came from the device rdpa.ko (wave-4) and are authoritative.
+
+## Wave-6 (2026-06-22): PROJECT VARIANT RESOLVED → BCM6813 (not _FPI)
+The GT-BE98 (96813GW) firmware compiles rdp project **BCM6813** (PKTFLOW), NOT BCM6813_FPI.
+Evidence: make.common:796-801 selects BCM6813 unless BRCM_DRIVER_FPI is set; the 96813GW.GT-BE98
+profile sets BRCM_DRIVER_PKTFLOW=m and does NOT set FPI. ("FPI"=Flow Provisioning Interface, an
+alt accel that replaces PKTFLOW; not used by GT-BE98.)
+→ AUTHORITATIVE CPU ring/feed values (BCM6813 rdd_runner_defs_auto.h):
+  RX ring desc 0x3000 (IMAGE_3/core3) · **TX ring desc 0x33e0 (IMAGE_2/core2)** [was wrongly 0x3360
+  from _FPI; FIXED in driver] · TX indices 0x29c8 (core2) · FEED ring desc 0x0f70 (IMAGE_3/core3).
+  CPU_RX thread 1 (core3), CPU_TX_0 thread 6 (core2), core→image identity.
+The block bases (wave-4, from device rdpa.ko) + these BCM6813 RDD addrs are now the authoritative
+set for implementation. SBPM init (0x03FFC000 vs 0x5fc000) still to confirm from the BCM6813
+project (CFE2's 0x5fc000 is the bootloader's smaller pool; use BCM6813 rdpa value) — minor, SBPM is
+slow-path-optional for first CPU frame.
+
+## STATUS: RE COMPLETE — ready for implementation
+Open MPM-free first-light datapath is fully specified: microcode blob built (RFW1), per-core
+INST/PRED load offsets, RNR enable+wakeup (core3/thr1 RX, core2/thr6 TX), UBUS decode (done in
+driver), FEED ring + CPU RX/TX rings + doorbells, BBH_RX/BBH_TX/SBPM/DSPTCHR/DMA minimal register
+sets, all bases device-rdpa.ko-confirmed. Remaining = WRITE the driver bring-up (coherent single
+file) + a deadman-guarded slot1 trial. MPM full HW-offload is clean-roomable later (map recovered).

@@ -415,9 +415,11 @@ static netdev_tx_t runner_start_xmit(struct sk_buff *skb,
 	return NETDEV_TX_OK;
 }
 
-/* [PINNED 2026-06-22 vs SDK oracle: RDD_CPU_TX_RING_DESCRIPTOR_TABLE_ADDRESS_ARR = 0x3360
- * on Runner core 2 (BCM6813_FPI). RDD/core-data-memory offset; + per-core RNR base for abs. */
-#define PSRAM_CPU_TX_RING_DESC_TABLE	0x3360	/* RDD off, core 2 [SDK BCM6813_FPI] */
+/* [PINNED 2026-06-22: the GT-BE98 (96813GW) build uses rdp project BCM6813 (NOT _FPI; FPI is the
+ * alt Flow-Provisioning accel — make.common:796), so CPU_TX_RING_DESCRIPTOR_TABLE = 0x33e0 on
+ * Runner core 2 (BCM6813 rdd_runner_defs_auto.h:1422). 0x3360 was the wrong _FPI variant.
+ * RDD/core-data-memory offset; abs = rnr_mem[2] + this. (RX 0x3000 + TX indices 0x29c8 agree.) */
+#define PSRAM_CPU_TX_RING_DESC_TABLE	0x33e0	/* RDD off, core 2 [SDK BCM6813] */
 
 static int tx_ring_alloc(struct runner_priv *p)
 {
