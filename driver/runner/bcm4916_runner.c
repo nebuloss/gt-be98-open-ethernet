@@ -61,6 +61,11 @@
 #define RX_BUF_SIZE		2048	/* one DDR buffer per RX frame */
 #define RX_NAPI_BUDGET		64
 
+/* First-light physical port: the 1G EGPHY port_gphy1 (eth2-class) = UNIMAC inst,
+ * EGPHY addr+1, BBH_ID. The same index is used for UNIMAC inst, BBH_ID and the
+ * dispatcher VIQ (VIQ == bbh_id). Tune on silicon (emac->bbh_id is in rdpa.ko). */
+#define RUNNER_FIRST_PORT	1
+
 static bool runner_emulated;
 module_param(runner_emulated, bool, 0444);
 MODULE_PARM_DESC(runner_emulated,
@@ -854,10 +859,26 @@ static void runner_bbh_init(struct runner_priv *p, int rx_port)
 			   (u32)rx_port * XRDP_BBH_RX_STRIDE;
 	void __iomem *tx = p->xrdp + XRDP_OFF_BBH_TX0;	/* BBH_TX_ID_LAN = 0 */
 
-	/* BBH_RX: point the dispatcher + SBPM block IDs, then enable last */
-	writel(((u32)BBH_BBID_DISPATCHER << 8) | ((u32)BBH_BBID_SBPM << 16),
-	       rx + BBH_RX_BBCFG);
-	writel(BBH_RX_ENABLE_PKTEN | BBH_RX_ENABLE_SBPMEN, rx + BBH_RX_ENABLE);
+	/* BBH_RX full per-port config [SDK bbh_rx_cfg / data_path_init.c]:
+	 *  BBCFG = SDMABBID[5:0] | DISPBBID[15:8] | SBPMBBID[23:16]
+	 *  DISPVIQ = NORMALVIQ | EXCLVIQ, both = bbh_id (★VIQ == bbh_id rule)
+	 *  SDMAADDR=0, SDMACFG=4 chunks, SOPOFFSET=0, SBPMCFG MAXREQ, ENABLE last.
+	 * (Previously only DISPBBID/SBPMBBID + ENABLE were written -> the BBH could
+	 * not reassemble/enqueue a PD to the dispatcher.) */
+	{
+		u32 sdma_bb = (rx_port <= 5) ? BBH_BBID_SDMA0 : BBH_BBID_SDMA1;
+
+		writel(sdma_bb | ((u32)BBH_BBID_DISPATCHER << 8) |
+		       ((u32)BBH_BBID_SBPM << 16), rx + BBH_RX_BBCFG);
+		writel(((u32)rx_port & 0xff) | (((u32)rx_port & 0xff) << 8),
+		       rx + BBH_RX_DISPVIQ);
+		writel(0, rx + BBH_RX_SDMAADDR);
+		writel(BBH_RX_SDMACFG_VAL, rx + BBH_RX_SDMACFG);
+		writel(0, rx + BBH_RX_SOPOFFSET);
+		writel(BBH_RX_SBPMCFG_VAL, rx + BBH_RX_SBPMCFG);
+		writel(BBH_RX_ENABLE_PKTEN | BBH_RX_ENABLE_SBPMEN,
+		       rx + BBH_RX_ENABLE);	/* LAST */
+	}
 
 	/* BBH_TX: MAC type + FPM/SBPM source block IDs */
 	writel(BBH_TX_MACTYPE_VAL, tx + BBH_TX_MACTYPE);
@@ -865,6 +886,60 @@ static void runner_bbh_init(struct runner_priv *p, int rx_port)
 	       tx + BBH_TX_BBCFG_1);
 	dev_info(p->dev, "bring-up: BBH_RX port %d + LAN BBH_TX configured\n",
 		 rx_port);
+}
+
+/* ============================ 1G MAC/PHY bring-up ======================== *
+ * Bring up one 1G UNIMAC + internal EGPHY port (the eth2=port_gphy1 class) so a
+ * physical link exists for the Runner to RX/TX through. No proprietary blob (the
+ * 10G XPORT/serdes path needs one). [SDK phy_drv_egphy.c _phy_cfg +
+ * unimac_drv_impl1.c]. The stock built-in unimac/egphy drivers won't START the
+ * port without bcm_enet, so we replicate the register sequence directly.
+ * NOTE: the per-PHY MDIO power-up/link-read (addr 2 on mdiosf2) is a follow-up;
+ * the block EXT_PWR_DOWN=0 here powers the PHY and it auto-negotiates.
+ */
+static void runner_mac_phy_init(struct runner_priv *p, int unimac_inst)
+{
+	void __iomem *mac = p->xrdp + XRDP_OFF_UNIMAC0 +
+			    (u32)unimac_inst * XRDP_UNIMAC_STRIDE;
+	void __iomem *ctl = p->xrdp + XRDP_OFF_QEGPHY_CTRL;
+	void __iomem *sts = p->xrdp + XRDP_OFF_QEGPHY_STATUS;
+	u32 v;
+	int i;
+
+	/* --- internal quad-EGPHY block power-up (RMW the single CTRL reg) --- */
+	v = readl(ctl);
+	v |= QEGPHY_CTRL_PHY_RESET;			writel(v, ctl); mdelay(1);
+	v |= QEGPHY_CTRL_PLL_CLK125_250_SEL;		writel(v, ctl); mdelay(1);
+	v &= ~(QEGPHY_CTRL_IDDQ_GLOBAL_PWR | QEGPHY_CTRL_IDDQ_BIAS);
+							writel(v, ctl); mdelay(1);
+	v &= ~((u32)QEGPHY_CTRL_EXT_PWR_DOWN_MASK << QEGPHY_CTRL_EXT_PWR_DOWN_SHIFT);
+	v &= ~((u32)0x1f << QEGPHY_CTRL_PHYAD_SHIFT);
+	v |= (1u << QEGPHY_CTRL_PHYAD_SHIFT);		/* base MDIO addr = 1 */
+							writel(v, ctl); mdelay(1);
+	v &= ~QEGPHY_CTRL_PLL_CLK125_250_SEL;		writel(v, ctl); mdelay(1);
+	v &= ~QEGPHY_CTRL_PHY_RESET;			writel(v, ctl); mdelay(1);
+	for (i = 0; i < 100; i++) {
+		if (readl(sts) & QEGPHY_STATUS_PLL_LOCK)
+			break;
+		mdelay(1);
+	}
+	dev_info(p->dev, "bring-up: EGPHY block PLL %s\n",
+		 (readl(sts) & QEGPHY_STATUS_PLL_LOCK) ? "locked" : "NOT locked");
+
+	/* --- UNIMAC MAC config under sw_reset, then enable [unimac_drv_impl1.c] --- */
+	writel(UNIMAC_CMD_SW_RESET, mac + UNIMAC_CMD);		/* assert reset */
+	writel(UNIMAC_FRM_LEN_VAL, mac + UNIMAC_FRM_LEN);
+	v = UNIMAC_CMD_SW_RESET |
+	    ((u32)UNIMAC_CMD_SPEED_1G << UNIMAC_CMD_SPEED_SHIFT) |
+	    UNIMAC_CMD_PROMIS | UNIMAC_CMD_CRC_FWD | UNIMAC_CMD_PAUSE_FWD |
+	    UNIMAC_CMD_CNTL_FRM_ENA | UNIMAC_CMD_NO_LGTH_CHK;
+	writel(v, mac + UNIMAC_CMD);				/* configured, in reset */
+	v &= ~UNIMAC_CMD_SW_RESET;
+	writel(v, mac + UNIMAC_CMD);				/* release reset */
+	v |= UNIMAC_CMD_TX_ENA | UNIMAC_CMD_RX_ENA;
+	writel(v, mac + UNIMAC_CMD);				/* enable TX/RX */
+	dev_info(p->dev, "bring-up: UNIMAC inst%d up (1G, tx/rx enabled)\n",
+		 unimac_inst);
 }
 
 /* ============================ offload self-test (debugfs) =============== *
@@ -1133,9 +1208,14 @@ static int runner_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	rx_ring_publish(p);
-	/* one MAC port for first-light; the real port map needs on-silicon
-	 * iteration (BBH_RX has 11 MAC instances) - flagged in the spec. */
-	runner_bbh_init(p, 0);
+	/*
+	 * First-light port = the 1G EGPHY port_gphy1 (eth2-class): UNIMAC inst 1,
+	 * EGPHY MDIO addr 2, BBH_ID 1. ★The exact emac->bbh_id mapping is resolved
+	 * in the closed rdpa.ko (BBH_ID 0 vs 1 for this port is unconfirmed) - tune
+	 * RUNNER_FIRST_PORT on silicon. VIQ == bbh_id. No serdes blob (1G path).
+	 */
+	runner_mac_phy_init(p, RUNNER_FIRST_PORT);	/* 1G UNIMAC + EGPHY link */
+	runner_bbh_init(p, RUNNER_FIRST_PORT);
 	runner_thread_regfile_init(p);	/* CPU thread initial registers (post-zero, pre-enable) */
 	runner_rnr_enable(p);		/* CFG_GLOBAL_CTRL.EN + cpu_wakeup, LAST */
 

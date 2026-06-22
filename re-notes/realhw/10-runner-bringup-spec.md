@@ -275,6 +275,47 @@ our rings (TX/FEED runner read_idx=0). RE (GPL source + rdpa disasm) found the g
   MAC/PHY control plane (DSA/phylink) is a separate subsystem still to build. TX is host-initiated so
   it's testable first (ring-res + per-frame CFG_CPU_WAKEUP + register-init).
 
+## Wave-9 (2026-06-22): MAC/PHY 1G port bring-up + per-port BBH/dispatcher (RE, no device)
+After TX got serviced by the Runner, the next gap is a LIVE MAC PORT (no egress/ingress otherwise).
+RE'd the 1G EGPHY port + the full per-port BBH + the CPU_RX dispatcher VIQ. (10G XPORT ports need a
+~31KB serdes microcode blob — merlin16_shortfin, CRC 0x4949, non-redistributable like the Runner ucode;
+1G EGPHY needs NO blob → first target. pcs-bcm-xport.c already drafts the 10G PCS for mainline.)
+
+### 1G port "eth2" = port_gphy1 [GT-BE98.dts:275 / 6813.dtsi]
+- UNIMAC **inst 1**, conf base **0x828a9000** (base 0x828a8000 + 1*0x1000). CMD @ +0x08:
+  tx_ena b0, rx_ena b1, eth_speed[3:2]=2(1G), sw_reset b13, promis, crc_fwd b6, pause_fwd b7,
+  cntl_frm_ena b23, no_lgth_check. FRM_LEN @ +0x14 = 0x3fff (max). Config under sw_reset=1, then =0,
+  then set tx_ena|rx_ena. [u-boot unimac_drv_impl1.c / unimac_drv.h]
+- EGPHY (internal quad): block power regs — QEGPHY_TEST_CTRL 0x837ff00c, **QEGPHY_CTRL 0x837ff010**,
+  **QEGPHY_STATUS 0x837ff014** (poll PLL_LOCK). Seq [phy_drv_egphy.c:585 _phy_cfg]: PHY_RESET=1 →1ms;
+  PLL_CLK125_250_SEL=1 →1ms; IDDQ_GLOBAL_PWR=0,IDDQ_BIAS=0 →1ms; PHY_PHYAD=base, EXT_PWR_DOWN=~port_map&0xf
+  (clear our port's bit to power it) →1ms; PLL_CLK125_250_SEL=0 →1ms; PHY_RESET=0 →1ms; poll PLL_LOCK.
+  Then per-PHY via MDIO addr **2** on mdiosf2 (0x837ffd00, Clause-22): BMCR(0x00) clear POWERDOWN + set
+  ANRESTART(0x200); link/speed from Broadcom AUXSTAT reg **0x19** (link b2, speed [10:8]). NO blob.
+  PMC = open BPCM (impl1; usually already powered by U-Boot).
+- ★Integration: the stock built-in brcm-unimac/egphy drivers DON'T start the port without bcm_enet →
+  our driver replicates these register writes (and may reuse the kernel mdiosf2 mdio_bus for the EGPHY).
+
+### Per-port BBH (for the 1G port = BBH_ID_0; RX base 0x82898000, TX LAN base 0x82890000)
+- ★VIQ == bbh_id (firm rule, rdp_platform.h:224). For eth2: bbh_id 0, VIQ 0.
+- BBH_RX (was incomplete — only BBCFG DISPBBID/SBPMBBID + ENABLE): add SDMABBID into BBCFG + the rest:
+  BBCFG @ +0x00 = **0x00380015** (SDMABBID[5:0]=21 SDMA0 | DISPBBID[15:8]=18 | SBPMBBID[23:16]=56);
+  DISPVIQ @ +0x04 = 0 (NORMALVIQ=EXCLVIQ=bbh_id=0); SDMAADDR @ +0x1c = 0; SDMACFG @ +0x20 = **0x00000404**
+  (NUMOFCD=4|EXCLTH=4); SOPOFFSET @ +0x30 = 0; MINPKT=64/MAXPKT(4 sels); SBPMCFG @ +0x64 MAXREQ; then
+  ENABLE @ +0x3c = 0x3 (PKTEN|SBPMEN) LAST. (SDMA bb_id = 21 for bbh 0-5, 22 for 6-11.)
+- BBH_TX LAN (0x82890000): MACTYPE @ +0x00 = 1 (GPON) ✓; BBCFG_1_TX @ +0x04 = **0x17380000**
+  (FPMSRC[29:24]=23 | SBPMSRC[21:16]=56) ✓; BBCFG_2_TX @ +0x08 PDRNR0SRC = runner core bb-id;
+  RNRCFG_2 (per-q @ +0x60) PTRADDR | TASK[19:16]=CPU_TX task (the egress doorbell target = RNR core +
+  CPU_TX task); DDRTMBASEL/H @ +0x2c/+0x34 = FPM pool phys; DMACFG/SDMACFG + DFIFOCTRL.
+- XLIF (MAC↔BBH glue): xlif0 ch0+ch2, xlif1 all enabled [data_path_init.c:841]. Per-port emac→bbh_id
+  binding is resolved inside rdpa.ko (BBH_ID_0 is the right first-light choice).
+
+### DSPTCHR CPU_RX (combines Wave-8 recipe + the VIQ): for bbh_id 0 / VIQ 0:
+create VIQ 0 (normal, bb_id=BB_ID_RX_BBH_0=31, target=2, dest=disp=0); group-1 queues_mask bit0 (LAN
+mask 0xFFF routes all LAN ports); group-1 task_mask = CPU_RX thread; QUEUE_MAPPING_PD_DSPTCH_ADD[core3]
+@0x048C = IMAGE_3_PD_FIFO_TABLE 0x3940>>3 = 0x728; REORDER_CFG_VQ_EN bit0; REORDER_CFG=0x11+poll RDY;
+rnr_enable LAST.
+
 ## STATUS: RE COMPLETE — ready for implementation
 Open MPM-free first-light datapath is fully specified: microcode blob built (RFW1), per-core
 INST/PRED load offsets, RNR enable+wakeup (core3/thr1 RX, core2/thr6 TX), UBUS decode (done in

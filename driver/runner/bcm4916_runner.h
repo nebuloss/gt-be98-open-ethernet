@@ -132,10 +132,55 @@
 #define BBH_RX_ENABLE		0x3c	/* PKTEN b0, SBPMEN b1 (LAST) */
 #define BBH_RX_ENABLE_PKTEN	BIT(0)
 #define BBH_RX_ENABLE_SBPMEN	BIT(1)
+/* BBH_RX extended per-port config [SDK data_path_init.c bbh_rx_cfg / XRDP_AG.h].
+ * BBCFG also carries SDMABBID[5:0] (=SDMA0 21 for ports 0-5, SDMA1 22 for 6-11). */
+#define BBH_BBID_SDMA0		21
+#define BBH_BBID_SDMA1		22
+#define BBH_RX_DISPVIQ		0x04	/* NORMALVIQ[7:0], EXCLVIQ[15:8] = bbh_id */
+#define BBH_RX_SDMAADDR		0x1c	/* DATABASE[7:0], DESCBASE[15:8] */
+#define BBH_RX_SDMACFG		0x20	/* NUMOFCD[7:0], EXCLTH[15:8] */
+#define BBH_RX_SDMACFG_VAL	0x00000404	/* 4 chunk descriptors, excl thr 4 */
+#define BBH_RX_SOPOFFSET	0x30
+#define BBH_RX_SBPMCFG		0x64	/* MAXREQ[3:0] */
+#define BBH_RX_SBPMCFG_VAL	0x0000000f
 /* BBH_TX */
 #define BBH_TX_MACTYPE		0x00	/* = 1 (GPON; 7 is invalid) */
 #define BBH_TX_MACTYPE_VAL	1
 #define BBH_TX_BBCFG_1		0x04	/* FPMSRC[31:24], SBPMSRC[23:16] */
+
+/* ----------------------------------------------------------------------------
+ * 1G MAC/PHY: UNIMAC + internal EGPHY (the "eth2"=port_gphy1 first-light port).
+ * UNIMAC inst N conf base = 0x828a8000 + N*0x1000; EGPHY power block @ 0x837ff00c.
+ * No proprietary blob (the 10G XPORT/serdes path does need one). [SDK
+ * unimac_drv_impl1.c / phy_drv_egphy.c / 6813.dtsi]
+ * -------------------------------------------------------------------------- */
+#define XRDP_OFF_UNIMAC0	0x008a8000UL	/* UNIMAC conf inst0; stride 0x1000 */
+#define XRDP_UNIMAC_STRIDE	0x00001000UL
+#define UNIMAC_CMD		0x0008		/* MAC command/config */
+#define UNIMAC_CMD_TX_ENA	BIT(0)
+#define UNIMAC_CMD_RX_ENA	BIT(1)
+#define UNIMAC_CMD_SPEED_SHIFT	2		/* eth_speed[3:2]: 1G = 2 */
+#define UNIMAC_CMD_SPEED_1G	2
+#define UNIMAC_CMD_PROMIS	BIT(4)
+#define UNIMAC_CMD_PAD_EN	BIT(5)
+#define UNIMAC_CMD_CRC_FWD	BIT(6)
+#define UNIMAC_CMD_PAUSE_FWD	BIT(7)
+#define UNIMAC_CMD_SW_RESET	BIT(13)
+#define UNIMAC_CMD_CNTL_FRM_ENA	BIT(23)
+#define UNIMAC_CMD_NO_LGTH_CHK	BIT(24)
+#define UNIMAC_FRM_LEN		0x0014
+#define UNIMAC_FRM_LEN_VAL	0x3fff
+/* internal quad-EGPHY block power (eth-phy-top region) */
+#define XRDP_OFF_QEGPHY_CTRL	0x007ff010UL	/* abs 0x837ff010 */
+#define XRDP_OFF_QEGPHY_STATUS	0x007ff014UL	/* abs 0x837ff014, PLL_LOCK */
+#define QEGPHY_CTRL_PHY_RESET		BIT(0)
+#define QEGPHY_CTRL_IDDQ_BIAS		BIT(1)
+#define QEGPHY_CTRL_EXT_PWR_DOWN_SHIFT	2	/* [5:2] per-port power-down (1=down) */
+#define QEGPHY_CTRL_EXT_PWR_DOWN_MASK	0xf
+#define QEGPHY_CTRL_IDDQ_GLOBAL_PWR	BIT(6)
+#define QEGPHY_CTRL_PHYAD_SHIFT		8	/* [12:8] base MDIO addr */
+#define QEGPHY_CTRL_PLL_CLK125_250_SEL	BIT(13)
+#define QEGPHY_STATUS_PLL_LOCK		BIT(0)
 
 /* ----------------------------------------------------------------------------
  * FPM register block. Layout from the GPL FpmControl struct (fpm_priv.h):
