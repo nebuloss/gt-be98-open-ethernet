@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * gt-be98-ref.dts — DIAGNOSTIC: mirror the upstream bcm96813.dts reference board
+ * (which is known to boot mainline) as closely as possible, to test whether our
+ * board boots the EXACT proven DT. Differences vs our gt-be98-min.dts: NO
+ * /memreserve/, NO reserved-memory node, and reference memory size — these are the
+ * board-level additions we made (cycle 03) that the booting reference board lacks
+ * and are the prime suspect for a pre-userspace hang (the kernel reserved-memory
+ * framework runs extremely early; a bad/overlapping no-map node can hang before
+ * console). If our board boots THIS, our reservations were the problem.
+ */
+
+/dts-v1/;
+
+#include "bcm6813.dtsi"
+
+/ {
+	model = "ASUS GT-BE98 (diagnostic: reference-board DT)";
+	compatible = "asus,gt-be98", "brcm,bcm4916", "brcm,bcm6813", "brcm,bcmbca";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x0 0x0 0x08000000>;	/* 128 MiB — match bcm96813.dts exactly */
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&hsspi {
+	status = "okay";
+};
+
+&nand_controller {
+	brcm,wp-not-connected;
+	status = "okay";
+};
+
+&nandcs {
+	nand-on-flash-bbt;
+	brcm,nand-ecc-use-strap;
+};
