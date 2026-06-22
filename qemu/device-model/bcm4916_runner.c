@@ -291,23 +291,41 @@ static uint64_t fpm_token_to_phys(Bcm4916RunnerState *s, uint32_t token)
 /* ===================== ring discovery ===================== */
 
 /*
- * Parse a 16-B CPU_RING_DESCRIPTOR (big-endian) the driver published into PSRAM.
- * Layout (ABI 2.1, see contract section 3.1):
- *   w0 [31:27]=size_of_entry(log2 bytes), [26:16]=number_of_entries, [15:0]=irq
- *   w1 [31:16]=drop_counter, [15:0]=write_idx
- *   w2 base_addr_low
- *   w3 [15:0]=read_idx, [7:0]=base_addr_high
+ * ★★ ON-SILICON CONTRACT DIVERGENCE (2026-06-22) — THIS MODEL NEEDS A RESYNC ★★
+ * The driver evolved against real BCM6813 silicon and the ring contract changed
+ * from what this model emulates. To make the model a valid validator again,
+ * resync these (see re-notes/realhw/10-runner-bringup-spec.md Wave 4-9):
+ *   1. RING LOCATION: rings are no longer in PSRAM. They live in per-core RNR_MEM
+ *      data SRAM: RX delivery @ core3 (0x82700000+3*0x20000)+0x3000; TX @ core2
+ *      +0x33e0; FEED ring @ core3 +0x0f70; TX indices table @ core2 +0x29c8.
+ *      (This model still watches PSRAM 0x0000/0x0080 - it won't see the publishes.)
+ *   2. number_of_entries field is in RESOLUTION units: real depth = field<<5 for
+ *      RX/TX (32-res), field<<6 for FEED (64-res). size_of_entry is in BYTES.
+ *   3. FEED RING: RX buffers come from a host-posted feed ring (40-bit ABS ptrs)
+ *      + a feed doorbell (write_idx@+6 of the feed cfg); model must consume it.
+ *   4. TX doorbell: write_idx at +2 of the indices entry (core2 +0x29c8) PLUS a
+ *      per-frame CFG_CPU_WAKEUP write to RNR_REGS(core2)+0x04.
+ *   5. Microcode is loaded BE (inst byte-swapped, pred u16->u32) - model ignores it.
+ * The encoding fix below (bytes + resolution) is applied; the location/feed/
+ * doorbell rewrite is the remaining scoped work.
+ *
+ * Parse a 16-B CPU_RING_DESCRIPTOR (big-endian). Layout:
+ *   w0 [31:27]=size_of_entry(BYTES), [26:16]=number_of_entries(>>res), [15:0]=irq
+ *   w1 [31:16]=drop_counter, [15:0]=write_idx ; w2 base_low ; w3 [15:0]=read_idx,
+ *   [7:0]=base_high.
  */
-static void runner_parse_ring(const uint8_t *d, RunnerRing *r)
+#define RING_RES_32  5   /* RX delivery + TX rings */
+#define RING_RES_64  6   /* FEED ring */
+static void runner_parse_ring(const uint8_t *d, RunnerRing *r, uint32_t res_shift)
 {
     uint32_t w0 = ldl_be_p(d + 0);
     uint32_t w2 = ldl_be_p(d + 8);
     uint32_t w3 = ldl_be_p(d + 12);
-    uint32_t size_code = (w0 >> 27) & 0x1f;
-    uint32_t depth = (w0 >> 16) & 0x7ff;
+    uint32_t entry_sz = (w0 >> 27) & 0x1f;            /* BYTES, not log2 */
+    uint32_t depth = ((w0 >> 16) & 0x7ff) << res_shift;
     uint64_t base = ((uint64_t)(w3 & 0xff) << 32) | w2;
 
-    r->entry_size = 1u << size_code;
+    r->entry_size = entry_sz;
     r->depth = depth;
     r->base = base;
     r->idx = 0;
@@ -1090,7 +1108,7 @@ static void runner_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
              */
             stl_le_p(s->rx_cfg + off, (uint32_t)val);
             if (off == PSRAM_CPU_RX_RING_DESC + DESC_SIZE - 4) {
-                runner_parse_ring(s->rx_cfg, &s->rx);
+                runner_parse_ring(s->rx_cfg, &s->rx, RING_RES_32);
                 qemu_log("bcm4916-runner: RX ring base=0x%" PRIx64
                          " depth=%u esz=%u valid=%d\n",
                          s->rx.base, s->rx.depth, s->rx.entry_size, s->rx.valid);
@@ -1101,7 +1119,7 @@ static void runner_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             off < PSRAM_CPU_TX_RING_DESC + DESC_SIZE && size == 4) {
             stl_le_p(s->tx_cfg + (off - PSRAM_CPU_TX_RING_DESC), (uint32_t)val);
             if (off == PSRAM_CPU_TX_RING_DESC + DESC_SIZE - 4) {
-                runner_parse_ring(s->tx_cfg, &s->tx);
+                runner_parse_ring(s->tx_cfg, &s->tx, RING_RES_32);
                 qemu_log("bcm4916-runner: TX ring base=0x%" PRIx64
                          " depth=%u esz=%u valid=%d\n",
                          s->tx.base, s->tx.depth, s->tx.entry_size, s->tx.valid);
