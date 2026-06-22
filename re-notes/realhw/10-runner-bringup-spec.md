@@ -240,6 +240,41 @@ matching update if re-run against this driver.
 Runner; place the extracted microcode blob at /lib/firmware/brcm/bcm4916-runner-microcode.bin;
 deadman-guarded slot1 trial. BBH port map / DSPTCHR VIQ / QM-skip still need on-silicon iteration.
 
+## Wave-8 (2026-06-22): WHY the microcode doesn't service our rings (on-silicon + RE)
+First light reached probe-success + microcode load, but ringstat showed the Runner does NOT consume
+our rings (TX/FEED runner read_idx=0). RE (GPL source + rdpa disasm) found the gaps:
+- ★RING RESOLUTION: RX-delivery + TX rings are **32-resolution** (number_of_entries = depth>>5); only
+  the FEED ring is 64-res (>>6). We used >>6 everywhere → half-size → wrap math broke. FIXED in driver.
+- ★TX WAKEUP: the CPU_TX thread is edge-woken **per frame** by writing CFG_CPU_WAKEUP(core2, thread6)
+  AFTER the descriptor+index publish (rdd_cpu_tx_ring.c:233) — the index bump alone is NOT the doorbell.
+  FIXED in tx_ring_doorbell.
+- ★CPU_RX is woken by the **DSPTCHR**, not CFG_CPU_WAKEUP. Our dsptchr_init (only REORDER_CFG EN|AUTO_INIT)
+  never puts core3/task1 in a runner group nor sets its delivery address → RX thread never wakes. TODO.
+- ★PER-THREAD REGISTER-INIT: rdd_global/local_registers_init writes each thread's initial register file
+  (R31/CONST_1=1, R4=VPORT addrs) into core data mem AFTER zero-mem; we don't → woken threads run on
+  garbage regs. TODO (register-init RE agent in flight).
+
+### DSPTCHR CPU_RX wake recipe (block base 0x82880000; offsets relative). [RE: data_path_init.c
+### dispatcher_reorder_rnr_group_init + rdp_drv_dis_reor.c + XRDP_AG.h]. Implement in dsptchr_init
+### BEFORE the final REORDER_CFG enable, for core3/task1/group1:
+- Reg offsets (base+off, RAM regs stride 4*index): REORDER_CFG 0x000 (EN b0|AUTO_INIT b4, poll RDY b8);
+  REORDER_CFG_VQ_EN 0x004; QUEUE_MAPPING_CRDT_CFG 0x400+4*viq; QUEUE_MAPPING_PD_DSPTCH_ADD 0x480+4*core
+  (base_add[15:0]|offset_add[31:16]); QUEUE_MAPPING_Q_DEST 0x4c0+4*viq; MASK_MSK_TSK_255_0 0x500+4*(grp*8+w)
+  (8 words/grp, word0=tasks[255:224]); MASK_MSK_Q 0x600+4*grp; MASK_NON_DLY_Q 0x624/MASK_DLY_Q 0x620;
+  LOAD_BALANCING_TSK_TO_RG_MAPPING 0x900+4*(task/8) (8×3-bit); RG_AVLABL_TSK_0_3 0x980 / _4_7 0x984.
+- ★THE MISSING WRITE: QUEUE_MAPPING_PD_DSPTCH_ADD[core3] @ **0x048C = 0x728** (= IMAGE_3_PD_FIFO_TABLE
+  _ADDRESS 0x3940 >> 3; full-SDK BCM6813 rdd_runner_defs_auto.h:2043). offset_add=0. Without this the
+  thread is in a group but has no delivery address → never wakes.
+- group1/core3/task1: MASK_MSK_TSK @ 0x0524 = 0x00020000; MASK_MSK_Q @ 0x0604 = feeding-VIQ bitmask;
+  TSK_TO_RG_MAPPING field for the task = group 1; RG_AVLABL_TSK_0_3 @0x980 group1 byte = 1.
+- Order: VIQ/free-list/FLL init → group cfg + PD_DSPTCH_ADD → REORDER_CFG_VQ_EN (enable feeding VIQ) →
+  REORDER_CFG = 0x11 + poll RDY b8 → THEN rnr_enable (RNR block) LAST.
+- ★RE-VERIFY on silicon: the core3 PD wake addr (0x3940>>3=0x728) and WHICH VIQ feeds the CPU_RX group
+  (the full-SDK data_path_init.c + BCM6813 AG .c are build-generated; CFE core0 equiv = 0x140>>3=0x28).
+- NOTE: RX also needs a live ingress MAC port (BBH_RX + MAC/PHY) to have frames to dispatch — that
+  MAC/PHY control plane (DSA/phylink) is a separate subsystem still to build. TX is host-initiated so
+  it's testable first (ring-res + per-frame CFG_CPU_WAKEUP + register-init).
+
 ## STATUS: RE COMPLETE — ready for implementation
 Open MPM-free first-light datapath is fully specified: microcode blob built (RFW1), per-core
 INST/PRED load offsets, RNR enable+wakeup (core3/thr1 RX, core2/thr6 TX), UBUS decode (done in
