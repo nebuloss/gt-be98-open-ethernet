@@ -142,6 +142,13 @@ static dma_addr_t fpm_token_to_phys(struct runner_priv *p, u32 token)
 	return p->pool_pbase + FPM_TOKEN_INDEX(token) * p->chunk_size;
 }
 
+/* FPM token -> runner buffer number (fpm_convert_fpm_token_to_rdp_token):
+ * index[16:0] | pool<<17. [VERIFIED vs fpm_core.c:376] */
+static u32 fpm_token_to_bn(u32 token)
+{
+	return FPM_TOKEN_INDEX(token) | (FPM_TOKEN_POOL(token) << 17);
+}
+
 /* small helper so we don't busy-loop forever if INIT_MEM never clears */
 static void readl_poll_drain(struct runner_priv *p)
 {
@@ -260,18 +267,24 @@ static void rx_deliv_set_read_idx(struct runner_priv *p, u16 idx)
 		  PSRAM_CPU_RING_DESC_TABLE + RING_CFG_READ_IDX_OFF);
 }
 
-/* publish a CPU_RING_DESCRIPTOR control block into a runner core's data SRAM */
+/* publish a CPU_RING_DESCRIPTOR control block into a runner core's data SRAM.
+ * HW field encodings [VERIFIED vs SDK]:
+ *  - number_of_entries is in 64-entry units: field = depth>>6. The runner wraps
+ *    write_idx at (number_of_entries<<6)==depth (rdd_cpu_inc_feed_ring_write_idx,
+ *    CPU_RING_SIZE_64_RESOLUTION=6). => depth MUST be a multiple of 64.
+ *  - size_of_entry is the entry size in BYTES (rdp_cpu_ring.c:323
+ *    size_of_entry = sizeof(CPU_RX_DESCRIPTOR)), not log2.
+ *  - w0: half@0 = size_of_entry[15:11] | number_of_entries[10:0];
+ *    half@2 = interrupt_id; w1 (drop_counter, write_idx)=0;
+ *    w3 = read_idx[15:0]=0 | base_addr_high@f. All big-endian.
+ */
 static void ring_publish(struct runner_priv *p, int core, u32 tbl_off,
 			 dma_addr_t phys, u32 depth, u32 entry_sz, u16 irq)
 {
 	struct runner_ring_cfg cfg = {};
-	u8 size_code = ilog2(entry_sz);
 
-	/* w0: byte0[7:3]=size_of_entry, half@0[10:0]=number_of_entries,
-	 *     half@2=interrupt_id. w1 (drop_counter, write_idx)=0;
-	 *     w3 (read_idx=0 | base_addr_high). All big-endian. */
-	cfg.w0 = cpu_to_be32(((u32)(size_code & 0x1f) << 27) |
-			     ((depth & 0x7ff) << 16) | irq);
+	cfg.w0 = cpu_to_be32(((entry_sz & 0x1f) << 27) |
+			     (((depth >> 6) & 0x7ff) << 16) | irq);
 	cfg.base_addr_low = cpu_to_be32((u32)phys);
 	cfg.w3 = cpu_to_be32((u32)(phys >> 32) & 0xff);
 	memcpy_toio(p->rnr_mem[core] + tbl_off, &cfg, sizeof(cfg));
@@ -453,16 +466,15 @@ static netdev_tx_t runner_start_xmit(struct sk_buff *skb,
 	 * is_emac=1 (UNIMAC egress for the dumb-pipe CPU port), abs=0 (FPM
 	 * token mode), egress port left 0 - DSA tags select the real egress.
 	 */
-	d->word2 = cpu_to_be32(TXD_W2_IS_EMAC);
 	/*
-	 * abs=0 (FPM-token) egress: word3 is the FPM buffer-number / start-of-
-	 * packet split (fpm_bn0[19:0] | fpm_sop[29:20]), NOT the raw token
-	 * [verified vs RING_CPU_TX_DESCRIPTOR, rdd_data_structures_auto.h:2330].
-	 * bn0 = the token's FPM buffer index; SOP = 0 (we copied the frame to the
-	 * buffer start). The exact token->bn0 derivation in the closed
-	 * rdpa_cpu_send is flagged for on-silicon confirmation.
+	 * abs=0 (FPM-token) egress: word3 = fpm_bn0[19:0] | fpm_sop[29:20]
+	 * [VERIFIED vs RING_CPU_TX_DESCRIPTOR + fpm_core.c:376/rdd_cpu_tx.h:119].
+	 * bn0 = fpm_convert_fpm_token_to_rdp_token(token); SOP = 0 (we copied the
+	 * frame to the FPM buffer start). do_not_recycle stays 0 so the runner
+	 * auto-frees the FPM buffer after transmit (no host reclaim needed).
 	 */
-	d->word3 = cpu_to_be32((FPM_TOKEN_INDEX(token) & TXD_W3_FPM_BN0_MASK) |
+	d->word2 = cpu_to_be32(TXD_W2_IS_EMAC);
+	d->word3 = cpu_to_be32((fpm_token_to_bn(token) & TXD_W3_FPM_BN0_MASK) |
 			       ((0u & TXD_W3_FPM_SOP_MASK) << TXD_W3_FPM_SOP_SHIFT));
 
 	p->tx_write_idx = (p->tx_write_idx + 1) % TX_RING_DEPTH;
@@ -482,9 +494,6 @@ static netdev_tx_t runner_start_xmit(struct sk_buff *skb,
 
 static int tx_ring_alloc(struct runner_priv *p)
 {
-	struct runner_ring_cfg cfg = {};
-	u64 phys;
-
 	p->tx_ring = dmam_alloc_coherent(p->dev,
 					 TX_RING_DEPTH * sizeof(*p->tx_ring),
 					 &p->tx_ring_phys, GFP_KERNEL);
@@ -492,15 +501,11 @@ static int tx_ring_alloc(struct runner_priv *p)
 		return -ENOMEM;
 	p->tx_write_idx = 0;
 
-	phys = p->tx_ring_phys;
-	cfg.w0 = cpu_to_be32(((ilog2(sizeof(struct runner_tx_desc)) & 0x1f) << 27) |
-			     ((TX_RING_DEPTH & 0x7ff) << 16));
-	cfg.base_addr_low = cpu_to_be32((u32)phys);
-	cfg.w3 = cpu_to_be32((u32)(phys >> 32) & 0xff);
 	/* TX ring descriptor table lives in RNR core-2 data memory (not PSRAM)
 	 * [SDK RDD_CPU_TX_RING_DESCRIPTOR_TABLE_ADDRESS_ARR core 2]. */
-	memcpy_toio(p->rnr_mem[CPU_TX_RING_CORE] + PSRAM_CPU_TX_RING_DESC_TABLE,
-		    &cfg, sizeof(cfg));
+	ring_publish(p, CPU_TX_RING_CORE, PSRAM_CPU_TX_RING_DESC_TABLE,
+		     p->tx_ring_phys, TX_RING_DEPTH,
+		     sizeof(struct runner_tx_desc), 0);
 	return 0;
 }
 
@@ -673,6 +678,17 @@ static void runner_ubus_decode_init(struct runner_priv *p)
  */
 static void runner_rnr_precfg(struct runner_priv *p)
 {
+	/* DDR DMA base: DMA_BASE[19:0] = (phys_hi<<12)|(phys_lo>>20), mode bit set.
+	 * The runner DMAs RX/TX buffers from this 40-bit-phys region (our pool). */
+	u64 phys = p->pool_pbase;
+	u32 ddr_base = (((u32)(phys >> 32) << 12) |
+			((u32)(phys & 0xffffffff) >> 20)) & RNR_CFG_DDR_CFG_BASE_MASK;
+	u32 ddr_cfg = ddr_base | RNR_CFG_DDR_CFG_BUF_SIZE_MODE;
+	const u32 zero = RNR_CFG_GEN_CFG_DIS_DMA_OLD_FC |
+			 RNR_CFG_GEN_CFG_ZERO_DATA_MEM |
+			 RNR_CFG_GEN_CFG_ZERO_CTX_MEM;
+	const u32 done = RNR_CFG_GEN_CFG_ZERO_DATA_DONE |
+			 RNR_CFG_GEN_CFG_ZERO_CTX_DONE;
 	int c, i;
 
 	for (c = 0; c < XRDP_RNR_CORES; c++) {
@@ -680,22 +696,18 @@ static void runner_rnr_precfg(struct runner_priv *p)
 
 		if (!r)
 			continue;
-		/* zero data + context memory; the bits self-clear when done */
-		writel(RNR_CFG_GEN_CFG_ZERO_DATA_MEM | RNR_CFG_GEN_CFG_ZERO_CTX_MEM,
-		       r + RNR_CFG_GEN_CFG);
+		/* trigger data+context-mem zeroing, then poll the DONE bits to 1
+		 * (the zero bits do NOT self-clear - data_path_init.c:631-647). */
+		writel(zero, r + RNR_CFG_GEN_CFG);
 		for (i = 0; i < 1000; i++) {
-			if (!(readl(r + RNR_CFG_GEN_CFG) &
-			      (RNR_CFG_GEN_CFG_ZERO_DATA_MEM |
-			       RNR_CFG_GEN_CFG_ZERO_CTX_MEM)))
+			if ((readl(r + RNR_CFG_GEN_CFG) & done) == done)
 				break;
 			udelay(10);
 		}
-		/* scheduler mode + memory base config */
+		/* scheduler mode + PSRAM / DDR memory base config */
 		writel(RNR_CFG_SCH_CFG_VAL,   r + RNR_CFG_SCH_CFG);
 		writel(RNR_CFG_PSRAM_CFG_VAL, r + RNR_CFG_PSRAM_CFG);
-		/* DDR buffer-memory base, encoded as phys>>20 (best-effort; the exact
-		 * field packing is flagged for on-silicon confirmation in the spec). */
-		writel((u32)(p->pool_pbase >> 20), r + RNR_CFG_DDR_CFG);
+		writel(ddr_cfg,               r + RNR_CFG_DDR_CFG);
 	}
 }
 

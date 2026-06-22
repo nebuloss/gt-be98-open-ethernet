@@ -77,12 +77,20 @@
 #define RNR_CFG_GLOBAL_CTRL_EN	BIT(0)
 #define RNR_CFG_CPU_WAKEUP	0x04	/* THREAD_NUM[3:0]; the WRITE starts that thread */
 #define RNR_CFG_CPU_WAKEUP_THREAD_MASK	0xf
-#define RNR_CFG_GEN_CFG		0x30	/* zero data/context mem; self-clears when done */
+#define RNR_CFG_GEN_CFG		0x30	/* trigger data/context-mem zeroing */
 #define RNR_CFG_GEN_CFG_DIS_DMA_OLD_FC	BIT(0)
 #define RNR_CFG_GEN_CFG_ZERO_DATA_MEM	BIT(2)
 #define RNR_CFG_GEN_CFG_ZERO_CTX_MEM	BIT(3)
-#define RNR_CFG_DDR_CFG		0x40	/* DDR buffer-memory base, encoded >>20 */
-#define RNR_CFG_PSRAM_CFG	0x44	/* PSRAM base >>20 = 0x82000000>>20 = 0x820 */
+/* [VERIFIED vs data_path_init.c:631-647 / XRDP_AG.h: completion is NOT a
+ * self-clear of the zero bits (that poll is #if 0'd); poll these DONE bits=1. ] */
+#define RNR_CFG_GEN_CFG_ZERO_DATA_DONE	BIT(4)
+#define RNR_CFG_GEN_CFG_ZERO_CTX_DONE	BIT(5)
+/* CFG_DDR_CFG: DMA_BASE[19:0] = (phys_hi<<12)|(phys_lo>>20); BUF_SIZE_MODE b23.
+ * [VERIFIED vs data_path_init.c:654-657 + rdp_drv_rnr.c:62 (mode arg = 1).] */
+#define RNR_CFG_DDR_CFG		0x40
+#define RNR_CFG_DDR_CFG_BASE_MASK	0x000fffff
+#define RNR_CFG_DDR_CFG_BUF_SIZE_MODE	BIT(23)
+#define RNR_CFG_PSRAM_CFG	0x44	/* DMA_BASE[19:0] = psram_base>>20 = 0x820 */
 #define RNR_CFG_PSRAM_CFG_VAL	0x820
 #define RNR_CFG_SCH_CFG		0x4c	/* scheduler cfg = 4 (DRV_RNR_16SP) */
 #define RNR_CFG_SCH_CFG_VAL	0x4
@@ -270,10 +278,14 @@ struct runner_rx_desc {
  * -------------------------------------------------------------------------- */
 struct runner_feed_desc {
 	__be32	ptr_low;	/* host_buffer_data_ptr_low[31:0] (abs phys, low 32) */
-	__be32	w1;		/* ptr_hi[31:24] | abs(b16) | reserved[15:0] */
+	__be32	w1;		/* valid_flag[31:9] | type/abs(b8) | ptr_hi[7:0] */
 };
-#define FEED_W1_ABS		BIT(16)		/* word1 bit16: abs-address token */
-#define FEED_W1_PTR_HI_SHIFT	24		/* word1 bits [31:24] = phys[39:32] */
+/* [VERIFIED vs CPU_FEED_DESCRIPTOR, rdd_data_structures_auto.h:17168: the type
+ * (ABS) bit is byte+6 bit0 == host bit8; ptr_hi[39:32] is byte+7 == host[7:0].
+ * ABS_TYPE=1 => an absolute DDR pointer (vs FPM token). The host w1 value below
+ * is cpu_to_be32()'d, so host bit8 -> byte6 bit0 and host[7:0] -> byte7. ] */
+#define FEED_W1_ABS		BIT(8)		/* type/abs bit (byte+6 bit0) */
+#define FEED_W1_PTR_HI_SHIFT	0		/* ptr_hi[39:32] at byte+7 */
 #define FEED_W1_PTR_HI_MASK	0xff
 
 /* ----------------------------------------------------------------------------
