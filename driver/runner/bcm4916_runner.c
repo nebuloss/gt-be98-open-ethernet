@@ -1066,6 +1066,16 @@ static void runner_remove(struct platform_device *pdev)
 
 static const struct of_device_id runner_of_match[] = {
 	{ .compatible = "brcm,bcm4916-runner" },
+	/*
+	 * Also bind the STOCK rdpa_drv DT node ("brcm,rdpa") directly. On a trial
+	 * boot where the stock datapath (rdpa.ko) is NOT loaded, that node is left
+	 * unbound; binding it gives us the real XRDP reg window as our OWN device
+	 * resource (request_mem_region succeeds - no -EBUSY from a duplicate),
+	 * the of_dma_configure() DMA setup the DT device already got at boot (no
+	 * -EIO), and the real "queue0" CPU-RX IRQ - with NO DT change and NO
+	 * platform_device shim. (On a normal boot rdpa.ko owns this node first.)
+	 */
+	{ .compatible = "brcm,rdpa" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, runner_of_match);
