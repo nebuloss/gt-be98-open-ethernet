@@ -212,6 +212,34 @@ set for implementation. SBPM init (0x03FFC000 vs 0x5fc000) still to confirm from
 project (CFE2's 0x5fc000 is the bootloader's smaller pool; use BCM6813 rdpa value) — minor, SBPM is
 slow-path-optional for first CPU frame.
 
+## Wave-7 (2026-06-22): IMPLEMENTED + 4-way adversarial SDK verification
+Bring-up steps 1-4 are now CODED in driver/runner/bcm4916_runner.{c,h} and build clean as the
+4.19 module on dev-build. Four parallel read-only verifiers cross-checked the riskiest values
+against the BCM6813 SDK (vendor tree gt-be98-firmware/vendor/.../src-rt-5.04behnd.4916, NOT the
+re-sdk merlin checkout which is stripped). Corrections applied:
+- **RNR zero-mem completion is NOT self-clearing**: poll CFG_GEN_CFG ZERO_DATA_MEM_DONE(b4) +
+  ZERO_CONTEXT_MEM_DONE(b5) to 1 (the "poll zero bits to 0" loop is #if0'd in data_path_init.c:638).
+  Set DISABLE_DMA_OLD_FLOW_CONTROL(b0) with the zero bits.
+- **CFG_DDR_CFG@0x40 DMA_BASE = (phys_hi<<12)|(phys_lo>>20)** (40-bit fold), + DMA_BUF_SIZE_MODE b23=1
+  — NOT a plain phys>>20. CFG_PSRAM_CFG@0x44=0x820, CFG_SCH_CFG@0x4c=4 (offset confirmed; DRV_RNR_16SP
+  literal + PSRAM base unread-but-plausible). RNR_REGS 0x82800000/0x1000, GLOBAL_CTRL.EN b0,
+  CPU_WAKEUP[3:0] write-to-wake, RX core3/thr1 + TX core2/thr6 — all CONFIRMED.
+- **CPU ring number_of_entries field is in 64-entry units (depth>>6)**; size_of_entry is in BYTES
+  (sizeof desc), not log2. write_idx@+6 / read_idx@+12; runner wraps write_idx at number_of_entries<<6.
+- **FEED descriptor type/ABS bit = byte+6 bit0 (host BIT(8)), ptr_hi[39:32] = byte+7 (shift 0)**
+  — were wrongly BIT(16)/shift24. Table @core3 RDD 0x0f70, doorbell = 16b BE write_idx@+6,
+  recycle buffers directly back into the feed ring (no RX recycle-ring indirection). ABS_TYPE=1.
+- **TX word3 (abs=0) = fpm_bn0[19:0] | fpm_sop[29:20]**, bn = index|(pool<<17)
+  (fpm_convert_fpm_token_to_rdp_token, fpm_core.c:376), sop=data offset (0 for buf-start; 240 is the
+  std FPM_NET_BUF_HEAD_PAD). do_not_recycle=0 => runner auto-frees the FPM buf (no host reclaim).
+  TX word2 byte/bit offsets confirmed correct as written.
+★Note: the QEMU Runner model used the OLD ring encoding (depth direct, size log2); it needs a
+matching update if re-run against this driver.
+★Step-5 (device trial) PREREQS still open (each non-trivial): DT node (XRDP reg+irqs, compatible
+"brcm,bcm4916-runner") so the driver probes; disable the stock pktrunner/rdpa so they don't own the
+Runner; place the extracted microcode blob at /lib/firmware/brcm/bcm4916-runner-microcode.bin;
+deadman-guarded slot1 trial. BBH port map / DSPTCHR VIQ / QM-skip still need on-silicon iteration.
+
 ## STATUS: RE COMPLETE — ready for implementation
 Open MPM-free first-light datapath is fully specified: microcode blob built (RFW1), per-core
 INST/PRED load offsets, RNR enable+wakeup (core3/thr1 RX, core2/thr6 TX), UBUS decode (done in
