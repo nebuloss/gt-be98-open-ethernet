@@ -268,23 +268,28 @@ static void rx_deliv_set_read_idx(struct runner_priv *p, u16 idx)
 }
 
 /* publish a CPU_RING_DESCRIPTOR control block into a runner core's data SRAM.
- * HW field encodings [VERIFIED vs SDK]:
- *  - number_of_entries is in 64-entry units: field = depth>>6. The runner wraps
- *    write_idx at (number_of_entries<<6)==depth (rdd_cpu_inc_feed_ring_write_idx,
- *    CPU_RING_SIZE_64_RESOLUTION=6). => depth MUST be a multiple of 64.
- *  - size_of_entry is the entry size in BYTES (rdp_cpu_ring.c:323
- *    size_of_entry = sizeof(CPU_RX_DESCRIPTOR)), not log2.
+ * HW field encodings [VERIFIED vs SDK rdd_ring_init disasm]:
+ *  - number_of_entries field = depth >> res_shift. ★The RESOLUTION DIFFERS by
+ *    ring: the RX delivery + TX rings are 32-resolution (res_shift=5,
+ *    CPU_RING_SIZE_32_RESOLUTION; runner wraps at field<<5); the FEED ring is
+ *    64-resolution (res_shift=6). Using >>6 for the RX ring told the microcode
+ *    the ring was half-size -> wrap math broke -> it never delivered.
+ *  - size_of_entry is the entry size in BYTES (sizeof desc), not log2.
+ *  - base_addr = full DMA bus phys: low32 @+8, high byte @+15. No shift.
  *  - w0: half@0 = size_of_entry[15:11] | number_of_entries[10:0];
  *    half@2 = interrupt_id; w1 (drop_counter, write_idx)=0;
  *    w3 = read_idx[15:0]=0 | base_addr_high@f. All big-endian.
  */
+#define RING_RES_32	5	/* RX delivery + TX rings */
+#define RING_RES_64	6	/* FEED ring */
 static void ring_publish(struct runner_priv *p, int core, u32 tbl_off,
-			 dma_addr_t phys, u32 depth, u32 entry_sz, u16 irq)
+			 dma_addr_t phys, u32 depth, u32 entry_sz, u16 irq,
+			 u32 res_shift)
 {
 	struct runner_ring_cfg cfg = {};
 
 	cfg.w0 = cpu_to_be32(((entry_sz & 0x1f) << 27) |
-			     (((depth >> 6) & 0x7ff) << 16) | irq);
+			     (((depth >> res_shift) & 0x7ff) << 16) | irq);
 	cfg.base_addr_low = cpu_to_be32((u32)phys);
 	cfg.w3 = cpu_to_be32((u32)(phys >> 32) & 0xff);
 	memcpy_toio(p->rnr_mem[core] + tbl_off, &cfg, sizeof(cfg));
@@ -318,14 +323,14 @@ static int rx_ring_alloc(struct runner_priv *p)
 
 static void rx_ring_publish(struct runner_priv *p)
 {
-	/* delivery ring (runner -> host), 16B descriptors, on core 3 */
+	/* delivery ring (runner -> host), 16B descriptors, on core 3, 32-res */
 	ring_publish(p, CPU_RX_RING_CORE, PSRAM_CPU_RING_DESC_TABLE,
 		     p->rx_ring_phys, RX_RING_DEPTH,
-		     sizeof(struct runner_rx_desc), p->rx_irq & 0xffff);
-	/* feed ring (host -> runner), 8B descriptors, on core 3 */
+		     sizeof(struct runner_rx_desc), p->rx_irq & 0xffff, RING_RES_32);
+	/* feed ring (host -> runner), 8B descriptors, on core 3, 64-res */
 	ring_publish(p, CPU_RX_RING_CORE, RDD_FEED_RING_DESC_TABLE,
 		     p->feed_ring_phys, FEED_RING_DEPTH,
-		     sizeof(struct runner_feed_desc), 0);
+		     sizeof(struct runner_feed_desc), 0, RING_RES_64);
 	/* ring the feed doorbell so the runner sees the pre-posted buffers */
 	feed_doorbell(p, p->feed_widx);
 }
@@ -423,6 +428,16 @@ static void tx_ring_doorbell(struct runner_priv *p, u16 write_idx)
 	 */
 	iowrite16(cpu_to_be16(write_idx),
 		  p->rnr_mem[CPU_TX_RING_CORE] + CPU_TX_RING_INDICES_OFF + 2);
+
+	/*
+	 * The CPU_TX thread is edge-woken PER FRAME by a CFG_CPU_WAKEUP write to
+	 * its thread number (core2/thread6), issued after the descriptor+index are
+	 * published [SDK rdd_cpu_tx_ring.c:233]. The index bump alone does NOT make
+	 * the thread run; this wakeup is the real doorbell.
+	 */
+	wmb();
+	writel(RNR_CPU_TX_THREAD & RNR_CFG_CPU_WAKEUP_THREAD_MASK,
+	       p->rnr_regs[CPU_TX_RING_CORE] + RNR_CFG_CPU_WAKEUP);
 }
 
 static netdev_tx_t runner_start_xmit(struct sk_buff *skb,
@@ -500,7 +515,7 @@ static int tx_ring_alloc(struct runner_priv *p)
 	 * [SDK RDD_CPU_TX_RING_DESCRIPTOR_TABLE_ADDRESS_ARR core 2]. */
 	ring_publish(p, CPU_TX_RING_CORE, PSRAM_CPU_TX_RING_DESC_TABLE,
 		     p->tx_ring_phys, TX_RING_DEPTH,
-		     sizeof(struct runner_tx_desc), 0);
+		     sizeof(struct runner_tx_desc), 0, RING_RES_32);
 	return 0;
 }
 
