@@ -13,8 +13,10 @@
 # USB shell IS reachable, disarm from it (touch /tmp/deadman-disarm; wdtctl stop)
 # to iterate without time pressure.
 set +e
+# /data override of the WHOLE loader logic -> iterate load steps without a re-flash
+[ -x /data/open-enet/load-override.sh ] && exec /bin/sh /data/open-enet/load-override.sh
 RO=/usr/lib/open-enet
-[ -f /data/open-enet/bcm4916-runner.ko ] && RO=/data/open-enet	# /data override
+[ -f /data/open-enet/bcm4916-runner.ko ] && RO=/data/open-enet	# /data driver override
 LOG=/data/open-enet; BC=$LOG/trial.log
 M=/lib/modules/4.19.294
 mkdir -p "$LOG"
@@ -34,6 +36,7 @@ insmod $M/kernel/drivers/usb/host/xhci-plat-hcd.ko 2>>"$BC"
 insmod $M/extra/bcm_bca_usb.ko 2>>"$BC"
 log "usb host modules loaded; waiting for enumeration"
 sleep 4
+insmod $M/kernel/drivers/net/mii.ko 2>>"$BC"		# usbnet needs mii_*
 insmod $M/kernel/drivers/net/usb/usbnet.ko 2>>"$BC"
 insmod $M/kernel/drivers/net/usb/cdc_ether.ko 2>>"$BC"
 insmod $M/kernel/drivers/net/usb/ax88179_178a.ko 2>>"$BC"

@@ -946,6 +946,7 @@ static int runner_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct net_device *ndev;
 	struct runner_priv *p;
+	struct resource *res;
 	int ret, i;
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(40));
@@ -970,9 +971,18 @@ static int runner_probe(struct platform_device *pdev)
 	p->ndev = ndev;
 	platform_set_drvdata(pdev, p);
 
-	p->xrdp = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(p->xrdp))
-		return PTR_ERR(p->xrdp);
+	/*
+	 * Map the XRDP window WITHOUT request_mem_region: the window hosts many
+	 * sub-devices (MDIO/serdes/PHY under the xrdp simple-bus) that already
+	 * claim sub-regions, so requesting the whole window returns -EBUSY. The
+	 * stock rdpa shares the window the same way (ioremap, no request).
+	 */
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res)
+		return -EINVAL;
+	p->xrdp = devm_ioremap(dev, res->start, resource_size(res));
+	if (!p->xrdp)
+		return -ENOMEM;
 	p->fpm = p->xrdp + XRDP_OFF_FPM;
 	p->natc = p->xrdp + XRDP_OFF_NATC;
 	for (i = 0; i < XRDP_RNR_CORES; i++) {
