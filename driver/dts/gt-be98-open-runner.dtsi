@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * gt-be98-open-runner.dtsi - DT changes to bind the open bcm4916_runner driver
+ * on the GT-BE98 (BCM6813) STOCK 4.19 kernel, replacing the closed rdpa stack.
+ *
+ * Two changes (both required):
+ *   1. Add a root-child node with our compatible so bcm4916_runner probes.
+ *      reg / IRQ are taken verbatim from the stock rdpa_drv node
+ *      (kernel/dts/6813/6813.dtsi:303-340): the whole XRDP window
+ *      0x82000000 size 0xCAF004, CPU-RX "queue0" = GIC_SPI 75.
+ *   2. Disable the stock rdpa_drv node, otherwise both drivers fight over the
+ *      same reg window + IRQ (request_mem_region / IRQ collision).
+ *
+ * HOW TO APPLY (no overlay support assumed on 4.19): decompile the bootfs-FIT
+ * DTB, splice these changes in, recompile, repackage the FIT (the cycle04
+ * technique). Root context is #address-cells=<2> #size-cells=<2>,
+ * interrupt-parent=<&gic>, #interrupt-cells=<3>. The GIC_SPI/IRQ_TYPE macros
+ * resolve to <0 75 4>.
+ *
+ * NOTE: this is documentation of the exact change; the trial-prep script does
+ * the actual dtc splice against the built DTB.
+ */
+
+/ {
+	/* 1. our open Runner conduit */
+	runner@82000000 {
+		compatible = "brcm,bcm4916-runner";
+		reg = <0x0 0x82000000 0x0 0x00CAF004>;	/* whole XRDP window */
+		interrupt-parent = <&gic>;
+		interrupt-names = "queue0";
+		interrupts = <0 75 4>;			/* GIC_SPI 75, LEVEL_HIGH (XRDP_QUEUE_0) */
+		/* runner_emulated is NOT set: real-HW path (loads microcode). */
+	};
+};
+
+/* 2. take the XRDP window away from the closed stack */
+&rdpa_drv {
+	status = "disabled";
+};
