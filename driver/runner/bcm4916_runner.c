@@ -118,6 +118,12 @@ module_param(runner_emulated, bool, 0444);
 MODULE_PARM_DESC(runner_emulated,
 		 "Skip proprietary Runner microcode load (QEMU emulator path).");
 
+static bool mac_loopback;
+module_param(mac_loopback, bool, 0444);
+MODULE_PARM_DESC(mac_loopback,
+		 "Enable UNIMAC local loopback (TX->RX) to validate the full "
+		 "datapath on silicon with no cable/link partner.");
+
 /* ------------------------------------------------------------------------- */
 struct runner_priv {
 	struct platform_device	*pdev;
@@ -1060,13 +1066,15 @@ static void runner_mac_phy_init(struct runner_priv *p, int unimac_inst)
 	    ((u32)UNIMAC_CMD_SPEED_1G << UNIMAC_CMD_SPEED_SHIFT) |
 	    UNIMAC_CMD_PROMIS | UNIMAC_CMD_CRC_FWD | UNIMAC_CMD_PAUSE_FWD |
 	    UNIMAC_CMD_CNTL_FRM_ENA | UNIMAC_CMD_NO_LGTH_CHK;
+	if (mac_loopback)
+		v |= UNIMAC_CMD_LOOP_ENA;	/* TX->RX internal, no cable */
 	writel(v, mac + UNIMAC_CMD);				/* configured, in reset */
 	v &= ~UNIMAC_CMD_SW_RESET;
 	writel(v, mac + UNIMAC_CMD);				/* release reset */
 	v |= UNIMAC_CMD_TX_ENA | UNIMAC_CMD_RX_ENA;
 	writel(v, mac + UNIMAC_CMD);				/* enable TX/RX */
-	dev_info(p->dev, "bring-up: UNIMAC inst%d up (1G, tx/rx enabled)\n",
-		 unimac_inst);
+	dev_info(p->dev, "bring-up: UNIMAC inst%d up (1G, tx/rx enabled%s)\n",
+		 unimac_inst, mac_loopback ? ", LOCAL LOOPBACK" : "");
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
 	/*
