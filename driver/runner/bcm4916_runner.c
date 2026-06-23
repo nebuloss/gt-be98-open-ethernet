@@ -120,7 +120,8 @@ struct runner_priv {
 	struct device		*dev;
 	struct net_device	*ndev;
 
-	void __iomem		*xrdp;		/* whole rdpa window */
+	void __iomem		*xrdp;		/* whole rdpa window (0x82000000) */
+	void __iomem		*ethphytop;	/* eth-phy-top/egphy/mdio region (0x837f0000) */
 	void __iomem		*fpm;		/* xrdp + XRDP_OFF_FPM */
 	void __iomem		*rnr_mem[XRDP_RNR_CORES];	/* per-core data SRAM */
 	void __iomem		*rnr_regs[XRDP_RNR_CORES];	/* per-core ctl regs */
@@ -995,8 +996,8 @@ static void runner_mac_phy_init(struct runner_priv *p, int unimac_inst)
 {
 	void __iomem *mac = p->xrdp + XRDP_OFF_UNIMAC0 +
 			    (u32)unimac_inst * XRDP_UNIMAC_STRIDE;
-	void __iomem *ctl = p->xrdp + XRDP_OFF_QEGPHY_CTRL;
-	void __iomem *sts = p->xrdp + XRDP_OFF_QEGPHY_STATUS;
+	void __iomem *ctl = p->ethphytop + ETHPHY_OFF_QEGPHY_CTRL;
+	void __iomem *sts = p->ethphytop + ETHPHY_OFF_QEGPHY_STATUS;
 	u32 v;
 	int i;
 
@@ -1287,6 +1288,15 @@ static int runner_probe(struct platform_device *pdev)
 		return -EINVAL;
 	p->xrdp = devm_ioremap(dev, res->start, resource_size(res));
 	if (!p->xrdp)
+		return -ENOMEM;
+	/*
+	 * The eth-phy-top / quad-EGPHY / mdiosf2 / xport blocks sit in the
+	 * 0x83000000 SoC region, OUTSIDE the rdpa window - map them separately.
+	 * (Absolute phys base; the stock built-in eth-phy-top driver maps the
+	 * same region with ioremap and no request_mem_region, so this coexists.)
+	 */
+	p->ethphytop = devm_ioremap(dev, ETHPHY_PHYS_BASE, ETHPHY_SIZE);
+	if (!p->ethphytop)
 		return -ENOMEM;
 	p->fpm = p->xrdp + XRDP_OFF_FPM;
 	p->natc = p->xrdp + XRDP_OFF_NATC;

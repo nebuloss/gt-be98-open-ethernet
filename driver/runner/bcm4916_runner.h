@@ -200,9 +200,18 @@
  * (POR = 1 = in reset); clear to release. Base phy_phyad = 1 -> the four
  * GPHYs answer at MDIO addr 1,2,3,4 (port_gphy1/eth2 = addr 2).
  */
-#define XRDP_OFF_QEGPHY_TEST_CNTRL 0x007ff010UL	/* abs 0x837ff010 (unused, keep 0) */
-#define XRDP_OFF_QEGPHY_CTRL	0x007ff014UL	/* abs 0x837ff014 QPHY_CNTRL */
-#define XRDP_OFF_QEGPHY_STATUS	0x007ff018UL	/* abs 0x837ff018 QPHY_STATUS */
+/*
+ * The eth-phy-top / quad-EGPHY / mdiosf2 / xport blocks live in the 0x83000000
+ * SoC register region, NOT in the 0x82000000 XRDP/rdpa datapath window. They
+ * need their OWN mapping (p->ethphytop); offsets below are relative to
+ * ETHPHY_PHYS_BASE, NOT to p->xrdp. (UNIMAC at 0x828a8000 IS in the rdpa
+ * window, so it stays on p->xrdp.)
+ */
+#define ETHPHY_PHYS_BASE	0x837f0000UL	/* xport/ephytop/egphy/mdiosf2 region */
+#define ETHPHY_SIZE		0x00010000UL	/* covers 0x837f0000..0x837fffff */
+#define ETHPHY_OFF_QEGPHY_TEST_CNTRL 0x0000f010UL /* abs 0x837ff010 (unused, keep 0) */
+#define ETHPHY_OFF_QEGPHY_CTRL	0x0000f014UL	/* abs 0x837ff014 QPHY_CNTRL */
+#define ETHPHY_OFF_QEGPHY_STATUS 0x0000f018UL	/* abs 0x837ff018 QPHY_STATUS */
 #define QEGPHY_CTRL_IDDQ_BIAS		BIT(0)
 #define QEGPHY_CTRL_EXT_PWR_DOWN_SHIFT	1	/* [4:1] per-port power-down (1=down) */
 #define QEGPHY_CTRL_EXT_PWR_DOWN_MASK	0xf
