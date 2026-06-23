@@ -71,6 +71,16 @@
 #define XRDP_OFF_FPM		0x00a00000UL
 #define XRDP_OFF_QM		0x00c00000UL
 #define XRDP_OFF_DQM		0x00c80034UL	/* [rdpa.ko DQM_ADDRS[0]=0x82c80034 — stock accessor base; revert] */
+/*
+ * QM block (base 0x82c00000 per our UBUS decode dev1). GLOBAL_CFG_QM_ENABLE_CTRL
+ * @ +0x0: FPM_PREFETCH[0]|REORDER_CREDIT[1]|DQM_POP[2]|RMT_FIXED_ARB[8]|
+ * DQM_PUSH_FIXED_ARB[9]. The CPU_TX EGRESS delayed VIQ's credit RELEASE+wakeup is
+ * gated by DSPTCHR EGRS_DLY_QM_CRDT, fed only when REORDER_CREDIT (bit1) is set.
+ * Stock slot2 reads 0x307 here (verified live via devmem). [XRDP_QM_AG.h:1535-1584]
+ */
+#define XRDP_OFF_QM		0x00c00000UL	/* QM block base (rel rdpa window) */
+#define QM_GLOBAL_QM_ENABLE_CTRL 0x000		/* GLOBAL_CFG_QM_ENABLE_CTRL */
+#define QM_ENABLE_CTRL_STOCK	0x307		/* full stock enable (matches silicon) */
 
 /* ----------------------------------------------------------------------------
  * RNR_REGS per-core control block (base XRDP_OFF_RNR_REGS0 + core*stride).

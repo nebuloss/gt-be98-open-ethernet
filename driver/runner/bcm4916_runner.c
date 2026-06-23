@@ -124,6 +124,12 @@ MODULE_PARM_DESC(mac_loopback,
 		 "Enable UNIMAC local loopback (TX->RX) to validate the full "
 		 "datapath on silicon with no cable/link partner.");
 
+static uint qm_enable = QM_ENABLE_CTRL_STOCK;
+module_param(qm_enable, uint, 0444);
+MODULE_PARM_DESC(qm_enable,
+		 "QM GLOBAL_CFG_QM_ENABLE_CTRL value (0=skip). Stock=0x307; bit1 "
+		 "REORDER_CREDIT gates the CPU_TX egress delayed-VIQ credit release.");
+
 /* ------------------------------------------------------------------------- */
 struct runner_priv {
 	struct platform_device	*pdev;
@@ -983,6 +989,19 @@ static int runner_dsptchr_init(struct runner_priv *p)
 	 * enabling the reorder engine */
 	runner_dsptchr_cpu_rx_setup(p);
 	runner_dsptchr_cpu_tx_setup(p);
+
+	/*
+	 * Enable the QM global credit path. The CPU_TX egress VIQ is a DELAYED
+	 * queue whose credit RELEASE + thread wakeup is gated by DSPTCHR
+	 * EGRS_DLY_QM_CRDT, which the QM only feeds when REORDER_CREDIT (bit1)
+	 * is set. Without this the dispatcher deposits the one-time guaranteed
+	 * grant but never re-arms, so CPU_TX stalls with credit pinned. Stock
+	 * writes 0x307 here (verified). No QM queue/context config is needed for
+	 * the runner-fed BBH_TX slow path. [CFE2 rdp_block_enable qm_enable_ctrl]
+	 */
+	if (qm_enable)
+		writel(qm_enable, p->xrdp + XRDP_OFF_QM + QM_GLOBAL_QM_ENABLE_CTRL);
+	dev_info(p->dev, "bring-up: QM enable_ctrl=0x%x\n", qm_enable);
 
 	/* let the HW auto-init the free linked list, then enable the reorder
 	 * engine; poll RDY (bit8). (Hand-seeding 1024 nodes is the alternative.) */
