@@ -54,3 +54,11 @@ secrets*
 
 # raw real-HW trial logs (may contain device IPs/MACs) - keep local, commit redacted summaries only
 re-notes/realhw/raw/
+
+# Proprietary firmware blobs + their extractors (user-extracted, NEVER commit;
+# same convention as extract-runner-microcode.sh above). *.bin already ignored.
+*.bin
+merlin*-shortfin.bin
+*runner-microcode*.bin
+fw-extracted/
+tools/extract-serdes-fw.py
