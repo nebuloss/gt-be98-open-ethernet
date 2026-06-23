@@ -188,17 +188,34 @@
 #define UNIMAC_CMD_NO_LGTH_CHK	BIT(24)
 #define UNIMAC_FRM_LEN		0x0014
 #define UNIMAC_FRM_LEN_VAL	0x3fff
-/* internal quad-EGPHY block power (eth-phy-top region) */
-#define XRDP_OFF_QEGPHY_CTRL	0x007ff010UL	/* abs 0x837ff010 */
-#define XRDP_OFF_QEGPHY_STATUS	0x007ff014UL	/* abs 0x837ff014, PLL_LOCK */
-#define QEGPHY_CTRL_PHY_RESET		BIT(0)
-#define QEGPHY_CTRL_IDDQ_BIAS		BIT(1)
-#define QEGPHY_CTRL_EXT_PWR_DOWN_SHIFT	2	/* [5:2] per-port power-down (1=down) */
+/*
+ * Internal quad-EGPHY (1G) block in the eth-phy-top register region.
+ * Authoritative map: bchp_eth_phy_top_reg.h (68880/6813) + bcmethsw.h
+ * (CONFIG_BCM96813 branch). Three adjacent registers:
+ *   0x837ff010 QPHY_TEST_CNTRL  (leave 0; phy_test_en/iddq_test_mode only)
+ *   0x837ff014 QPHY_CNTRL       (THE control register: reset/iddq/pwr/phyad)
+ *   0x837ff018 QPHY_STATUS      (pll_lock = bit 8)
+ * iddq_global_pwr[9:6] and ext_pwr_down[4:1] are 4-bit per-port fields
+ * (one bit per internal GPHY, 1 = powered down). phy_reset is active-high
+ * (POR = 1 = in reset); clear to release. Base phy_phyad = 1 -> the four
+ * GPHYs answer at MDIO addr 1,2,3,4 (port_gphy1/eth2 = addr 2).
+ */
+#define XRDP_OFF_QEGPHY_TEST_CNTRL 0x007ff010UL	/* abs 0x837ff010 (unused, keep 0) */
+#define XRDP_OFF_QEGPHY_CTRL	0x007ff014UL	/* abs 0x837ff014 QPHY_CNTRL */
+#define XRDP_OFF_QEGPHY_STATUS	0x007ff018UL	/* abs 0x837ff018 QPHY_STATUS */
+#define QEGPHY_CTRL_IDDQ_BIAS		BIT(0)
+#define QEGPHY_CTRL_EXT_PWR_DOWN_SHIFT	1	/* [4:1] per-port power-down (1=down) */
 #define QEGPHY_CTRL_EXT_PWR_DOWN_MASK	0xf
-#define QEGPHY_CTRL_IDDQ_GLOBAL_PWR	BIT(6)
-#define QEGPHY_CTRL_PHYAD_SHIFT		8	/* [12:8] base MDIO addr */
-#define QEGPHY_CTRL_PLL_CLK125_250_SEL	BIT(13)
-#define QEGPHY_STATUS_PLL_LOCK		BIT(0)
+#define QEGPHY_CTRL_IDDQ_GLOBAL_PWR_SHIFT 6	/* [9:6] per-port iddq (1=down) */
+#define QEGPHY_CTRL_IDDQ_GLOBAL_PWR_MASK 0xf
+#define QEGPHY_CTRL_CK25_DIS		BIT(10)
+#define QEGPHY_CTRL_PHY_RESET		BIT(11)	/* active-high; POR=1; clear to release */
+#define QEGPHY_CTRL_PHYAD_SHIFT		12	/* [16:12] base MDIO addr */
+#define QEGPHY_CTRL_PHYAD_MASK		0x1f
+#define QEGPHY_CTRL_REF_CLK_FREQ_SHIFT	17	/* [18:17]; 0x2 = 50 MHz (stock) */
+#define QEGPHY_CTRL_REF_CLK_50MHZ	0x2
+#define QEGPHY_CTRL_PLL_CLK125_250_SEL	BIT(19)	/* leave 0 = 125 MHz */
+#define QEGPHY_STATUS_PLL_LOCK		BIT(8)
 
 /* ----------------------------------------------------------------------------
  * FPM register block. Layout from the GPL FpmControl struct (fpm_priv.h):

@@ -1000,25 +1000,48 @@ static void runner_mac_phy_init(struct runner_priv *p, int unimac_inst)
 	u32 v;
 	int i;
 
-	/* --- internal quad-EGPHY block power-up (RMW the single CTRL reg) --- */
+	/*
+	 * --- internal quad-EGPHY block power-up (QPHY_CNTRL @ 0x837ff014) ---
+	 * Replicates the stock 6813 sequence (phy_drv_dsl_phy.c qphy_ctrl_adjust /
+	 * u-boot bcm_ethsw_phy.c qgphy_powerup): power everything down + assert
+	 * reset, settle, apply power (still in reset), settle, then release reset
+	 * and let the PLL lock. The PMC "ethtop" power domain is already ON
+	 * (u-boot switch power-up + the built-in eth_phy_top probe's
+	 * pmc_ethtop_power_up(ETHTOP_COMMON)); the stock GPHY power-up itself is
+	 * tied to a MAC phy_connect via the stock datapath, which our trial SKIPS,
+	 * so the block is left in POR and we drive it here. We enable all four
+	 * internal GPHYs (ext_pwr_down = 0). Base phy_phyad = 1 (addrs 1..4).
+	 */
 	v = readl(ctl);
-	v |= QEGPHY_CTRL_PHY_RESET;			writel(v, ctl); mdelay(1);
-	v |= QEGPHY_CTRL_PLL_CLK125_250_SEL;		writel(v, ctl); mdelay(1);
-	v &= ~(QEGPHY_CTRL_IDDQ_GLOBAL_PWR | QEGPHY_CTRL_IDDQ_BIAS);
-							writel(v, ctl); mdelay(1);
-	v &= ~((u32)QEGPHY_CTRL_EXT_PWR_DOWN_MASK << QEGPHY_CTRL_EXT_PWR_DOWN_SHIFT);
-	v &= ~((u32)0x1f << QEGPHY_CTRL_PHYAD_SHIFT);
-	v |= (1u << QEGPHY_CTRL_PHYAD_SHIFT);		/* base MDIO addr = 1 */
-							writel(v, ctl); mdelay(1);
-	v &= ~QEGPHY_CTRL_PLL_CLK125_250_SEL;		writel(v, ctl); mdelay(1);
-	v &= ~QEGPHY_CTRL_PHY_RESET;			writel(v, ctl); mdelay(1);
+	v &= ~(QEGPHY_CTRL_IDDQ_BIAS |
+	       ((u32)QEGPHY_CTRL_EXT_PWR_DOWN_MASK << QEGPHY_CTRL_EXT_PWR_DOWN_SHIFT) |
+	       ((u32)QEGPHY_CTRL_IDDQ_GLOBAL_PWR_MASK << QEGPHY_CTRL_IDDQ_GLOBAL_PWR_SHIFT) |
+	       QEGPHY_CTRL_CK25_DIS | QEGPHY_CTRL_PHY_RESET |
+	       ((u32)QEGPHY_CTRL_PHYAD_MASK << QEGPHY_CTRL_PHYAD_SHIFT) |
+	       ((u32)0x3 << QEGPHY_CTRL_REF_CLK_FREQ_SHIFT) |
+	       QEGPHY_CTRL_PLL_CLK125_250_SEL);
+	v |= (1u << QEGPHY_CTRL_PHYAD_SHIFT);			/* base MDIO addr = 1 */
+	v |= ((u32)QEGPHY_CTRL_REF_CLK_50MHZ << QEGPHY_CTRL_REF_CLK_FREQ_SHIFT);
+	/* phase 1: all ports powered down + in reset */
+	writel(v | QEGPHY_CTRL_IDDQ_BIAS |
+	       ((u32)0xf << QEGPHY_CTRL_EXT_PWR_DOWN_SHIFT) |
+	       ((u32)0xf << QEGPHY_CTRL_IDDQ_GLOBAL_PWR_SHIFT) |
+	       QEGPHY_CTRL_PHY_RESET, ctl);
+	udelay(40);
+	/* phase 2: power applied (iddq + ext_pwr_down cleared), still in reset */
+	writel(v | QEGPHY_CTRL_PHY_RESET, ctl);
+	udelay(100);
+	/* phase 3: release reset (all four ports enabled) -> PLL starts */
+	writel(v, ctl);
+	udelay(1000);
 	for (i = 0; i < 100; i++) {
 		if (readl(sts) & QEGPHY_STATUS_PLL_LOCK)
 			break;
-		mdelay(1);
+		udelay(100);
 	}
-	dev_info(p->dev, "bring-up: EGPHY block PLL %s\n",
-		 (readl(sts) & QEGPHY_STATUS_PLL_LOCK) ? "locked" : "NOT locked");
+	dev_info(p->dev, "bring-up: EGPHY block PLL %s (qphy_cntrl=0x%08x status=0x%08x)\n",
+		 (readl(sts) & QEGPHY_STATUS_PLL_LOCK) ? "locked" : "NOT locked",
+		 readl(ctl), readl(sts));
 
 	/* --- UNIMAC MAC config under sw_reset, then enable [unimac_drv_impl1.c] --- */
 	writel(UNIMAC_CMD_SW_RESET, mac + UNIMAC_CMD);		/* assert reset */
