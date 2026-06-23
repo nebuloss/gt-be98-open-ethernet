@@ -153,9 +153,18 @@
  */
 #define DSPTCHR_INGRS_Q_LIMITS		0x300	/* +4*viq: CMN_MAX[9:0] GURNTD_MAX[19:10] CREDIT_CNT[31:20] */
 #define DSPTCHR_MASK_DLY_Q		0x620	/* bitmap: VIQ is a delayed (egress) queue */
-#define DSPTCHR_Q_DEST_REOR		1	/* Q_DEST value: route to reorder */
-#define DSPTCHR_CPU_TX_EGRESS_VIQ	30	/* DISP_REOR_VIQ_CPU_TX_EGRESS_MCORE (8-core img) */
-#define DSPTCHR_TX_GURNTD_BUFS		16	/* DSPTCHR_NORMAL_GUARANTEED_BUFFERS */
+#define DSPTCHR_EGRS_DLY_QM_CRDT	0x630	/* dispatcher's delayed-egress QM credit pool */
+/*
+ * ★VIQ NUMBER: the stock driver on THIS silicon uses VIQ 13 for the CPU_TX_0
+ * egress (core2/thread6/credit-table 0x29d0) — read live: crdt_cfg[13]=0x653A0002,
+ * exactly our target. (DISP_REOR_VIQ_CPU_TX_EGRESS=13; the "MCORE=30" enum is a
+ * SECOND instance on core5/thread4/0x2970 — crdt_cfg[30]=0x452E0005.) Match stock:
+ * ingrs_lim = CMN_MAX 0x3FF | GURNTD 8 (0x23ff); q_dest is unused (stock=0xDEADBEEF);
+ * EGRS_DLY_QM_CRDT seeded to 8.
+ */
+#define DSPTCHR_CPU_TX_EGRESS_VIQ	13	/* DISP_REOR_VIQ_CPU_TX_EGRESS (stock, verified live) */
+#define DSPTCHR_TX_INGRS_LIMITS		0x000023ff /* CMN_MAX=0x3FF, GURNTD_MAX=8 (match stock) */
+#define DSPTCHR_EGRS_DLY_QM_CRDT_VAL	8	/* match stock EGRS_DLY_QM_CRDT */
 #define DSPTCHR_CPU_TX_CRDT_TGT		(((CPU_TX_EGRESS_CREDIT_OFF >> 3) | \
 					  (RNR_CPU_TX_THREAD << 12)) & 0xffff)
 /* CPU_RX PD-table the dispatcher delivers to (full-SDK IMAGE_3_PD_FIFO_TABLE

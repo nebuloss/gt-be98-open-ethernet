@@ -962,22 +962,27 @@ static void runner_dsptchr_cpu_tx_setup(struct runner_priv *p)
 
 	/* crdt_cfg: target = (credit_addr>>3 | thread<<12) in [31:16], bb_id [7:0].
 	 * The target tells the dispatcher WHERE to deposit credit + WHICH thread
-	 * to wake; bb_id selects the runner core whose data memory holds it. */
+	 * to wake; bb_id selects the runner core whose data memory holds it.
+	 * Matches stock crdt_cfg[13] = 0x653A0002 exactly. */
 	writel((DSPTCHR_CPU_TX_CRDT_TGT << 16) | (bb_id & 0xff),
 	       d + DSPTCHR_QUEUE_CRDT_CFG + 4 * viq);
-	/* route to the reorder engine and mark it a delayed (egress) queue */
-	writel(DSPTCHR_Q_DEST_REOR, d + DSPTCHR_Q_DEST + 4 * viq);
+	/* mark it a delayed (egress) queue. q_dest is NOT written - stock leaves it
+	 * uninitialized (0xDEADBEEF) for this VIQ; it is meaningless for a delayed
+	 * credit queue. */
 	cur = readl(d + DSPTCHR_MASK_DLY_Q);
 	writel(cur | (1u << viq), d + DSPTCHR_MASK_DLY_Q);
-	/* guaranteed buffers for the VIQ (credit_cnt=0, gurntd=16, cmn=0) */
-	writel((u32)DSPTCHR_TX_GURNTD_BUFS << 10,
-	       d + DSPTCHR_INGRS_Q_LIMITS + 4 * viq);
+	/* per-VIQ ingress limits: CMN_MAX=0x3FF, GURNTD_MAX=8 (match stock) */
+	writel(DSPTCHR_TX_INGRS_LIMITS, d + DSPTCHR_INGRS_Q_LIMITS + 4 * viq);
+	/* seed the dispatcher's delayed-egress QM credit pool (stock=8). Without a
+	 * QM feeding this, the dispatcher cannot RELEASE delayed-queue credit. */
+	writel(DSPTCHR_EGRS_DLY_QM_CRDT_VAL, d + DSPTCHR_EGRS_DLY_QM_CRDT);
 	/* enable this VIQ alongside the CPU_RX one already set */
 	cur = readl(d + DSPTCHR_VQ_EN);
 	writel(cur | (1u << viq), d + DSPTCHR_VQ_EN);
 	dev_info(p->dev,
-		 "bring-up: DSPTCHR CPU_TX egress VIQ%u wired (crdt_tgt=0x%x bb=%u thr%d)\n",
-		 viq, DSPTCHR_CPU_TX_CRDT_TGT, bb_id, RNR_CPU_TX_THREAD);
+		 "bring-up: DSPTCHR CPU_TX egress VIQ%u wired (crdt_tgt=0x%x bb=%u thr%d dly_crdt=%u)\n",
+		 viq, DSPTCHR_CPU_TX_CRDT_TGT, bb_id, RNR_CPU_TX_THREAD,
+		 DSPTCHR_EGRS_DLY_QM_CRDT_VAL);
 }
 
 static int runner_dsptchr_init(struct runner_priv *p)
