@@ -1400,6 +1400,12 @@ static int runner_probe(struct platform_device *pdev)
 	p->ndev = ndev;
 	platform_set_drvdata(pdev, p);
 
+	/* The QEMU model advertises emulation via DT; fold it into runner_emulated
+	 * so every HW-only step (microcode load, EGPHY/MAC-PHY) is skipped
+	 * consistently (the module param is the other way to set it). */
+	if (of_property_read_bool(dev->of_node, "brcm,runner-emulated"))
+		runner_emulated = true;
+
 	/*
 	 * Map the XRDP window WITHOUT request_mem_region: the window hosts many
 	 * sub-devices (MDIO/serdes/PHY under the xrdp simple-bus) that already
