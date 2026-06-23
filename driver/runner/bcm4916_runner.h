@@ -264,6 +264,52 @@
 #define QEGPHY_MDIO_ADDR		2
 
 /* ----------------------------------------------------------------------------
+ * 10G XPORT SerDes (merlin16_shortfin). Reached via an indirect register window
+ * "brcm,serdes1" @ 0x837ff500 size 0x300 (separate ioremap, like the EGPHY).
+ * Per-core block (core N at +N*0x100): ADDR @ +0x04, MASK @ +0x08, CNTRL @ +0xf0.
+ * A merlin "lane register" is encoded as (dev<<27)|(lane<<16)|reg and driven via
+ * the ADDR/MASK/CNTRL triplet. CNTRL bits: reg_data[15:0], r_w[16], start_busy[17],
+ * delayed_ack[18]. The firmware (merlin16_shortfin_ucode_image, 31664 B, CRC 0x4949)
+ * is streamed as 16-bit LE words into the micro program RAM. [serdes_access.c,
+ * serdes_access_6813.h, merlin16_shortfin_config.c]
+ * -------------------------------------------------------------------------- */
+#define SERDES_PHYS_BASE	0x837ff500UL
+#define SERDES_SIZE		0x00000300UL
+#define SERDES_CORE_STRIDE	0x100UL
+#define SERDES_OFF_INDIR_ADDR	0x004	/* +core*0x100 */
+#define SERDES_OFF_INDIR_MASK	0x008
+#define SERDES_OFF_INDIR_CNTRL	0x0f0
+#define SERDES_DEV_TYPE_SHIFT	27	/* merlin C45-style dev in the encoded addr */
+#define SERDES_LANE_SHIFT	16
+#define SERDES_PMD_DEV		1	/* micro/PMD device */
+#define SERDES_CNTRL_RW		BIT(16)
+#define SERDES_CNTRL_START_BUSY	BIT(17)
+#define SERDES_CNTRL_DELAYED_ACK BIT(18)
+/* micro subsystem registers (merlin dev1 reg space) + field {mask,shift} */
+#define SRD_MICRO_CLK_CTRL	0xd200	/* master_clk_en[0], core_clk_en[1] */
+#define SRD_MICRO_CLK_MASTER	0x0001
+#define SRD_MICRO_CLK_CORE	0x0002
+#define SRD_MICRO_RST_CTRL	0xd201	/* master_rstb[0], core_rstb[1] */
+#define SRD_MICRO_RST_MASTER	0x0001
+#define SRD_MICRO_RST_CORE	0x0002
+#define SRD_MICRO_AHB_CTRL	0xd202	/* ra_wrdatasize[1:0], ra_init[9:8], autoinc_wraddr_en[12] */
+#define SRD_MICRO_RA_WRDATASIZE	0x0003
+#define SRD_MICRO_RA_INIT	0x0300
+#define SRD_MICRO_RA_INIT_SHIFT	8
+#define SRD_MICRO_AUTOINC_WR	0x1000
+#define SRD_MICRO_AHB_STATUS	0xd203	/* ra_initdone (bit0 per exc_; poll nonzero) */
+#define SRD_MICRO_RA_INITDONE	0x8001	/* tolerate bit0|bit15 (RE ambiguity) */
+#define SRD_MICRO_RA_WRADDR_LSW	0xd204
+#define SRD_MICRO_RA_WRADDR_MSW	0xd205
+#define SRD_MICRO_RA_WRDATA_LSW	0xd206
+#define SRD_MICRO_PMI_IF_CTRL	0xd228	/* pmi_hp_fast_read_en[0] */
+#define SRD_MICRO_PMI_HP_FAST	0x0001
+#define SRD_UC_ACTIVE_REG	0xd0f4	/* uc_active[15] - the "uC running" gate */
+#define SRD_UC_ACTIVE		0x8000
+#define SERDES_FW_NAME		"brcm/merlin16-shortfin.bin"
+#define SERDES_FW_SIZE		31664
+
+/* ----------------------------------------------------------------------------
  * FPM register block. Layout from the GPL FpmControl struct (fpm_priv.h):
  *   ctrl  @ 0x0000, pool(broadcast) @ 0x0200, pool0 @ 0x0400, pool1 @ 0x0600.
  * The alloc/dealloc register is at +0x000 of the pool0 management block,

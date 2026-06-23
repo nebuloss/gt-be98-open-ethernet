@@ -130,6 +130,20 @@ MODULE_PARM_DESC(qm_enable,
 		 "QM GLOBAL_CFG_QM_ENABLE_CTRL value (0=skip). Stock=0x307; bit1 "
 		 "REORDER_CREDIT gates the CPU_TX egress delayed-VIQ credit release.");
 
+static bool serdes_fw_load;
+module_param(serdes_fw_load, bool, 0444);
+MODULE_PARM_DESC(serdes_fw_load,
+		 "Load the merlin16_shortfin 10G XPORT SerDes firmware (" SERDES_FW_NAME
+		 ") and start the uC. Opt-in (HW only); first step of 10G bring-up.");
+
+static uint serdes_core;	/* which merlin16 core (0/1/2) the 10G port uses */
+module_param(serdes_core, uint, 0444);
+MODULE_PARM_DESC(serdes_core, "merlin16 SerDes core index for the 10G port (default 0).");
+
+static uint serdes_lane;	/* lane within the core */
+module_param(serdes_lane, uint, 0444);
+MODULE_PARM_DESC(serdes_lane, "merlin16 SerDes lane index for the 10G port (default 0).");
+
 /* ------------------------------------------------------------------------- */
 struct runner_priv {
 	struct platform_device	*pdev;
@@ -138,6 +152,7 @@ struct runner_priv {
 
 	void __iomem		*xrdp;		/* whole rdpa window (0x82000000) */
 	void __iomem		*ethphytop;	/* eth-phy-top/egphy/mdio region (0x837f0000) */
+	void __iomem		*serdes;	/* merlin16 serdes indirect window (0x837ff500) */
 	void __iomem		*fpm;		/* xrdp + XRDP_OFF_FPM */
 	void __iomem		*rnr_mem[XRDP_RNR_CORES];	/* per-core data SRAM */
 	void __iomem		*rnr_regs[XRDP_RNR_CORES];	/* per-core ctl regs */
@@ -1370,6 +1385,169 @@ static const struct net_device_ops runner_netdev_ops = {
 	.ndo_validate_addr = eth_validate_addr,
 };
 
+/* ====================== 10G XPORT SerDes (merlin16) ===================== *
+ * Minimal merlin16_shortfin firmware loader: stream the ucode blob into the
+ * SerDes micro program-RAM and start the uC, then confirm it runs (uc_active).
+ * This is STEP 1 of 10G XPORT bring-up; the full link (PLL/VCO, lane AFE,
+ * speed/AN, PMD lock) is a larger follow-on (best served by reusing the open
+ * SDK merlin16 driver). Access = the indirect ADDR/MASK/CNTRL window at
+ * 0x837ff500 (per core). [merlin16_shortfin_config.c, serdes_access.c]
+ */
+static int serdes_xfer(struct runner_priv *p, u16 reg, u16 mask, u16 val,
+		       bool write, u16 *out)
+{
+	void __iomem *b = p->serdes + serdes_core * SERDES_CORE_STRIDE;
+	u32 addr = ((u32)SERDES_PMD_DEV << SERDES_DEV_TYPE_SHIFT) |
+		   ((u32)serdes_lane << SERDES_LANE_SHIFT) | reg;
+	u32 cntrl = 0;
+	int i;
+
+	writel(addr, b + SERDES_OFF_INDIR_ADDR);
+	if (write) {
+		writel((u16)~mask, b + SERDES_OFF_INDIR_MASK);
+		cntrl = (u32)val | SERDES_CNTRL_START_BUSY | SERDES_CNTRL_DELAYED_ACK;
+	} else {
+		cntrl = SERDES_CNTRL_RW | SERDES_CNTRL_START_BUSY |
+			SERDES_CNTRL_DELAYED_ACK;
+	}
+	writel(cntrl, b + SERDES_OFF_INDIR_CNTRL);
+
+	for (i = 0; i < 1000; i++) {
+		cntrl = readl(b + SERDES_OFF_INDIR_CNTRL);
+		if (!(cntrl & SERDES_CNTRL_START_BUSY))
+			break;
+		udelay(1);
+	}
+	if (cntrl & SERDES_CNTRL_START_BUSY)
+		return -ETIMEDOUT;
+	if (out)
+		*out = cntrl & mask;
+	return 0;
+}
+
+static inline int serdes_wr_reg(struct runner_priv *p, u16 reg, u16 val)
+{
+	return serdes_xfer(p, reg, 0xffff, val, true, NULL);
+}
+/* write field {mask,shift} = v (v is the logical field value, pre-shift) */
+static inline int serdes_wr_f(struct runner_priv *p, u16 reg, u16 mask,
+			      u16 shift, u16 v)
+{
+	return serdes_xfer(p, reg, mask, (v << shift) & mask, true, NULL);
+}
+static inline int serdes_rd(struct runner_priv *p, u16 reg, u16 mask, u16 *out)
+{
+	return serdes_xfer(p, reg, mask, 0, false, out);
+}
+
+static int serdes_poll_ra_initdone(struct runner_priv *p)
+{
+	u16 v;
+	int i;
+
+	for (i = 0; i < 250; i++) {
+		if (serdes_rd(p, SRD_MICRO_AHB_STATUS, SRD_MICRO_RA_INITDONE, &v) == 0 && v)
+			return 0;
+		udelay(1);
+	}
+	dev_warn(p->dev, "serdes: RAM init timeout\n");
+	return -ETIMEDOUT;
+}
+
+static int runner_serdes_load(struct runner_priv *p)
+{
+	/* micro register block reset-to-default values [merlin16_shortfin_config.c
+	 * uc_reset(enable=1)]; the few non-zero ones are spelled out below. */
+	static const u16 zero_regs[] = {
+		0xD200, 0xD201, 0xD202, 0xD204, 0xD205, 0xD206, 0xD207, 0xD208,
+		0xD209, 0xD20A, 0xD20B, 0xD20C, 0xD20D, 0xD20E, 0xD211, 0xD212,
+		0xD213, 0xD214, 0xD215, 0xD217, 0xD218, 0xD219, 0xD21A, 0xD21B,
+		0xD220, 0xD221, 0xD224, 0xD226, 0xD229, 0xD22A,
+	};
+	const struct firmware *fw;
+	int ret, i;
+	u16 v = 0;
+
+	ret = request_firmware(&fw, SERDES_FW_NAME, p->dev);
+	if (ret) {
+		dev_warn(p->dev, "serdes: firmware '%s' absent (%d); 10G XPORT skipped\n",
+			 SERDES_FW_NAME, ret);
+		return ret;
+	}
+	if (fw->size != SERDES_FW_SIZE)
+		dev_warn(p->dev, "serdes: fw size %zu != expected %d\n",
+			 fw->size, SERDES_FW_SIZE);
+	dev_info(p->dev, "serdes: loading merlin16 uC core%u lane%u (%zu B)\n",
+		 serdes_core, serdes_lane, fw->size);
+
+	/* --- assert uC reset: clocks off, micro reg block to defaults --- */
+	serdes_wr_f(p, SRD_MICRO_CLK_CTRL, SRD_MICRO_CLK_CORE, 1, 0);
+	serdes_wr_f(p, SRD_MICRO_CLK_CTRL, SRD_MICRO_CLK_MASTER, 0, 0);
+	for (i = 0; i < ARRAY_SIZE(zero_regs); i++)
+		serdes_wr_reg(p, zero_regs[i], 0x0000);
+	serdes_wr_reg(p, 0xD216, 0x0007);
+	serdes_wr_reg(p, 0xD225, 0x8201);
+	serdes_wr_reg(p, 0xD228, 0x0101);
+
+	/* --- toggle subsystem reset, init code + data RAM --- */
+	serdes_wr_f(p, SRD_MICRO_CLK_CTRL, SRD_MICRO_CLK_MASTER, 0, 1);
+	serdes_wr_f(p, SRD_MICRO_RST_CTRL, SRD_MICRO_RST_MASTER, 0, 1);
+	serdes_wr_f(p, SRD_MICRO_RST_CTRL, SRD_MICRO_RST_MASTER, 0, 0);
+	serdes_wr_f(p, SRD_MICRO_RST_CTRL, SRD_MICRO_RST_MASTER, 0, 1);
+	serdes_wr_f(p, SRD_MICRO_AHB_CTRL, SRD_MICRO_RA_INIT, SRD_MICRO_RA_INIT_SHIFT, 1);
+	ret = serdes_poll_ra_initdone(p);
+	if (ret)
+		goto out;
+	serdes_wr_f(p, SRD_MICRO_AHB_CTRL, SRD_MICRO_RA_INIT, SRD_MICRO_RA_INIT_SHIFT, 2);
+	ret = serdes_poll_ra_initdone(p);
+	if (ret)
+		goto out;
+	serdes_wr_f(p, SRD_MICRO_AHB_CTRL, SRD_MICRO_RA_INIT, SRD_MICRO_RA_INIT_SHIFT, 0);
+
+	/* --- program-RAM write port: autoinc, 16-bit words, addr 0 --- */
+	serdes_wr_f(p, SRD_MICRO_AHB_CTRL, SRD_MICRO_AUTOINC_WR, 12, 1);
+	serdes_wr_f(p, SRD_MICRO_AHB_CTRL, SRD_MICRO_RA_WRDATASIZE, 0, 1);
+	serdes_wr_reg(p, SRD_MICRO_RA_WRADDR_MSW, 0);
+	serdes_wr_reg(p, SRD_MICRO_RA_WRADDR_LSW, 0);
+
+	/* --- stream blob as 16-bit LE words (raw, no transform) --- */
+	for (i = 0; i + 1 < fw->size; i += 2) {
+		ret = serdes_wr_reg(p, SRD_MICRO_RA_WRDATA_LSW,
+				    fw->data[i] | ((u16)fw->data[i + 1] << 8));
+		if (ret)
+			goto out;
+	}
+	if (fw->size & 1)
+		serdes_wr_reg(p, SRD_MICRO_RA_WRDATA_LSW, fw->data[fw->size - 1]);
+	serdes_wr_f(p, SRD_MICRO_AHB_CTRL, SRD_MICRO_RA_WRDATASIZE, 0, 2);
+	serdes_wr_f(p, SRD_MICRO_CLK_CTRL, SRD_MICRO_CLK_CORE, 1, 1);
+
+	/* --- release/start the uC --- */
+	serdes_wr_f(p, SRD_MICRO_CLK_CTRL, SRD_MICRO_CLK_MASTER, 0, 1);
+	serdes_wr_f(p, SRD_MICRO_RST_CTRL, SRD_MICRO_RST_MASTER, 0, 1);
+	serdes_wr_f(p, SRD_MICRO_CLK_CTRL, SRD_MICRO_CLK_CORE, 1, 1);
+	serdes_wr_f(p, SRD_MICRO_PMI_IF_CTRL, SRD_MICRO_PMI_HP_FAST, 0, 0);
+	serdes_wr_f(p, SRD_MICRO_RST_CTRL, SRD_MICRO_RST_CORE, 1, 1);
+
+	/* --- confirm uC running (uc_active) --- */
+	for (i = 0; i < 10000; i++) {
+		if (serdes_rd(p, SRD_UC_ACTIVE_REG, SRD_UC_ACTIVE, &v) == 0 && v)
+			break;
+		udelay(1);
+	}
+	if (v) {
+		dev_info(p->dev, "serdes: merlin16 uC ACTIVE core%u (fw running)\n",
+			 serdes_core);
+		ret = 0;
+	} else {
+		dev_warn(p->dev, "serdes: uC NOT active after load (uc_active=0)\n");
+		ret = -EIO;
+	}
+out:
+	release_firmware(fw);
+	return ret;
+}
+
 static int runner_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1431,6 +1609,12 @@ static int runner_probe(struct platform_device *pdev)
 		if (!p->ethphytop)
 			return -ENOMEM;
 	}
+	/* 10G XPORT SerDes indirect window (opt-in, HW only). */
+	if (!runner_emulated && serdes_fw_load) {
+		p->serdes = devm_ioremap(dev, SERDES_PHYS_BASE, SERDES_SIZE);
+		if (!p->serdes)
+			return -ENOMEM;
+	}
 	p->fpm = p->xrdp + XRDP_OFF_FPM;
 	p->natc = p->xrdp + XRDP_OFF_NATC;
 	for (i = 0; i < XRDP_RNR_CORES; i++) {
@@ -1476,6 +1660,8 @@ static int runner_probe(struct platform_device *pdev)
 	 */
 	if (!runner_emulated)
 		runner_mac_phy_init(p, RUNNER_FIRST_PORT);	/* 1G UNIMAC + EGPHY (HW only) */
+	if (!runner_emulated && serdes_fw_load)
+		runner_serdes_load(p);		/* 10G XPORT merlin16 fw (opt-in, step 1) */
 	runner_bbh_init(p, RUNNER_FIRST_PORT);
 	runner_thread_regfile_init(p);	/* CPU thread initial registers (post-zero, pre-enable) */
 	runner_rnr_enable(p);		/* CFG_GLOBAL_CTRL.EN + cpu_wakeup, LAST */
