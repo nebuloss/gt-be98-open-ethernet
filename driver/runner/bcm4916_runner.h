@@ -467,7 +467,13 @@ struct runner_ring_cfg {
  */
 /* [PINNED 2026-06-22 vs SDK oracle: RDD_CPU_TX_RING_INDICES_VALUES_TABLE_ADDRESS_ARR = 0x29c8
  * (BCM6813_FPI). RDD/core-data-memory offset; + per-core RNR base for the absolute addr. */
-#define CPU_TX_RING_INDICES_OFF		0x29c8	/* RDD off [SDK BCM6813_FPI] */
+#define CPU_TX_RING_INDICES_OFF		0x29c8	/* RDD off, core 2 [SDK BCM6813] */
+/* CPU_TX credit/sync state (core-2 data mem) - the egress dispatcher credit is
+ * replenished by the QM/dispatcher; if it stays 0 the CPU_TX thread stalls after
+ * its initial credits. [rdd_runner_reg_dump_addrs.c core 2] */
+#define CPU_TX_EGRESS_CREDIT_OFF	0x29d0	/* 3 x u32 */
+#define CPU_TX_INGRESS_CREDIT_OFF	0x2b70	/* 3 x u32 */
+#define CPU_TX_SYNC_FIFO_OFF		0x3780	/* {write_ptr@+0, read_ptr@+2} */
 
 /*
  * Field offsets WITHIN a runner_ring_cfg control block (16B, big-endian) for the

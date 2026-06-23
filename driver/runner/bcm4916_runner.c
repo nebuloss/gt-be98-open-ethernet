@@ -1206,7 +1206,9 @@ static ssize_t runner_ringstat_read(struct file *file, char __user *ubuf,
 {
 	struct runner_priv *p = file->private_data;
 	u16 tx_runner_rd, rx_runner_wr, feed_runner_rd;
-	char buf[480];
+	u32 ecred0, ecred1, ecred2;
+	u16 sfifo_wr, sfifo_rd;
+	char buf[640];
 	int n;
 
 	/* TX indices entry {read_idx@+0, write_idx@+2} on core 2: read_idx is
@@ -1220,11 +1222,21 @@ static ssize_t runner_ringstat_read(struct file *file, char __user *ubuf,
 	feed_runner_rd = be16_to_cpu(ioread16(p->rnr_mem[CPU_RX_RING_CORE] +
 				     RDD_FEED_RING_DESC_TABLE + RING_CFG_READ_IDX_OFF));
 
+	/* CPU_TX egress-dispatcher credits + sync-fifo ptrs (core 2): if the
+	 * thread stalls after a few frames with credits==0, it is credit-starved
+	 * (the QM/dispatcher replenish path is not wired in slow-path bring-up). */
+	ecred0 = ioread32be(p->rnr_mem[CPU_TX_RING_CORE] + CPU_TX_EGRESS_CREDIT_OFF + 0);
+	ecred1 = ioread32be(p->rnr_mem[CPU_TX_RING_CORE] + CPU_TX_EGRESS_CREDIT_OFF + 4);
+	ecred2 = ioread32be(p->rnr_mem[CPU_TX_RING_CORE] + CPU_TX_EGRESS_CREDIT_OFF + 8);
+	sfifo_wr = be16_to_cpu(ioread16(p->rnr_mem[CPU_TX_RING_CORE] + CPU_TX_SYNC_FIFO_OFF + 0));
+	sfifo_rd = be16_to_cpu(ioread16(p->rnr_mem[CPU_TX_RING_CORE] + CPU_TX_SYNC_FIFO_OFF + 2));
+
 	n = scnprintf(buf, sizeof(buf),
 		"TX  : host_write_idx=%u  runner_read_idx=%u  %s\n"
 		"RX  : runner_write_idx=%u host_read_idx=%u  %s\n"
 		"FEED: host_write_idx=%u  runner_read_idx=%u  %s\n"
 		"FPM : tokens_avail=%u\n"
+		"TXCR: egress_credit=[%u %u %u] sync_fifo{wr=%u rd=%u}\n"
 		"stats: tx=%lu rx=%lu txerr=%lu rxerr=%lu\n",
 		p->tx_write_idx, tx_runner_rd,
 		tx_runner_rd ? "(runner CONSUMING tx)" : "(runner not consuming tx)",
@@ -1233,6 +1245,7 @@ static ssize_t runner_ringstat_read(struct file *file, char __user *ubuf,
 		p->feed_widx, feed_runner_rd,
 		feed_runner_rd ? "(runner PULLING feed bufs)" : "(feed untouched)",
 		readl(p->fpm + FPM_POOL1_STAT2) & FPM_STAT2_TOKENS_AVAIL_MASK,
+		ecred0, ecred1, ecred2, sfifo_wr, sfifo_rd,
 		p->ndev->stats.tx_packets, p->ndev->stats.rx_packets,
 		p->ndev->stats.tx_errors, p->ndev->stats.rx_errors);
 	return simple_read_from_buffer(ubuf, count, ppos, buf, n);
