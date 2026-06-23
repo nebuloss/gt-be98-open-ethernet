@@ -44,12 +44,55 @@
 #include <linux/firmware.h>
 #include <linux/delay.h>
 #include <linux/byteorder/generic.h>
-#include <asm/unaligned.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+#include <asm/unaligned.h>	/* get_unaligned_le32() etc. (pre-6.12 location) */
+#else
+#include <linux/unaligned.h>
+#endif
 #include <linux/in.h>
 #include <linux/debugfs.h>
 
 #include "bcm4916_runner.h"
 #include "flow_offload.h"
+
+/*
+ * Kernel-API compat. This single source builds against two very different
+ * trees: the on-silicon Broadcom vendor kernel (a 4.19 fork) for the live
+ * trial, and current mainline (6.x/7.x) for the QEMU harness + upstreaming.
+ * A few net/platform APIs differ. The vendor 4.19 fork additionally predates
+ * (or strips) some 4.x helpers, so gate on < 5.0 rather than the exact add
+ * version: the fork is < 5.0 and the mainline harness is >= 6.x, which splits
+ * the two cleanly.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+/* platform_get_irq_byname_optional() (no error print on a missing entry)
+ * landed in 5.4; the plain variant is functionally equivalent for us (we treat
+ * any negative return as "no IRQ -> poll mode"). */
+#define platform_get_irq_byname_optional platform_get_irq_byname
+
+/* netif_napi_add() dropped its explicit weight argument in 6.1. The inner call
+ * is not re-expanded (a macro is not recursively painted), so this is safe. */
+#define netif_napi_add(dev, napi, poll) \
+	netif_napi_add((dev), (napi), (poll), NAPI_POLL_WEIGHT)
+
+/* devm_register_netdev() is absent in this vendor fork; synthesize it from
+ * register_netdev() + a devm unwind action (devm_add_action_or_reset exists). */
+static inline void runner_compat_unregister_netdev(void *ndev)
+{
+	unregister_netdev((struct net_device *)ndev);
+}
+static inline int devm_register_netdev(struct device *dev,
+				       struct net_device *ndev)
+{
+	int ret = register_netdev(ndev);
+
+	if (ret)
+		return ret;
+	return devm_add_action_or_reset(dev, runner_compat_unregister_netdev,
+					ndev);
+}
+#endif /* < 5.0.0 */
 
 #define DRV_NAME		"bcm4916-runner"
 #define RUNNER_FW_NAME		"brcm/bcm4916-runner-microcode.bin"
@@ -1311,7 +1354,13 @@ static int runner_probe(struct platform_device *pdev)
 	return 0;
 }
 
+/* platform_driver.remove() returns void only from 6.11 (the .remove_new
+ * rename); older trees (incl. the 4.19 vendor fork) expect an int. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+static int runner_remove(struct platform_device *pdev)
+#else
 static void runner_remove(struct platform_device *pdev)
+#endif
 {
 	struct runner_priv *p = platform_get_drvdata(pdev);
 	int c;
@@ -1333,6 +1382,9 @@ static void runner_remove(struct platform_device *pdev)
 
 	debugfs_remove_recursive(p->dbg);
 	xrdp_offload_deinit(&p->offload);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+	return 0;
+#endif
 }
 
 static const struct of_device_id runner_of_match[] = {
