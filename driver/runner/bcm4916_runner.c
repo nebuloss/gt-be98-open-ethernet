@@ -52,6 +52,10 @@
 #endif
 #include <linux/in.h>
 #include <linux/debugfs.h>
+#include <linux/mii.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+#include <linux/kallsyms.h>	/* resolve stock built-in MDIO accessor (trial) */
+#endif
 
 #include "bcm4916_runner.h"
 #include "flow_offload.h"
@@ -522,17 +526,22 @@ static netdev_tx_t runner_start_xmit(struct sk_buff *skb,
 			       ((len & TXD_W0_PKT_LEN_MASK) << TXD_W0_PKT_LEN_SHIFT));
 	d->word1 = 0;
 	/*
-	 * is_emac=1 (UNIMAC egress for the dumb-pipe CPU port), abs=0 (FPM
-	 * token mode), egress port left 0 - DSA tags select the real egress.
-	 */
-	/*
+	 * is_emac=1 (UNIMAC egress for the dumb-pipe CPU port), abs=0 (FPM token
+	 * mode). The egress EMAC port [27:20] MUST name the port we actually
+	 * brought up (UNIMAC inst / BBH_TX = RUNNER_FIRST_PORT); leaving it 0
+	 * directed frames at the unconfigured EMAC port 0, so the Runner TX
+	 * thread stalled after the BBH_TX FIFO filled (~3 frames) and read_idx
+	 * froze. (DSA tag-based egress selection is a later step.)
+	 *
 	 * abs=0 (FPM-token) egress: word3 = fpm_bn0[19:0] | fpm_sop[29:20]
 	 * [VERIFIED vs RING_CPU_TX_DESCRIPTOR + fpm_core.c:376/rdd_cpu_tx.h:119].
 	 * bn0 = fpm_convert_fpm_token_to_rdp_token(token); SOP = 0 (we copied the
 	 * frame to the FPM buffer start). do_not_recycle stays 0 so the runner
 	 * auto-frees the FPM buffer after transmit (no host reclaim needed).
 	 */
-	d->word2 = cpu_to_be32(TXD_W2_IS_EMAC);
+	d->word2 = cpu_to_be32(TXD_W2_IS_EMAC |
+			       (((u32)RUNNER_FIRST_PORT & TXD_W2_PORT_MASK)
+				<< TXD_W2_PORT_SHIFT));
 	d->word3 = cpu_to_be32((fpm_token_to_bn(token) & TXD_W3_FPM_BN0_MASK) |
 			       ((0u & TXD_W3_FPM_SOP_MASK) << TXD_W3_FPM_SOP_SHIFT));
 
@@ -1058,6 +1067,38 @@ static void runner_mac_phy_init(struct runner_priv *p, int unimac_inst)
 	writel(v, mac + UNIMAC_CMD);				/* enable TX/RX */
 	dev_info(p->dev, "bring-up: UNIMAC inst%d up (1G, tx/rx enabled)\n",
 		 unimac_inst);
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+	/*
+	 * Best-effort PHY/link readback via the stock built-in SF2 MDIO
+	 * accessor (mdiosf2 @ 0x837ffd00; port_gphy1 = MDIO addr 2). Diagnostic
+	 * only - a proper phylib hookup is a follow-up. (4.19 vendor kernel:
+	 * kallsyms_lookup_name is exported; mainline uses phylib instead.)
+	 */
+	{
+		int (*mdio_rd)(u32, u32, u16 *) =
+			(void *)kallsyms_lookup_name("mdio_read_c22_register");
+
+		if (mdio_rd) {
+			u16 bmcr = 0, bmsr = 0, id1 = 0, id2 = 0;
+			u32 a = QEGPHY_MDIO_ADDR;
+
+			mdio_rd(a, MII_BMCR, &bmcr);
+			mdio_rd(a, MII_BMSR, &bmsr);
+			/* BMSR latches link-low; read twice for the live state */
+			mdio_rd(a, MII_BMSR, &bmsr);
+			mdio_rd(a, MII_PHYSID1, &id1);
+			mdio_rd(a, MII_PHYSID2, &id2);
+			dev_info(p->dev,
+				 "bring-up: PHY@%u id=%04x%04x bmcr=0x%04x bmsr=0x%04x link=%d aneg=%d\n",
+				 a, id1, id2, bmcr, bmsr,
+				 !!(bmsr & BMSR_LSTATUS),
+				 !!(bmsr & BMSR_ANEGCOMPLETE));
+		} else {
+			dev_info(p->dev, "bring-up: SF2 MDIO accessor not found (link unknown)\n");
+		}
+	}
+#endif
 }
 
 /* ============================ offload self-test (debugfs) =============== *

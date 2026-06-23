@@ -225,6 +225,8 @@
 #define QEGPHY_CTRL_REF_CLK_50MHZ	0x2
 #define QEGPHY_CTRL_PLL_CLK125_250_SEL	BIT(19)	/* leave 0 = 125 MHz */
 #define QEGPHY_STATUS_PLL_LOCK		BIT(8)
+/* port_gphy1 (eth2-class, UNIMAC inst 1) answers at MDIO addr 2 on mdiosf2 */
+#define QEGPHY_MDIO_ADDR		2
 
 /* ----------------------------------------------------------------------------
  * FPM register block. Layout from the GPL FpmControl struct (fpm_priv.h):
