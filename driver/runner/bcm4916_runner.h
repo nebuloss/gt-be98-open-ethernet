@@ -452,7 +452,7 @@ struct runner_recycle_desc {
 struct runner_tx_desc {
 	__be32	word0;	/* sk_buf_ptr_high[7:0] | packet_length[21:8] | egress_or_ingress_1[30:22] | is_egress(b31) */
 	__be32	word1;	/* sk_buf_ptr_low_or_data_1588[31:0] */
-	__be32	word2;	/* pkt_buf_ptr_high[7:0] | ssid[13:10] | abs(b16) | wan_flow/src_port[27:20] | is_emac(b28) | flag_1588(b29) | do_not_recycle(b30) | color(b31) */
+	__be32	word2;	/* pkt_buf_ptr_high[7:0] | ssid[13:10] | abs(b16) | flow_or_port_id[26:20] | is_vport(b27) | is_emac(b28) | flag_1588(b29) | do_not_recycle(b30) | color(b31) */
 	__be32	word3;	/* pkt_buf_ptr_low (abs=1) OR fpm_bn0[19:0]|fpm_sop[29:20] (abs=0) */
 };
 
@@ -467,9 +467,9 @@ struct runner_tx_desc {
 #define TXD_W2_DO_NOT_RECYCLE	BIT(30)			/* bit30 */
 #define TXD_W2_FLAG_1588	BIT(29)			/* bit29 */
 #define TXD_W2_IS_EMAC		BIT(28)			/* bit28 */
-#define TXD_W2_PORT_SHIFT	20			/* bits [27:20] wan_flow / source_port (egress) */
-#define TXD_W2_PORT_MASK	0xff
-#define TXD_W2_IS_VPORT		BIT(27)			/* bit27 (when set, [26:20]=vport flow_or_port_id) */
+#define TXD_W2_IS_VPORT		BIT(27)			/* bit27: 1=[26:20] is a vport, 0=emac port */
+#define TXD_W2_PORT_SHIFT	20			/* bits [26:20] flow_or_port_id (7-bit egress emac port) */
+#define TXD_W2_PORT_MASK	0x7f			/* [26:20], NOT [27:20] - bit27 is is_vport */
 #define TXD_W2_ABS		BIT(16)			/* bit16: 1=abs addr (word3=phys), 0=FPM token */
 #define TXD_W2_SSID_SHIFT	10			/* bits [13:10] WLAN ssid */
 #define TXD_W2_SSID_MASK	0xf

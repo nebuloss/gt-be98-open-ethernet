@@ -1417,10 +1417,14 @@ static int runner_probe(struct platform_device *pdev)
 	 * 0x83000000 SoC region, OUTSIDE the rdpa window - map them separately.
 	 * (Absolute phys base; the stock built-in eth-phy-top driver maps the
 	 * same region with ioremap and no request_mem_region, so this coexists.)
+	 * Skipped under emulation: the QEMU model only backs the rdpa window, so
+	 * touching 0x837f0000 there would fault.
 	 */
-	p->ethphytop = devm_ioremap(dev, ETHPHY_PHYS_BASE, ETHPHY_SIZE);
-	if (!p->ethphytop)
-		return -ENOMEM;
+	if (!runner_emulated) {
+		p->ethphytop = devm_ioremap(dev, ETHPHY_PHYS_BASE, ETHPHY_SIZE);
+		if (!p->ethphytop)
+			return -ENOMEM;
+	}
 	p->fpm = p->xrdp + XRDP_OFF_FPM;
 	p->natc = p->xrdp + XRDP_OFF_NATC;
 	for (i = 0; i < XRDP_RNR_CORES; i++) {
@@ -1464,7 +1468,8 @@ static int runner_probe(struct platform_device *pdev)
 	 * in the closed rdpa.ko (BBH_ID 0 vs 1 for this port is unconfirmed) - tune
 	 * RUNNER_FIRST_PORT on silicon. VIQ == bbh_id. No serdes blob (1G path).
 	 */
-	runner_mac_phy_init(p, RUNNER_FIRST_PORT);	/* 1G UNIMAC + EGPHY link */
+	if (!runner_emulated)
+		runner_mac_phy_init(p, RUNNER_FIRST_PORT);	/* 1G UNIMAC + EGPHY (HW only) */
 	runner_bbh_init(p, RUNNER_FIRST_PORT);
 	runner_thread_regfile_init(p);	/* CPU thread initial registers (post-zero, pre-enable) */
 	runner_rnr_enable(p);		/* CFG_GLOBAL_CTRL.EN + cpu_wakeup, LAST */
