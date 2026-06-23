@@ -133,6 +133,21 @@
 #define BBH_BBID_RX_BBH0		31	/* RX_BBH_n bb_id = 31 + 2*n */
 #define DSPTCHR_VIQ_TARGET_NORMAL	2	/* bbh target = normal */
 #define DSPTCHR_CPU_RX_GROUP		1	/* runner group for the LAN->CPU_RX path */
+/*
+ * CPU_TX EGRESS (delayed-credit) VIQ. The dispatcher is the credit PRODUCER:
+ * it deposits credit into the CPU_TX credit table (core-2 @0x29d0) and wakes
+ * thread 6. Without this VIQ registered the table stays 0 and CPU_TX stalls
+ * after its initial buffers. [rdd_data_structures_auto DISP_REOR_VIQ_*, CFE2
+ * dispatcher_reorder_viq_init]. Crdt-cfg target word = (credit_addr>>3) |
+ * (thread<<12) in [31:16], bb_id (runner core) in [7:0].
+ */
+#define DSPTCHR_INGRS_Q_LIMITS		0x300	/* +4*viq: CMN_MAX[9:0] GURNTD_MAX[19:10] CREDIT_CNT[31:20] */
+#define DSPTCHR_MASK_DLY_Q		0x620	/* bitmap: VIQ is a delayed (egress) queue */
+#define DSPTCHR_Q_DEST_REOR		1	/* Q_DEST value: route to reorder */
+#define DSPTCHR_CPU_TX_EGRESS_VIQ	30	/* DISP_REOR_VIQ_CPU_TX_EGRESS_MCORE (8-core img) */
+#define DSPTCHR_TX_GURNTD_BUFS		16	/* DSPTCHR_NORMAL_GUARANTEED_BUFFERS */
+#define DSPTCHR_CPU_TX_CRDT_TGT		(((CPU_TX_EGRESS_CREDIT_OFF >> 3) | \
+					  (RNR_CPU_TX_THREAD << 12)) & 0xffff)
 /* CPU_RX PD-table the dispatcher delivers to (full-SDK IMAGE_3_PD_FIFO_TABLE
  * 0x3940 >> 3); matches the CPU_RX thread regfile R8/R17. */
 #define DSPTCHR_CPU_RX_PD_ADDR		(0x3940 >> 3)

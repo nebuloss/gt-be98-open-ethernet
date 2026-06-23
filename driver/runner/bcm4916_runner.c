@@ -939,13 +939,50 @@ static void runner_dsptchr_cpu_rx_setup(struct runner_priv *p)
 		 viq, grp, CPU_RX_RING_CORE, RNR_CPU_RX_THREAD, DSPTCHR_CPU_RX_PD_ADDR);
 }
 
+/*
+ * Register the CPU_TX EGRESS (delayed-credit) VIQ so the dispatcher GRANTS
+ * egress credits to the CPU_TX thread. Without this the credit table (core-2
+ * @0x29d0) stays 0 and the CPU_TX thread stalls after its initial buffers
+ * (observed: runner_read_idx frozen at 3). The dispatcher is the credit
+ * PRODUCER; it deposits credit at the target address and wakes thread 6.
+ * [CFE2 data_path_init.c dispatcher_reorder_viq_init(DISP_REOR_VIQ_CPU_TX_EGRESS)].
+ */
+static void runner_dsptchr_cpu_tx_setup(struct runner_priv *p)
+{
+	void __iomem *d = p->xrdp + XRDP_OFF_DSPTCHR;
+	u32 viq   = DSPTCHR_CPU_TX_EGRESS_VIQ;
+	u32 bb_id = CPU_TX_RING_CORE;		/* BB_ID_RNR<core> == core index */
+	u32 cur;
+
+	/* crdt_cfg: target = (credit_addr>>3 | thread<<12) in [31:16], bb_id [7:0].
+	 * The target tells the dispatcher WHERE to deposit credit + WHICH thread
+	 * to wake; bb_id selects the runner core whose data memory holds it. */
+	writel((DSPTCHR_CPU_TX_CRDT_TGT << 16) | (bb_id & 0xff),
+	       d + DSPTCHR_QUEUE_CRDT_CFG + 4 * viq);
+	/* route to the reorder engine and mark it a delayed (egress) queue */
+	writel(DSPTCHR_Q_DEST_REOR, d + DSPTCHR_Q_DEST + 4 * viq);
+	cur = readl(d + DSPTCHR_MASK_DLY_Q);
+	writel(cur | (1u << viq), d + DSPTCHR_MASK_DLY_Q);
+	/* guaranteed buffers for the VIQ (credit_cnt=0, gurntd=16, cmn=0) */
+	writel((u32)DSPTCHR_TX_GURNTD_BUFS << 10,
+	       d + DSPTCHR_INGRS_Q_LIMITS + 4 * viq);
+	/* enable this VIQ alongside the CPU_RX one already set */
+	cur = readl(d + DSPTCHR_VQ_EN);
+	writel(cur | (1u << viq), d + DSPTCHR_VQ_EN);
+	dev_info(p->dev,
+		 "bring-up: DSPTCHR CPU_TX egress VIQ%u wired (crdt_tgt=0x%x bb=%u thr%d)\n",
+		 viq, DSPTCHR_CPU_TX_CRDT_TGT, bb_id, RNR_CPU_TX_THREAD);
+}
+
 static int runner_dsptchr_init(struct runner_priv *p)
 {
 	void __iomem *d = p->xrdp + XRDP_OFF_DSPTCHR;
 	int i;
 
-	/* configure the CPU_RX VIQ/group BEFORE enabling the reorder engine */
+	/* configure the CPU_RX VIQ/group + CPU_TX egress credit VIQ BEFORE
+	 * enabling the reorder engine */
 	runner_dsptchr_cpu_rx_setup(p);
+	runner_dsptchr_cpu_tx_setup(p);
 
 	/* let the HW auto-init the free linked list, then enable the reorder
 	 * engine; poll RDY (bit8). (Hand-seeding 1024 nodes is the alternative.) */
