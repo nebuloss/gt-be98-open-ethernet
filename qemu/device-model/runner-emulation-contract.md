@@ -260,7 +260,32 @@ Replaying `runner_probe`:
 
 UBUS decode-window / BBH / DSPTCHR / QM / DMA / SBPM writes from the real
 `data_path_init` are **not issued** by this slow-path driver (they're stubbed),
-so the model does not need to decode them.
+so the model does not need to decode them — EXCEPT when Route A is enabled (next).
+
+### Route A egress (driver `route_a=1`)
+
+When the driver runs with `route_a=1`, it additionally brings up the QM + a
+TM-core egress queue + a BBH_TX QMQ binding so an injected CPU_TX PD egresses the
+way the stock image_2 thread routes (dispatcher → TM/QM core → BBH_TX), not the
+CFE2 direct-to-BBH model. The model decodes:
+
+- **QM** (`0xc00000`): `MEM_AUTO_INIT(0x138)` write + `MEM_AUTO_INIT_STS(0x13c)`
+  read (returns `MEM_INIT_DONE=1` instantly); `ENABLE_CTRL(0x000)`; per-group
+  `RUNNER_GRP` `QUEUE_CONFIG(+0x04)` (start/end queue) + `RNR_CONFIG(+0x00)`
+  (bb_id/task/enable), groups at `0x300` stride `0x10`.
+- **BBH_TX** (`0x890000`, stride `0x2000`): `QMQ` bits at `0x4b0`/`0x7b0` per
+  instance.
+- **Descriptor**: word0 `first_level_q[30:22]` (the target QM queue).
+
+`runner_tx_kick` then gates emission: if Route A is active (QM enabled + ≥1
+RUNNER_GRP enabled), a frame egresses only if its `first_level_q` lies in an
+enabled group's `[start,end]` AND some BBH_TX instance is QM-fed (QMQ set) — else
+it is dropped with a `LOG_GUEST_ERROR`. This regression-guards the driver's
+Route A register writes. Debug counter: `NATC + 0x10` = frames egressed via
+Route A. When `route_a=0` the QM/BBH state stays zero and TX emits as before
+(legacy path). Validated: `run-validate.sh` (legacy) and the `route_a` cmdline
+variant (`bcm4916_runner.route_a=1 …`) both reach `VALIDATE_DONE` tx=4/rx=6, the
+latter logging `TX emit(route_a)`.
 
 ---
 

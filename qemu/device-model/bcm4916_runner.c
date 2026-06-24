@@ -68,6 +68,22 @@
 #define XRDP_OFF_FPM         0x00a00000ULL
 #define XRDP_OFF_NATC        0x00950000ULL   /* NAT-C engine (ABI 1.1) */
 
+/* Route A egress path: QM + BBH_TX (offsets/fields match the driver header). */
+#define XRDP_OFF_QM          0x00c00000ULL
+#define XRDP_OFF_BBH_TX0     0x00890000ULL
+#define XRDP_BBH_TX_STRIDE   0x00002000ULL
+#define XRDP_BBH_TX_INSTANCES 4
+#define QM_ENABLE_CTRL       0x000
+#define QM_MEM_AUTO_INIT     0x138
+#define QM_MEM_AUTO_INIT_STS 0x13c
+#define QM_RUNNER_GRP_BASE   0x300
+#define QM_RUNNER_GRP_STRIDE 0x10
+#define QM_RGRP_RNR_CONFIG   0x00
+#define QM_RGRP_QUEUE_CONFIG 0x04
+#define QM_NUM_GROUPS        15
+#define BBH_TX_QMQ_LAN       0x4b0
+#define BBH_TX_QMQ_UNIFIED   0x7b0
+
 /* CPU host rings live on specific Runner cores (matches driver header). */
 #define CPU_RX_RING_CORE     3
 #define CPU_TX_RING_CORE     2
@@ -261,6 +277,20 @@ struct Bcm4916RunnerState {
     } natc[NATC_MAX_ENTRIES];
     uint64_t off_hits;                    /* frames forwarded in HW (bypassed CPU) */
     uint64_t off_misses;                  /* frames delivered to CPU (slow path) */
+
+    /* ---- Route A egress modelling (QM + TM-core RUNNER_GRP + BBH_TX QMQ) ----
+     * Lets the harness prove the driver's route_a register writes happen and are
+     * self-consistent, and that a frame still egresses through that path. When
+     * the driver runs without route_a these stay zero and TX emits as before. */
+    bool     qm_mem_init;                 /* MEM_AUTO_INIT requested */
+    uint32_t qm_enable;                   /* QM ENABLE_CTRL value written */
+    struct {
+        uint16_t start, end;              /* QUEUE_CONFIG range */
+        uint8_t  bb_id, task;             /* RNR_CONFIG TM core/thread */
+        bool     en;                      /* RNR_ENABLE */
+    } qm_grp[QM_NUM_GROUPS];
+    uint8_t  bbh_qmq[XRDP_BBH_TX_INSTANCES]; /* QMQ bits written per BBH_TX inst */
+    uint64_t route_a_egress;              /* frames egressed via the QM/TM path */
 };
 
 /* DMA helpers operate on the system address space of this device. */
@@ -1012,9 +1042,55 @@ static ssize_t runner_receive(NetClientState *nc, const uint8_t *buf, size_t len
 
 /* ===================== TX consume (guest -> backend) ===================== */
 
+/*
+ * Route A egress validation. When the driver brought up the QM/TM egress path
+ * (route_a=1 -> QM enabled + at least one RUNNER_GRP enabled), a TX frame may
+ * only physically egress if its descriptor's first_level_q falls inside an
+ * enabled group's queue range AND some BBH_TX instance was bound QM-fed (QMQ).
+ * This makes the harness exercise & regression-guard the route_a register
+ * writes. Returns true if route_a is NOT active (legacy emulation emits as
+ * before) or if the path is correctly configured for this queue.
+ */
+static bool runner_route_a_active(Bcm4916RunnerState *s)
+{
+    int g;
+    if (!s->qm_enable) {
+        return false;
+    }
+    for (g = 0; g < QM_NUM_GROUPS; g++) {
+        if (s->qm_grp[g].en) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool runner_route_a_egress_ok(Bcm4916RunnerState *s, uint32_t first_level_q)
+{
+    int g, i;
+    bool grp_ok = false, qmq_ok = false;
+
+    for (g = 0; g < QM_NUM_GROUPS; g++) {
+        if (s->qm_grp[g].en &&
+            first_level_q >= s->qm_grp[g].start &&
+            first_level_q <= s->qm_grp[g].end) {
+            grp_ok = true;
+            break;
+        }
+    }
+    for (i = 0; i < XRDP_BBH_TX_INSTANCES; i++) {
+        if (s->bbh_qmq[i]) {
+            qmq_ok = true;
+            break;
+        }
+    }
+    return grp_ok && qmq_ok;
+}
+
 static void runner_tx_kick(Bcm4916RunnerState *s, uint16_t new_widx)
 {
     AddressSpace *as = runner_dma_as(s);
+    bool route_a = runner_route_a_active(s);
 
     if (!s->tx.valid) {
         return;
@@ -1046,12 +1122,31 @@ static void runner_tx_kick(Bcm4916RunnerState *s, uint16_t new_widx)
             continue;
         }
 
+        /* Route A: the PD must target a QM queue an enabled RUNNER_GRP drains
+         * into a QM-fed BBH_TX, else the TM core would never egress it. */
+        if (route_a) {
+            uint32_t flq = (w0 >> 22) & 0x1ff;   /* word0 first_level_q [30:22] */
+            if (!runner_route_a_egress_ok(s, flq)) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "bcm4916-runner: route_a TX idx %u q=%u not bound "
+                              "to an enabled RUNNER_GRP + QM-fed BBH_TX - dropped\n",
+                              s->tx.idx, flq);
+                fpm_free(s, token);
+                s->tx.idx = (s->tx.idx + 1) % s->tx.depth;
+                continue;
+            }
+        }
+
         buf_pa = fpm_token_to_phys(s, token);
         frame = g_malloc(len);
         if (dma_memory_read(as, buf_pa, frame, len,
                             MEMTXATTRS_UNSPECIFIED) == MEMTX_OK) {
-            qemu_log("bcm4916-runner: TX emit idx=%u len=%u token=0x%x buf=0x%" PRIx64 "\n", s->tx.idx, len, token, buf_pa);
+            qemu_log("bcm4916-runner: TX emit%s idx=%u len=%u token=0x%x buf=0x%" PRIx64 "\n",
+                     route_a ? "(route_a)" : "", s->tx.idx, len, token, buf_pa);
             qemu_send_packet(qemu_get_queue(s->nic), frame, len);
+            if (route_a) {
+                s->route_a_egress++;
+            }
         }
 
         /* free the FPM token back to the pool */
@@ -1099,13 +1194,27 @@ static uint64_t runner_read(void *opaque, hwaddr addr, unsigned size)
      *   NATC base + 0x00 : off_hits (frames HW-forwarded, CPU bypassed)
      *   NATC base + 0x08 : off_misses (frames sent to CPU slow path)
      */
-    if (addr >= XRDP_OFF_NATC && addr < XRDP_OFF_NATC + 0x10) {
+    if (addr >= XRDP_OFF_NATC && addr < XRDP_OFF_NATC + 0x18) {
         hwaddr off = addr - XRDP_OFF_NATC;
         switch (off) {
         case 0x00: return (uint32_t)s->off_hits;
         case 0x08: return (uint32_t)s->off_misses;
+        case 0x10: return (uint32_t)s->route_a_egress;  /* Route A frames egressed */
         default:   return 0;
         }
+    }
+
+    /* QM block (Route A): the gen-2 SRAM auto-init completes instantly here, so
+     * the driver's MEM_INIT_DONE poll returns immediately. */
+    if (addr >= XRDP_OFF_QM && addr < XRDP_OFF_QM + 0x1000) {
+        hwaddr off = addr - XRDP_OFF_QM;
+        if (off == QM_MEM_AUTO_INIT_STS) {
+            return s->qm_mem_init ? 1 : 0;   /* MEM_INIT_DONE */
+        }
+        if (off == QM_ENABLE_CTRL) {
+            return s->qm_enable;
+        }
+        return 0;
     }
 
     /*
@@ -1179,6 +1288,43 @@ static void runner_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         default:
             return;
         }
+    }
+
+    /* QM block (Route A): track runner_qm_init() so tx_kick can confirm the
+     * egress path is configured. Plain writel's - val is the driver's value. */
+    if (addr >= XRDP_OFF_QM && addr < XRDP_OFF_QM + 0x1000) {
+        hwaddr off = addr - XRDP_OFF_QM;
+        if (off == QM_MEM_AUTO_INIT) {
+            s->qm_mem_init = !!(val & 1);
+        } else if (off == QM_ENABLE_CTRL) {
+            s->qm_enable = (uint32_t)val;
+        } else if (off >= QM_RUNNER_GRP_BASE &&
+                   off < QM_RUNNER_GRP_BASE +
+                         QM_NUM_GROUPS * QM_RUNNER_GRP_STRIDE) {
+            uint32_t g = (off - QM_RUNNER_GRP_BASE) / QM_RUNNER_GRP_STRIDE;
+            uint32_t r = (off - QM_RUNNER_GRP_BASE) % QM_RUNNER_GRP_STRIDE;
+            if (r == QM_RGRP_QUEUE_CONFIG) {
+                s->qm_grp[g].start = val & 0x1ff;
+                s->qm_grp[g].end   = (val >> 16) & 0x1ff;
+            } else if (r == QM_RGRP_RNR_CONFIG) {
+                s->qm_grp[g].bb_id = val & 0x3f;
+                s->qm_grp[g].task  = (val >> 8) & 0xf;
+                s->qm_grp[g].en    = !!(val & (1u << 16));
+            }
+        }
+        return;
+    }
+
+    /* BBH_TX block (Route A): track the QMQ bits the driver sets per instance. */
+    if (addr >= XRDP_OFF_BBH_TX0 &&
+        addr < XRDP_OFF_BBH_TX0 + XRDP_BBH_TX_INSTANCES * XRDP_BBH_TX_STRIDE) {
+        hwaddr rel = addr - XRDP_OFF_BBH_TX0;
+        uint32_t inst = rel / XRDP_BBH_TX_STRIDE;
+        hwaddr off = rel % XRDP_BBH_TX_STRIDE;
+        if (off == BBH_TX_QMQ_LAN || off == BBH_TX_QMQ_UNIFIED) {
+            s->bbh_qmq[inst] |= (uint32_t)val & 0x3;
+        }
+        return;
     }
 
     /*
