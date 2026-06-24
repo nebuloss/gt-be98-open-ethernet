@@ -83,6 +83,54 @@
 #define QM_ENABLE_CTRL_STOCK	0x307		/* full stock enable (matches silicon) */
 
 /* ----------------------------------------------------------------------------
+ * Route A (opt-in, module param route_a=1): QM + TM-core egress so an injected
+ * CPU_TX PD actually reaches BBH_TX. The stock image_2 CPU_TX thread routes PDs
+ * through the egress dispatcher to a TM/QM Runner core, NOT directly to BBH_TX
+ * (that direct path is CFE2/image_0 only) - so the open slow-path TX freezes at
+ * read_idx=3 until we (1) init the QM incl. the gen-2 SRAM auto-init that makes
+ * ENABLE_CTRL=0x307 safe, (2) bind a QM queue range to the TM core via a
+ * RUNNER_GRP, (3) set BBH_TX to take that queue from the QM aggregator (QMQ=1),
+ * and (4) mark the CPU_TX descriptor is_egress + target queue.
+ *
+ * Offsets + field bits VERIFIED vs BCM6813/autogen/XRDP_AG.h. Values marked
+ * ★SILICON live only in rdpa.ko and are exposed as module params, to be pinned
+ * by devmem oracle capture on the live stock slot2 (the technique that pinned
+ * DSPTCHR VIQ 13). Full spec: re-notes/realhw/11-route-a-egress-spec.md.
+ * -------------------------------------------------------------------------- */
+#define QM_GLOBAL_SW_RST_CTRL		0x004
+#define QM_GLOBAL_FPM_CONTROL		0x00c
+#define QM_GLOBAL_AGGREGATION_CTRL	0x02c
+#define QM_GLOBAL_FPM_BASE_ADDR		0x034	/* 256B-res phys of the RDP DDR pool */
+#define QM_GLOBAL_FPM_COHERENT_BASE_ADDR 0x038
+#define QM_GLOBAL_DDR_SOP_OFFSET	0x03c
+#define QM_GLOBAL_DDR_SOP_OFFSET_VAL	18	/* gen-1 starting value */
+/* gen-2 QM SRAM auto-init - MUST run before ENABLE_CTRL or fpm_prefetch reads
+ * garbage and hangs the SoC (the prior 0x307 hang). [XRDP_AG.h:693/19115] */
+#define QM_GLOBAL_MEM_AUTO_INIT		0x138
+#define QM_GLOBAL_MEM_AUTO_INIT_EN	BIT(0)	/* MEM_INIT_EN */
+#define QM_GLOBAL_MEM_AUTO_INIT_STS	0x13c
+#define QM_GLOBAL_MEM_AUTO_INIT_DONE	BIT(0)	/* MEM_INIT_DONE [XRDP_AG.h:723] */
+#define QM_FPM_POOLS_THR		0x200
+/* RUNNER_GRP: 15 groups (REG_RAM_CNT 0xf), stride 0x10, 4 regs/group.
+ * [XRDP_AG.h:19157-19173] */
+#define QM_RUNNER_GRP_BASE		0x300
+#define QM_RUNNER_GRP_STRIDE		0x10
+#define QM_RUNNER_GRP_RNR_CONFIG	0x00	/* RNR_BB_ID[5:0] RNR_TASK[11:8] EN[16] */
+#define QM_RUNNER_GRP_QUEUE_CONFIG	0x04	/* START_QUEUE[8:0] END_QUEUE[24:16] */
+#define QM_RUNNER_GRP_PDFIFO_CONFIG	0x08
+#define QM_RUNNER_GRP_UPDATE_FIFO_CONFIG 0x0c
+#define QM_RNR_CFG_RNR_BB_ID_MASK	0x3f	/* [5:0] */
+#define QM_RNR_CFG_RNR_TASK_SHIFT	8	/* [11:8] */
+#define QM_RNR_CFG_RNR_TASK_MASK	0xf
+#define QM_RNR_CFG_RNR_ENABLE		BIT(16)
+#define QM_QUEUE_CFG_START_SHIFT	0	/* [8:0] */
+#define QM_QUEUE_CFG_END_SHIFT		16	/* [24:16] */
+#define QM_QUEUE_CFG_QUEUE_MASK		0x1ff	/* 9-bit queue id */
+/* per-group register address helper (relative to the QM block base) */
+#define QM_RUNNER_GRP_REG(grp, reg) \
+	(QM_RUNNER_GRP_BASE + (u32)(grp) * QM_RUNNER_GRP_STRIDE + (reg))
+
+/* ----------------------------------------------------------------------------
  * RNR_REGS per-core control block (base XRDP_OFF_RNR_REGS0 + core*stride).
  * Offsets/values pinned vs BCM6813 rdpa.ko + CFE2 data_path_init / rdp_drv_rnr.c
  * (re-notes/realhw/10-runner-bringup-spec.md secs 1, Wave-3/6). Bring-up step 2.
@@ -199,6 +247,17 @@
 #define BBH_TX_MACTYPE		0x00	/* = 1 (GPON; 7 is invalid) */
 #define BBH_TX_MACTYPE_VAL	1
 #define BBH_TX_BBCFG_1		0x04	/* FPMSRC[31:24], SBPMSRC[23:16] */
+/* Route A BBH_TX runner/QM-fed binding (the fields the slow-path TX omits).
+ * [offsets/fields vs BCM6813/autogen/XRDP_AG.h:20757..20953; spec sec B] */
+#define BBH_TX_BBCFG_2		0x08	/* PDRNR{0..3}SRC = BB_ID of feeding TM core(s) */
+#define BBH_TX_RNRCFG_2_0	0x60	/* PTRADDR[15:0]=TM egr-cnt-tbl>>3, TASK[19:16] */
+#define BBH_TX_RNRCFG_2_TASK_SHIFT 16
+#define BBH_TX_Q2RNR_LAN	0x400	/* LAN single: Q0[1:0] Q1[3:2] runner-core sel */
+#define BBH_TX_QMQ_LAN		0x4b0	/* LAN single: Q0[0] Q1[1] - 1=QM-fed */
+#define BBH_TX_Q2RNR_UNIFIED	0x700	/* unified pair-indexed */
+#define BBH_TX_QMQ_UNIFIED	0x7b0	/* unified pair-indexed: Q0[0] Q1[1] */
+#define BBH_TX_QMQ_Q0		BIT(0)
+#define BBH_TX_QMQ_Q1		BIT(1)
 
 /* ----------------------------------------------------------------------------
  * 1G MAC/PHY: UNIMAC + internal EGPHY (the "eth2"=port_gphy1 first-light port).
@@ -504,6 +563,8 @@ struct runner_tx_desc {
 
 /* word0 (host LE order, post-swap) */
 #define TXD_W0_IS_EGRESS	BIT(31)			/* bit31 */
+#define TXD_W0_FIRST_LEVEL_Q_SHIFT 22			/* bits [30:22] egress_or_ingress_1 */
+#define TXD_W0_FIRST_LEVEL_Q_MASK  0x1ff		/* 9-bit target QM queue (Route A) */
 #define TXD_W0_PKT_LEN_SHIFT	8			/* bits [21:8], width 14 */
 #define TXD_W0_PKT_LEN_MASK	0x3fff
 #define TXD_W0_SKB_PTR_HI_MASK	0xff			/* bits [7:0] = sk_buf phys[39:32] */

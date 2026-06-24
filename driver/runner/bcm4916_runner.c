@@ -144,6 +144,38 @@ static uint serdes_lane;	/* lane within the core */
 module_param(serdes_lane, uint, 0444);
 MODULE_PARM_DESC(serdes_lane, "merlin16 SerDes lane index for the 10G port (default 0).");
 
+/* ---- Route A: QM + TM-core egress (opt-in; see bcm4916_runner.h + spec 11) --
+ * route_a brings up the QM + a RUNNER_GRP + BBH_TX QMQ binding so an injected
+ * CPU_TX PD egresses out a LAN port (the stock image_2 thread routes through the
+ * TM/QM cores, not direct-to-BBH). The ★SILICON values below are rdpa.ko-only;
+ * defaults are gen-1/CFE starting points and MUST be pinned by devmem oracle
+ * capture on the live stock slot2 before expecting a real egress. */
+static bool route_a;
+module_param(route_a, bool, 0444);
+MODULE_PARM_DESC(route_a,
+		 "Bring up QM + TM-core egress so CPU_TX PDs reach BBH_TX (opt-in, "
+		 "HW only). Needs the route_a_* values pinned from a stock oracle.");
+
+static uint route_a_grp;	/* ★SILICON RUNNER_GRP index that drains the LAN queue */
+module_param(route_a_grp, uint, 0444);
+MODULE_PARM_DESC(route_a_grp, "QM RUNNER_GRP index for LAN egress (oracle).");
+
+static uint route_a_queue;	/* ★SILICON QM queue number for the LAN egress */
+module_param(route_a_queue, uint, 0444);
+MODULE_PARM_DESC(route_a_queue, "QM queue number for LAN egress (oracle).");
+
+static uint route_a_tm_bb_id;	/* ★SILICON BB_ID of the TM Runner core */
+module_param(route_a_tm_bb_id, uint, 0444);
+MODULE_PARM_DESC(route_a_tm_bb_id, "BB_ID of the TM Runner core draining the queue (oracle).");
+
+static uint route_a_tm_task;	/* ★SILICON TM core egress thread number */
+module_param(route_a_tm_task, uint, 0444);
+MODULE_PARM_DESC(route_a_tm_task, "TM-core egress thread number (oracle).");
+
+static uint route_a_bbh_inst;	/* ★SILICON BBH_TX instance for the LAN port */
+module_param(route_a_bbh_inst, uint, 0444);
+MODULE_PARM_DESC(route_a_bbh_inst, "BBH_TX instance index for the LAN egress port (default 0).");
+
 /* ------------------------------------------------------------------------- */
 struct runner_priv {
 	struct platform_device	*pdev;
@@ -549,8 +581,13 @@ static netdev_tx_t runner_start_xmit(struct sk_buff *skb,
 
 	/* build descriptor in host order, then byte-swap into ring (ABI 2.2) */
 	d = &p->tx_ring[p->tx_write_idx];
+	/* word0: is_egress + length; when Route A is up also set first_level_q so the
+	 * TM core enqueues the PD to the QM queue bound to BBH_TX (else the queue is
+	 * resolved from the vport tx-flow table, which needs the QoS table - ★SILICON). */
 	d->word0 = cpu_to_be32(TXD_W0_IS_EGRESS |
-			       ((len & TXD_W0_PKT_LEN_MASK) << TXD_W0_PKT_LEN_SHIFT));
+			       ((len & TXD_W0_PKT_LEN_MASK) << TXD_W0_PKT_LEN_SHIFT) |
+			       (route_a ? ((route_a_queue & TXD_W0_FIRST_LEVEL_Q_MASK)
+					   << TXD_W0_FIRST_LEVEL_Q_SHIFT) : 0));
 	d->word1 = 0;
 	/*
 	 * is_emac=1 (UNIMAC egress for the dumb-pipe CPU port), abs=0 (FPM token
@@ -1000,6 +1037,80 @@ static void runner_dsptchr_cpu_tx_setup(struct runner_priv *p)
 		 DSPTCHR_EGRS_DLY_QM_CRDT_VAL);
 }
 
+/*
+ * Route A QM bring-up (opt-in). Makes the QM safe to enable and binds one queue
+ * to the TM core that drains it into BBH_TX. The gen-2 SRAM auto-init is THE step
+ * that makes ENABLE_CTRL=0x307 safe: without it fpm_prefetch reads uninitialised
+ * SRAM and hangs the SoC (the prior 0x307 hang). RUNNER_GRP / queue / TM-core
+ * values are ★SILICON (module params from a stock devmem oracle).
+ * [spec re-notes/realhw/11-route-a-egress-spec.md secs A+C; XRDP_AG.h offsets.]
+ */
+static void runner_qm_init(struct runner_priv *p)
+{
+	void __iomem *qm = p->xrdp + XRDP_OFF_QM;
+	u32 grpoff = QM_RUNNER_GRP_REG(route_a_grp, 0);
+	u32 en;
+	int i;
+
+	/* 1. gen-2 QM SRAM auto-init - MUST precede enable; poll MEM_INIT_DONE. */
+	writel(QM_GLOBAL_MEM_AUTO_INIT_EN, qm + QM_GLOBAL_MEM_AUTO_INIT);
+	for (i = 0; i < 1000; i++) {
+		if (readl(qm + QM_GLOBAL_MEM_AUTO_INIT_STS) &
+		    QM_GLOBAL_MEM_AUTO_INIT_DONE)
+			break;
+		udelay(10);
+	}
+	if (i == 1000)
+		dev_warn(p->dev, "route_a: QM SRAM auto-init did not signal DONE\n");
+
+	/* 2. FPM base = the DDR packet pool FPM manages (256B units) + DDR SOP. */
+	writel((u32)(p->pool_pbase >> 8), qm + QM_GLOBAL_FPM_BASE_ADDR);
+	writel(QM_GLOBAL_DDR_SOP_OFFSET_VAL, qm + QM_GLOBAL_DDR_SOP_OFFSET);
+
+	/* 3. bind a RUNNER_GRP: queue range [Q,Q] -> TM core bb_id/task, enabled.
+	 *    This IS the TM-core wakeup path (no extra DSPTCHR VIQ needed - the QM
+	 *    issues the credit/wakeup to the TM task via its UPDATE_FIFO). */
+	writel(((route_a_queue & QM_QUEUE_CFG_QUEUE_MASK) << QM_QUEUE_CFG_START_SHIFT) |
+	       ((route_a_queue & QM_QUEUE_CFG_QUEUE_MASK) << QM_QUEUE_CFG_END_SHIFT),
+	       qm + grpoff + QM_RUNNER_GRP_QUEUE_CONFIG);
+	writel((route_a_tm_bb_id & QM_RNR_CFG_RNR_BB_ID_MASK) |
+	       ((route_a_tm_task & QM_RNR_CFG_RNR_TASK_MASK) << QM_RNR_CFG_RNR_TASK_SHIFT) |
+	       QM_RNR_CFG_RNR_ENABLE,
+	       qm + grpoff + QM_RUNNER_GRP_RNR_CONFIG);
+
+	/* 4. enable the QM now that SRAM/FPM/grp are configured (full stock 0x307). */
+	en = qm_enable ? qm_enable : QM_ENABLE_CTRL_STOCK;
+	writel(en, qm + QM_GLOBAL_QM_ENABLE_CTRL);
+	dev_info(p->dev,
+		 "route_a: QM up (enable=0x%x grp=%u queue=%u tm_bb=%u tm_task=%u fpm_base=0x%x)\n",
+		 en, route_a_grp, route_a_queue, route_a_tm_bb_id, route_a_tm_task,
+		 (u32)(p->pool_pbase >> 8));
+}
+
+/*
+ * Route A BBH_TX binding (opt-in): make the LAN BBH_TX instance take its target
+ * queue from the QM aggregator (QMQ=1) and name the feeding TM core. These are
+ * the fields the plain slow-path BBH_TX setup omits. [spec sec B; XRDP_AG.h.]
+ */
+static void runner_bbh_tx_route_a(struct runner_priv *p)
+{
+	void __iomem *tx = p->xrdp + XRDP_OFF_BBH_TX0 +
+			   (u32)route_a_bbh_inst * XRDP_BBH_TX_STRIDE;
+
+	/* feeding TM-core BB-id (PDRNR0SRC) so BBH_TX accepts its PDs */
+	writel(route_a_tm_bb_id & 0x3f, tx + BBH_TX_BBCFG_2);
+	/* RNRCFG_2[0]: TASK = TM egress thread. PTRADDR (TM egress-counter table) is
+	 * ★SILICON and left 0 - the QM RUNNER_GRP drives the wakeup regardless. */
+	writel((route_a_tm_task & 0xf) << BBH_TX_RNRCFG_2_TASK_SHIFT,
+	       tx + BBH_TX_RNRCFG_2_0);
+	/* take queue 0 of this BBH from the QM aggregator (both register views) */
+	writel(BBH_TX_QMQ_Q0, tx + BBH_TX_QMQ_LAN);
+	writel(BBH_TX_QMQ_Q0, tx + BBH_TX_QMQ_UNIFIED);
+	dev_info(p->dev,
+		 "route_a: BBH_TX inst%u QM-fed (QMQ q0=1, tm_bb=%u task=%u)\n",
+		 route_a_bbh_inst, route_a_tm_bb_id, route_a_tm_task);
+}
+
 static int runner_dsptchr_init(struct runner_priv *p)
 {
 	void __iomem *d = p->xrdp + XRDP_OFF_DSPTCHR;
@@ -1018,10 +1129,15 @@ static int runner_dsptchr_init(struct runner_priv *p)
 	 * grant but never re-arms, so CPU_TX stalls with credit pinned. Stock
 	 * writes 0x307 here (verified). No QM queue/context config is needed for
 	 * the runner-fed BBH_TX slow path. [CFE2 rdp_block_enable qm_enable_ctrl]
+	 *
+	 * When route_a is set, runner_qm_init() owns the QM (full SRAM auto-init +
+	 * RUNNER_GRP + enable, in the correct order) - do NOT write enable here, or
+	 * 0x307 lands before the SRAM auto-init and hangs the SoC.
 	 */
-	if (qm_enable)
+	if (!route_a && qm_enable)
 		writel(qm_enable, p->xrdp + XRDP_OFF_QM + QM_GLOBAL_QM_ENABLE_CTRL);
-	dev_info(p->dev, "bring-up: QM enable_ctrl=0x%x\n", qm_enable);
+	if (!route_a)
+		dev_info(p->dev, "bring-up: QM enable_ctrl=0x%x\n", qm_enable);
 
 	/* let the HW auto-init the free linked list, then enable the reorder
 	 * engine; poll RDY (bit8). (Hand-seeding 1024 nodes is the alternative.) */
@@ -1645,6 +1761,10 @@ static int runner_probe(struct platform_device *pdev)
 		return ret;
 	runner_sbpm_init(p);
 	runner_dsptchr_init(p);
+	/* Route A (opt-in): full QM bring-up (SRAM auto-init + RUNNER_GRP + enable)
+	 * so the TM core can drain a queue into BBH_TX. FPM/SBPM are already up. */
+	if (route_a)
+		runner_qm_init(p);
 	ret = rx_ring_alloc(p);
 	if (ret)
 		return ret;
@@ -1663,6 +1783,8 @@ static int runner_probe(struct platform_device *pdev)
 	if (!runner_emulated && serdes_fw_load)
 		runner_serdes_load(p);		/* 10G XPORT merlin16 fw (opt-in, step 1) */
 	runner_bbh_init(p, RUNNER_FIRST_PORT);
+	if (route_a)
+		runner_bbh_tx_route_a(p);	/* QMQ=1 binding so the TM core's queue egresses */
 	runner_thread_regfile_init(p);	/* CPU thread initial registers (post-zero, pre-enable) */
 	runner_rnr_enable(p);		/* CFG_GLOBAL_CTRL.EN + cpu_wakeup, LAST */
 
