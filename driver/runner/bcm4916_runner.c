@@ -147,9 +147,14 @@ MODULE_PARM_DESC(serdes_lane, "merlin16 SerDes lane index for the 10G port (defa
 /* ---- Route A: QM + TM-core egress (opt-in; see bcm4916_runner.h + spec 11) --
  * route_a brings up the QM + a RUNNER_GRP + BBH_TX QMQ binding so an injected
  * CPU_TX PD egresses out a LAN port (the stock image_2 thread routes through the
- * TM/QM cores, not direct-to-BBH). The ★SILICON values below are rdpa.ko-only;
- * defaults are gen-1/CFE starting points and MUST be pinned by devmem oracle
- * capture on the live stock slot2 before expecting a real egress. */
+ * TM/QM cores, not direct-to-BBH). The ★SILICON values below are rdpa.ko-only.
+ *
+ * ★LIVE-PINNED 2026-06-24 (stock oracle, re-notes/realhw/11 "LIVE ORACLE
+ * RESULTS"): the QM-fed LAN egress instance is BBH_TX[1] -> route_a_bbh_inst=1.
+ * Two queue/grp candidates (logical->physical queue map still TBD):
+ *   B (preferred, LAN=DS_TM): route_a_queue~80 route_a_grp=0 tm_bb_id=7 tm_task=3
+ *   A (literal q0,    US_TM): route_a_queue=0  route_a_grp=1 tm_bb_id=6 tm_task=4
+ * Defaults stay 0 (opt-in/safe); pass the candidate set on insmod and iterate. */
 static bool route_a;
 module_param(route_a, bool, 0444);
 MODULE_PARM_DESC(route_a,

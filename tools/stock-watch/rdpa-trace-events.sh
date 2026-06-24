@@ -45,9 +45,10 @@ on)
 	echo > "$T/trace" 2>/dev/null
 	if [ "$what" = routea ] || [ "$what" = all ]; then
 		# Route A CPU_TX: the real worker is rdpa_cpu_send_pbuf (the f_rdpa_* /
-		# enet_lan names are data ptrs / DSL-only -> not kprobe-able). queue_id
-		# lives in info @+24 (route_a_queue); pbuf.length @0x16.
-		add cpu_pbuf rdpa_cpu_send_pbuf 'qid=+24(%x0):u32 len=+22(%x1):u16 fpmbn=+16(%x1):u32'
+		# enet_lan names are data ptrs / DSL-only -> not kprobe-able). ★LIVE-
+		# CONFIRMED arg order is (pbuf, info): x0=pbuf, x1=info. queue_id is in
+		# info @+24 (route_a_queue); pbuf.length @0x16.
+		add cpu_pbuf rdpa_cpu_send_pbuf 'qid=+24(%x1):u32 len=+22(%x0):u16 fpmbn=+16(%x0):u32'
 		add cpu_send rdpa_cpu_send_sysb 'sysb=%x0:x64 info=%x1:x64 qid=+24(%x1):u32'
 		add qm_grp   ag_drv_qm_rnr_group_cfg_set \
 			'idx=%x0:u32 start=+0(%x1):u16 end=+2(%x1):u16 bb=+11(%x1):u8 task=+12(%x1):u8 en=+13(%x1):u8'

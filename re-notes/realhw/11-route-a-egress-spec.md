@@ -192,3 +192,50 @@ Rule: FPM+SBPM ready and QM SRAM/FPM/UG/RUNNER_GRP done BEFORE QM enable; QM ena
 **Implementation approach:** code the verified-offset structure now; expose the ★UNKNOWNs as module
 params (like `qm_enable`), default to gen-1/CFE values, and pin them by devmem oracle capture on the
 live stock slot2 (the technique that pinned VIQ 13) before the first real egress test.
+
+---
+
+## ★ LIVE ORACLE RESULTS (2026-06-24, stock rdpa on the kprobe-enabled kernel, trial slot)
+
+Captured READ-ONLY (xrdp_peek.ko MMIO + rdpa_trace.ko kprobes; SSH held throughout, modules
+unloaded clean). Raw in tools/stock-watch (route-a-oracle.sh / rdpa_trace.ko).
+
+**QM global (0x82c00000):** `ENABLE_CTRL = 0x0307` (confirms our value); `MEM_AUTO_INIT_STS@0x13c =
+0x01` MEM_INIT_DONE (confirms our SRAM-auto-init poll); FPM_BASE@0x34 = 0x006d0000. → resolves
+open-items G1, G5/G6 direction (0x307 IS the live value; SRAM auto-init is real + done-bit0).
+
+**QM RUNNER_GRP map** (0x82c00300, stride 0x10; RNR_CONFIG=bb_id[5:0]/task[11:8]/EN[16],
+QUEUE_CONFIG=start[8:0]/end[24:16]) — enabled groups:
+| grp | queues | bb_id | task | TM core |
+|----|--------|-------|------|---------|
+| 1  | 0–79   | 6     | 4    | core6 US_TM |
+| 0  | 80–111 | 7     | 3    | core7 DS_TM |
+| 9  | 112–143| 0     | 7    | (img0) |
+| 3  | 145    | 3     | 1    | |
+| 6  | 146–148| 3     | 3    | |
+| 7  | 149–151| 4     | 1    | |
+| 10 | 154–155| 1     | 0    | |
+| 14 | 158    | 3     | 4    | |
+FIRST_QUEUE_MAPPING confirms: DS_TM core7 first-queue=0x50=80 (✓grp0), US_TM core6 first-queue=0
+(✓grp1). bb_id == RNR core number.
+
+**BBH_TX QMQ (unified @0x7b0):** BBH0=0, **BBH1=0x01 (Q0 QM-fed)**, BBH2=0, BBH3=unused. → the
+QM-fed LAN egress instance is **BBH_TX[1]** (MACTYPE=1). BBH0 is runner-fed (QMQ=0, RNRCFG_2
+populated 6e04/2807…) — a different port. So **route_a_bbh_inst = 1**.
+
+**CPU_TX (rdpa_cpu_send_pbuf kprobe):** ★arg order is **(pbuf, info)** not (info, pbuf) — x0=pbuf,
+x1=info (RE was reversed; fixed in rdpa_trace.c). Locally-originated CPU→LAN mgmt frames show
+`info.queue_id = 0` (a LOGICAL/port-relative rdpa queue, NOT necessarily physical QM queue 0).
+
+**Pinned params (candidates — bbh_inst solid; queue/grp pending the logical→physical map):**
+- `route_a_bbh_inst = 1` ✓ (BBH_TX[1] is the only QM-fed instance).
+- Candidate **B (preferred — LAN=downstream→DS_TM):** `route_a_queue ≈ 80` (in grp0 80–111),
+  `route_a_grp = 0`, `route_a_tm_bb_id = 7`, `route_a_tm_task = 3`.
+- Candidate **A (literal logical q0→US_TM):** `route_a_queue = 0`, `route_a_grp = 1`,
+  `route_a_tm_bb_id = 6`, `route_a_tm_task = 4`.
+
+**Still to resolve (G2/G4 — the logical→physical queue map):** the exact physical QM queue for
+port_gphy1's CPU-TX egress (port-relative q0 → which global queue in 80–111). Options: a refined
+kprobe reading the port_obj→queue base, OR empirical — the driver's route_a_* are module params, so
+try candidate B then A in the actual egress test (start_xmit first_level_q = route_a_queue). Also
+unconfirmed: that BBH_TX[1] is the instance for port_gphy1 (our RUNNER_FIRST_PORT) specifically.

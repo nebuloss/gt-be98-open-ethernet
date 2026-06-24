@@ -94,16 +94,18 @@ static struct trace_probe probes[] = {
 	 * rdpa_cpu_send_pbuf (in rdpa.ko). Symbols/offsets verified vs rdpa.ko nm +
 	 * rdpa_gpl/include headers (RE agent acff6c80). */
 	{
-		/* rdpa_cpu_send_pbuf(const rdpa_cpu_tx_info_t *info, pbuf_t *pbuf) -
-		 * last kprobe-able fn before the (static-inline) ring-desc writer.
-		 * info->...queue_id @ +24 = the egress QM queue (route_a_queue).
-		 * pbuf: fpm_bn@0x10, length u16@0x16, flags@0x18. */
+		/* rdpa_cpu_send_pbuf - last kprobe-able fn before the (static-inline)
+		 * ring-desc writer. ★LIVE-CONFIRMED 2026-06-24 the arg order is
+		 * (pbuf_t *pbuf, const rdpa_cpu_tx_info_t *info) - i.e. x0=pbuf,
+		 * x1=info (the RE's cross-tree (info,pbuf) was reversed; verified by
+		 * x1 matching the info ptr rdpa_cpu_send_sysb passes). info->queue_id
+		 * @ +24 = egress QM queue; pbuf: fpm_bn@0x10, len u16@0x16, flags@0x18. */
 		.sym = "rdpa_cpu_send_pbuf", .group = GRP_ROUTEA, .nregs = 2,
-		.desc = "CPU_TX worker: x0=info(queue_id@+24), x1=pbuf(len@0x16)",
+		.desc = "CPU_TX worker: x0=pbuf(len@0x16), x1=info(queue_id@+24)",
 		.deref = {
-			{ .arg = 0, .off = 24,   .len = 8,  .label = "info.queue_id/wanflow@+24" },
-			{ .arg = 0, .off = 0,    .len = 8,  .label = "info.method/.. @0" },
-			{ .arg = 1, .off = 0x10, .len = 10, .label = "pbuf.fpm_bn/off/len/flags@0x10" },
+			{ .arg = 1, .off = 24,   .len = 8,  .label = "info.queue_id/wanflow@+24" },
+			{ .arg = 1, .off = 8,    .len = 8,  .label = "info.port_obj@+8" },
+			{ .arg = 0, .off = 0x10, .len = 10, .label = "pbuf.fpm_bn/off/len/flags@0x10" },
 		},
 	},
 	{
