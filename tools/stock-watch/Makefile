@@ -1,19 +1,31 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Out-of-tree build of the Stage A read-only NAT-C DDR dumper (natc_dump.ko).
+# Out-of-tree build of the read-only stock-stack RE tools:
+#   natc_dump.ko  - dump the live NAT-C table (kallsyms + probe_kernel_read)
+#   xrdp_peek.ko  - read XRDP registers/SRAM (ioremap MMIO, opt-in)
+#   rdpa_trace.ko - kprobe the stock rdpa control plane (NEEDS CONFIG_KPROBES=y)
 #
 # MIRRORS the WiFi effort's tools/dhd-kprobe-trace/Makefile: same KDIR / TC
 # absolute paths, same cross-toolchain, same BUILD_NAME workaround. vermagic
-# must match the running device kernel EXACTLY (CONFIG_KPROBES off, FTRACE off,
-# CONFIG_KALLSYMS=y).
+# must match the RUNNING device kernel EXACTLY (CONFIG_KALLSYMS=y always).
+#
+# ★ rdpa_trace.ko requires CONFIG_KPROBES=y. As of 2026-06-24 the SDK kernel
+#   .config HAS CONFIG_KPROBES=y + CONFIG_KALLSYMS_ALL=y (added to
+#   hostTools/scripts/defconfig-bcm.template), so the DEFAULT $(KDIR) builds a
+#   real (non-stub) rdpa_trace.ko. vermagic must match the kernel you BOOT for
+#   the trace session - rebuild against that exact tree if it differs.
+#   (CONFIG_FTRACE is still off -> CONFIG_KPROBE_EVENTS/tracefs path is likely
+#   unavailable; the .ko is the primary tool, rdpa-trace-events.sh the fallback.)
 #
 # Usage (run on dev-build, NOT dev-code):
-#   make            # build natc_dump.ko against $(KDIR) with $(CROSS_COMPILE)
+#   make            # build all .ko against $(KDIR) with $(CROSS_COMPILE)
 #   make clean
 #
 # Override KDIR / TC / CROSS_COMPILE / ARCH on the command line as needed.
 
 obj-m += natc_dump.o
+obj-m += xrdp_peek.o
+obj-m += rdpa_trace.o
 
 # Point SDK at your local asuswrt-merlin.ng 4916 "behnd" checkout (the WiFi
 # effort's 4.19.294 KDIR has Module.symvers). KDIR/TC default off $(SDK).

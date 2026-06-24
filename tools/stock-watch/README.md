@@ -74,3 +74,43 @@ Stage A + the GPL SDK struct source fully pinned both UNKNOWNs, so Stage B was n
 attempted. If ever needed (e.g. to catch a NAT/VLAN flow being created live), it
 would hook `pktrunner_ucast_cmdlist_create` / `addIpv4Commands` / the natc-add via
 text-patch trampolines (kprobes are unavailable on this kernel).
+
+## Stage C — `rdpa_trace.ko` (live kprobe tracer) [READY, pending device window]
+
+★ **kprobes are now available.** As of 2026-06-24 the SDK kernel is built with
+**CONFIG_KPROBES=y** + CONFIG_KALLSYMS_ALL=y (added to
+`hostTools/scripts/defconfig-bcm.template`; see `docs/custom-kernel-howto.md` §2b
+for how config changes are made durable). This supersedes the "kprobes
+unavailable" notes above for any device booting that kprobe-enabled kernel — Stage
+B-style live interception is now a `register_kprobe` module, no text-patching.
+
+`rdpa_trace.ko` registers read-only pre-handler kprobes on stock rdpa functions and
+hex-dumps their arg registers (+ optional struct-field derefs via
+`probe_kernel_read`) to dmesg. rdpa ships as modules, so its symbols are in
+kallsyms once loaded. Two probe groups:
+- **`grp=1` Route A** — `f_rdpa_cpu_tx_port_enet_lan` (x1 = `egress_queue` = the
+  LAN QM queue == `route_a_queue`; the per-packet oracle a static snapshot can't
+  get), `rdpa_cpu_send_sysb`, `ag_drv_qm_rnr_group_cfg_set`.
+- **`grp=2` offload control plane** — `f_rdpa_cpu_tx_flow_cache_offload` + the
+  flow-add / NAT-C-add / cmdlist-build path (symbols/struct-offsets being filled
+  from the SDK RE map; TODO markers in the source).
+
+### Safety (live management link — same rules as Stage A)
+Pre-handlers only, no writes, struct reads via `probe_kernel_read` (fault-tolerant).
+**Per-probe hit cap** (`max_hits=16` default): per-packet hooks would otherwise
+flood dmesg + add latency. Arm ONE group at a time (`grp=`). `rmmod` unregisters
+everything; nothing is patched. Keep the deadman armed (it traces the live stock
+datapath on the trial slot).
+
+### Build + use
+```sh
+make                              # builds against the (now kprobe-y) SDK $(KDIR);
+                                  # vermagic must match the BOOTED kprobe kernel.
+strings rdpa_trace.ko | grep vermagic
+# on the device (kprobe kernel booted, stock rdpa loaded):
+insmod rdpa_trace.ko grp=1        # Route A; then `ping` a LAN host
+dmesg | grep RDPATRACE            # x1 of lan_tx = the egress_queue
+rmmod rdpa_trace
+```
+`rdpa-trace-events.sh` is the no-module tracefs equivalent, but needs
+CONFIG_KPROBE_EVENTS (depends on CONFIG_FTRACE, currently OFF) — so prefer the .ko.
