@@ -32,6 +32,8 @@ docs/recovery-plan.md
 docs/build-env.md
 # live-test-runbook references device recovery internals (slots/U-Boot/watchdog)
 docs/live-test-runbook.md
+# custom-kernel-howto references device recovery internals (slots/bcm_bootstate/deadman)
+docs/custom-kernel-howto.md
 # extract-runner-microcode documents proprietary microcode symbol offsets
 tools/extract-runner-microcode.sh
 
