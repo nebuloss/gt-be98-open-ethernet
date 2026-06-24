@@ -44,18 +44,24 @@ case "${1:-on}" in
 on)
 	echo > "$T/trace" 2>/dev/null
 	if [ "$what" = routea ] || [ "$what" = all ]; then
-		# Route A: per-packet CPU_TX egress_queue (x1) + port (x2); QM grp set.
-		add lan_tx   f_rdpa_cpu_tx_port_enet_lan 'egq=%x1:u32 port=%x2:x64'
-		add cpu_send rdpa_cpu_send_sysb          'sysb=%x0:x64 info=%x1:x64'
-		add qm_grp   ag_drv_qm_rnr_group_cfg_set 'rnr_idx=%x0:u32 cfg=%x1:x64'
-		# TODO: + start=+0(%x1):u32 end=+4(%x1):u32 bb=+8(%x1):u32 task=... once
-		#       the qm_rnr_group_cfg struct offsets are pinned from the RE map.
+		# Route A CPU_TX: the real worker is rdpa_cpu_send_pbuf (the f_rdpa_* /
+		# enet_lan names are data ptrs / DSL-only -> not kprobe-able). queue_id
+		# lives in info @+24 (route_a_queue); pbuf.length @0x16.
+		add cpu_pbuf rdpa_cpu_send_pbuf 'qid=+24(%x0):u32 len=+22(%x1):u16 fpmbn=+16(%x1):u32'
+		add cpu_send rdpa_cpu_send_sysb 'sysb=%x0:x64 info=%x1:x64 qid=+24(%x1):u32'
+		add qm_grp   ag_drv_qm_rnr_group_cfg_set \
+			'idx=%x0:u32 start=+0(%x1):u16 end=+2(%x1):u16 bb=+11(%x1):u8 task=+12(%x1):u8 en=+13(%x1):u8'
+		add bbh_qmq  ag_drv_bbh_tx_unified_configurations_qmq_set 'bbh=%x0:u8 idx=%x1:u8 q0=%x2:u8 q1=%x3:u8'
 	fi
 	if [ "$what" = offload ] || [ "$what" = all ]; then
-		# Offload control plane (symbols/offsets filled from the RE agent map).
-		add fc_off f_rdpa_cpu_tx_flow_cache_offload 'sysb=%x0:x64 rxq=%x1:u32 dirty=%x2:u32'
-		# TODO(offload): flow create/add, drv_natc_*_ctx_add (key+ctx derefs),
-		#                cmdlist builder - add p: lines from the RE map.
+		# Offload control plane (symbols verified vs rdpa.ko nm).
+		add ucast_add ucast_attr_flow_add 'mo=%x0:x64 flow=%x2:x64'
+		add natc_add  drv_natc_key_result_entry_var_size_ctx_add \
+			'tbl=%x0:u8 key=%x2:x64 ctx=%x3:x64 idxp=%x4:x64'
+		add cmdlist   rdpa_cmd_list_update_context 'params=%x0:x64 len=+28(%x0):u32'
+		add rdd_add   rdd_connection_entry_add 'a0=%x0:x64 a1=%x1:x64'
+		# struct-buffer bytes (natc key/ctx, cmdlist) are easier via rdpa_trace.ko
+		# (probe_kernel_read hexdumps); kprobe_events scalars shown here.
 	fi
 	echo "enabled. generate traffic, then: $0 show"
 	;;
@@ -64,7 +70,7 @@ show)
 	;;
 off)
 	# disable + clear all our kprobes
-	for e in lan_tx cpu_send qm_grp fc_off; do
+	for e in cpu_pbuf cpu_send qm_grp bbh_qmq ucast_add natc_add cmdlist rdd_add; do
 		echo 0 > "$T/events/kprobes/$e/enable" 2>/dev/null
 	done
 	echo > "$KE" 2>/dev/null

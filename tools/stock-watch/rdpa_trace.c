@@ -55,14 +55,16 @@ module_param(max_hits, int, 0444);
 MODULE_PARM_DESC(max_hits, "per-probe print cap (hot paths flood dmesg); 0 = unlimited");
 
 /* up to this many struct-deref dumps per probe entry */
-#define MAX_DEREF 3
+#define MAX_DEREF 4
 /* bytes to dump per struct deref (clamped) */
 #define DEREF_MAX 64
 
 struct deref_spec {
-	int  arg;		/* which arg register holds the pointer (0..7) */
+	int  arg;		/* which arg register holds the base pointer (0..7) */
 	int  off;		/* byte offset into the pointed-at struct */
 	int  len;		/* bytes to read (<= DEREF_MAX) */
+	bool chase;		/* if set: read a pointer at (arg+off), dump len from *that*
+				 * (for a buffer reached via a pointer field, e.g. cmdlist) */
 	const char *label;
 };
 
@@ -86,40 +88,105 @@ struct trace_probe {
  * deref specs from the RE symbol map before the live run.
  */
 static struct trace_probe probes[] = {
-	/* ---- GRP_ROUTEA: CPU_TX egress (per-packet; THE egress_queue oracle) ---- */
+	/* ---- GRP_ROUTEA: CPU_TX egress (per-packet; THE egress_queue oracle) ----
+	 * NB: the f_rdpa_cpu_tx_* / rdpa_cpu_tx_port_enet_lan names are DATA pointers
+	 * or DSL-only -> NOT kprobe-able. The real kprobe-able worker is
+	 * rdpa_cpu_send_pbuf (in rdpa.ko). Symbols/offsets verified vs rdpa.ko nm +
+	 * rdpa_gpl/include headers (RE agent acff6c80). */
 	{
-		/* f_rdpa_cpu_tx_port_enet_lan(sysb, egress_queue, port_obj, extra_info)
-		 * [rdpa_gpl_handwritten.c EXPORT_SYMBOL]. x1 = egress_queue = the LAN
-		 * QM queue number (route_a_queue!); x2 = port_obj. */
-		.sym = "f_rdpa_cpu_tx_port_enet_lan", .group = GRP_ROUTEA, .nregs = 4,
-		.desc = "CPU_TX LAN: x1=egress_queue (route_a_queue), x2=port_obj",
+		/* rdpa_cpu_send_pbuf(const rdpa_cpu_tx_info_t *info, pbuf_t *pbuf) -
+		 * last kprobe-able fn before the (static-inline) ring-desc writer.
+		 * info->...queue_id @ +24 = the egress QM queue (route_a_queue).
+		 * pbuf: fpm_bn@0x10, length u16@0x16, flags@0x18. */
+		.sym = "rdpa_cpu_send_pbuf", .group = GRP_ROUTEA, .nregs = 2,
+		.desc = "CPU_TX worker: x0=info(queue_id@+24), x1=pbuf(len@0x16)",
+		.deref = {
+			{ .arg = 0, .off = 24,   .len = 8,  .label = "info.queue_id/wanflow@+24" },
+			{ .arg = 0, .off = 0,    .len = 8,  .label = "info.method/.. @0" },
+			{ .arg = 1, .off = 0x10, .len = 10, .label = "pbuf.fpm_bn/off/len/flags@0x10" },
+		},
 	},
 	{
-		/* rdpa_cpu_send_sysb(sysb, info) - the generic CPU_TX entry; x1=info
-		 * points at rdpa_cpu_tx_info (port/queue/method). [EXPORT_SYMBOL] */
+		/* rdpa_cpu_send_sysb(bdmf_sysb sysb, const rdpa_cpu_tx_info_t *info) -
+		 * generic CPU_TX entry trampoline; x1=info. [rdpa_gpl EXPORT_SYMBOL] */
 		.sym = "rdpa_cpu_send_sysb", .group = GRP_ROUTEA, .nregs = 2,
 		.desc = "CPU_TX entry: x0=sysb, x1=rdpa_cpu_tx_info*",
-		/* TODO: deref x1 -> {port, queue_id, method} offsets from rdpa_cpu_tx_info */
+		.deref = {
+			{ .arg = 1, .off = 24, .len = 8, .label = "info.queue_id@+24" },
+			{ .arg = 1, .off = 8,  .len = 8, .label = "info.port_obj@+8" },
+		},
 	},
 	{
-		/* ag_drv_qm_rnr_group_cfg_set(rnr_idx, qm_rnr_group_cfg *cfg)
-		 * boot-time; x0=rnr_idx (route_a_grp), x1=cfg* (queue range + TM
-		 * bb_id/task). Caught only if armed at boot - otherwise read the regs
-		 * statically (route-a-oracle.sh). */
+		/* rdpa_cpu_tx_port_enet_or_dsl_wan(sysb, egress_queue, wanFlow,
+		 * port_obj, extra) - WAN inject trampoline; w1=egress_queue directly.
+		 * (The enet_lan equivalent is a data ptr -> not kprobe-able.) */
+		.sym = "rdpa_cpu_tx_port_enet_or_dsl_wan", .group = GRP_ROUTEA, .nregs = 5,
+		.desc = "CPU_TX WAN: w1=egress_queue w2=wanFlow x3=port_obj",
+	},
+	{
+		/* ag_drv_qm_rnr_group_cfg_set(uint8_t rnr_idx, const qm_rnr_group_cfg*)
+		 * boot-time; x0=rnr_idx (route_a_grp), x1=cfg. struct (verified): u16
+		 * start_queue@0, end_queue@2, pd_fifo_base@4, pd_fifo_size@6,
+		 * upd_fifo_base@8, upd_fifo_size@10, rnr_bb_id@11, rnr_task@12,
+		 * rnr_enable@13. Caught only if armed at boot - else route-a-oracle.sh. */
 		.sym = "ag_drv_qm_rnr_group_cfg_set", .group = GRP_ROUTEA, .nregs = 2,
-		.desc = "QM RUNNER_GRP set: x0=rnr_idx, x1=qm_rnr_group_cfg*",
-		/* TODO: deref x1 -> {start_queue, end_queue, rnr_bb_id, rnr_task} */
+		.desc = "QM RUNNER_GRP set: x0=rnr_idx, x1=qm_rnr_group_cfg(14B)",
+		.deref = {
+			{ .arg = 1, .off = 0, .len = 14, .label = "qm_rnr_group_cfg{start,end,fifos,bb_id@11,task@12,en@13}" },
+		},
+	},
+	{	/* BBH_TX QM-fed queue -> runner mapping (boot): w0=bbh_id w1=idx w2=q0 w3=q1 */
+		.sym = "ag_drv_bbh_tx_unified_configurations_q2rnr_set", .group = GRP_ROUTEA,
+		.nregs = 4, .desc = "BBH_TX Q2RNR: w0=bbh_id w1=idx w2=q0 w3=q1",
+	},
+	{	/* BBH_TX enable QM queue (boot): w0=bbh_id w1=idx w2=q0 w3=q1 */
+		.sym = "ag_drv_bbh_tx_unified_configurations_qmq_set", .group = GRP_ROUTEA,
+		.nregs = 4, .desc = "BBH_TX QMQ: w0=bbh_id w1=qm_q_idx w2=q0 w3=q1",
 	},
 
-	/* ---- GRP_OFFLOAD: flow-add / NAT-C / cmdlist (fill from RE agent map) ---- */
+	/* ---- GRP_OFFLOAD: flow-add / NAT-C / cmdlist (verified vs rdpa.ko nm) ---- */
 	{
-		/* f_rdpa_cpu_tx_flow_cache_offload(sysb, cpu_rx_queue, dirty)
-		 * [EXPORT_SYMBOL] - the flow-cache offload inject path. */
-		.sym = "f_rdpa_cpu_tx_flow_cache_offload", .group = GRP_OFFLOAD, .nregs = 3,
-		.desc = "flow-cache offload: x0=sysb x1=cpu_rx_queue x2=dirty",
+		/* ucast_attr_flow_add(mo, bdmf_index *index, const rdpa_ip_flow_info_t*)
+		 * x2=flow. struct: hw_flow_id u32@0, then rdpa_ip_flow_key_t (bdmf_ip_t
+		 * src/dst are 20B each!). Dump raw 64B and decode offline vs .config. */
+		.sym = "ucast_attr_flow_add", .group = GRP_OFFLOAD, .nregs = 3,
+		.desc = "FC_UCAST flow-add: x2=rdpa_ip_flow_info_t* (5-tuple+result)",
+		.deref = { { .arg = 2, .off = 0, .len = 64, .label = "rdpa_ip_flow_info(raw)" } },
 	},
-	/* TODO(offload): flow create/add, drv_natc_*_ctx_add, cmdlist builder -
-	 * symbols + arg/struct offsets pending the offload RE agent map. */
+	{	/* l2_ucast_attr_flow_add(mo, index, const rdpa_l2_flow_info_t*) */
+		.sym = "l2_ucast_attr_flow_add", .group = GRP_OFFLOAD, .nregs = 3,
+		.desc = "L2 flow-add: x2=rdpa_l2_flow_info_t* (MAC+VLAN)",
+		.deref = { { .arg = 2, .off = 0, .len = 64, .label = "rdpa_l2_flow_info(raw)" } },
+	},
+	{
+		/* drv_natc_key_result_entry_var_size_ctx_add(tbl, hash_key, key,
+		 * result, *entry_idx): w0=tbl x1=hash_key x2=key(16B) x3=result(ctx,124B
+		 * w/ cmdlist@24). THE NAT-C add. [arg count cross-tree - confirm live] */
+		.sym = "drv_natc_key_result_entry_var_size_ctx_add", .group = GRP_OFFLOAD,
+		.nregs = 5, .desc = "NAT-C add: x2=key(16B) x3=result/ctx x4=entry_idx*",
+		.deref = {
+			{ .arg = 2, .off = 0, .len = 16, .label = "natc_key(16B BE)" },
+			{ .arg = 3, .off = 0, .len = 64, .label = "fc_ucast_ctx(raw, cmdlist@24)" },
+		},
+	},
+	{
+		/* rdpa_cmd_list_update_context(cmd_list_update_params_t *p, int *ovf):
+		 * p->rdpa_cmd_list_p @0x10 (ptr to bytes), len @0x1c, data_len @0x20,
+		 * final_len_32 @0x2c (OUT). CHASE the buffer pointer. */
+		.sym = "rdpa_cmd_list_update_context", .group = GRP_OFFLOAD, .nregs = 2,
+		.desc = "cmdlist compile: x0=params (buf@0x10 chase, len@0x1c)",
+		.deref = {
+			{ .arg = 0, .off = 0x10, .len = 64, .chase = true, .label = "cmdlist bytes(*p+0x10)" },
+			{ .arg = 0, .off = 0x1c, .len = 8,  .label = "cmdlist len@0x1c / data_len@0x20" },
+		},
+	},
+	{	/* rdd_connection_entry_add - final RDD commit; rdd_fc_context_t internal
+		 * offsets are proprietary -> dump regs + a best-effort raw blob, decode
+		 * offline. (arg layout unconfirmed; raw regs are the safety net.) */
+		.sym = "rdd_connection_entry_add", .group = GRP_OFFLOAD, .nregs = 4,
+		.desc = "RDD commit: dump regs + raw x0 blob (rdd_fc_context_t)",
+		.deref = { { .arg = 0, .off = 0, .len = 64, .label = "x0 blob(raw)" } },
+	},
 };
 
 static int trace_pre(struct kprobe *p, struct pt_regs *regs)
@@ -148,6 +215,17 @@ static int trace_pre(struct kprobe *p, struct pt_regs *regs)
 			continue;
 		len = d->len > DEREF_MAX ? DEREF_MAX : d->len;
 		ptr = regs->regs[d->arg] + d->off;
+		if (d->chase) {
+			/* read a pointer at (arg+off), then dump from *that* */
+			unsigned long p2;
+
+			if (probe_kernel_read(&p2, (void *)ptr, sizeof(p2)) || !p2) {
+				pr_emerg(RDPATRACE ":   %s = <chase fault @%px>\n",
+					 d->label ? d->label : "deref", (void *)ptr);
+				continue;
+			}
+			ptr = p2;
+		}
 		if (probe_kernel_read(buf, (void *)ptr, len)) {
 			pr_emerg(RDPATRACE ":   %s = <fault @%px>\n",
 				 d->label ? d->label : "deref", (void *)ptr);
