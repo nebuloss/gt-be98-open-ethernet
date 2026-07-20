@@ -668,6 +668,17 @@ int  xrdp_offload_nat_selftest(struct xrdp_offload *o,
 			       __be16 l4_sport, __be16 l4_dport, u8 ip_proto,
 			       __be32 nat_sip, __be16 nat_sport);
 
+/*
+ * NAT-C slot allocation (RE-PINNED, re-notes/re-firmware/01-natc-abi.md §3):
+ * the stock stack does NOT use a monotonic counter — the table slot is
+ * HASH-DERIVED (XOR-fold of the masked key, seed 0x4899b351) then open-addressed
+ * probed. Real HW folds the 32-bit hash to N = 13 + ddr_size_enum index bits; we
+ * use a fixed-size open table for the driver<->model contract.
+ */
+#define NATC_HASH_SEED		0x4899b351U	/* XOR-fold seed (RE 01 §3 mode 0) */
+#define NATC_IDX_BITS		12		/* open table index width (real: 13+enum) */
+#define NATC_TABLE_SLOTS	(1U << NATC_IDX_BITS)
+
 /* bcm4916_runner.c - NAT-C connection-table I/O (owns the MMIO window) */
 int  xrdp_natc_add(struct xrdp_offload *o, const struct natc_key *key,
 		   const struct fc_ucast_ctx *ctx, u32 *idx_out);

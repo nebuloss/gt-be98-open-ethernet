@@ -44,6 +44,7 @@
 #include <linux/firmware.h>
 #include <linux/delay.h>
 #include <linux/byteorder/generic.h>
+#include <linux/bitops.h>	/* test_and_set_bit/clear_bit for the NAT-C slot map */
 #include <linux/version.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
 #include <asm/unaligned.h>	/* get_unaligned_le32() etc. (pre-6.12 location) */
@@ -225,7 +226,7 @@ struct runner_priv {
 	/* HW flow offload (Phase 1: L2 + VLAN) */
 	struct xrdp_offload	offload;
 	void __iomem		*natc;		/* xrdp + XRDP_OFF_NATC */
-	u32			natc_next_idx;	/* simple slot allocator */
+	DECLARE_BITMAP(natc_occ, NATC_TABLE_SLOTS); /* hash-slot occupancy (RE 01 §3) */
 	struct dentry		*dbg;		/* debugfs dir */
 };
 
@@ -647,35 +648,56 @@ static int tx_ring_alloc(struct runner_priv *p)
 }
 
 /* ============================ NAT-C offload I/O ========================== *
- * The open analog of drv_natc_key_result_entry_var_size_ctx_add (ABI sec 1.1):
- * stage the 16-byte masked BE key + the FC_UCAST_FLOW_CONTEXT_ENTRY into PSRAM
- * staging windows, write the table index, then issue the indirect "add"
- * command (cmd=3). The QEMU model watches these PSRAM writes and the command
- * register to populate its modelled NAT-C table.
+ * The open analog of drv_natc_key_result_entry_var_size_ctx_add. The install
+ * sequence is RE-PINNED (re-notes/re-firmware/01-natc-abi.md §1):
+ *   mask key -> hash-derived slot (open-addressed probe) -> stage key+result ->
+ *   issue command 3 (there is NO command 4; delete = a cmd-3 write of an
+ *   invalidated entry, §7).
  *
- * The PSRAM staging offsets + indirect command register here are CONTRACT
- * placeholders (real RDD/NAT-C indirect-register offsets are ABI UNKNOWN #5);
- * driver and model agree on them.
+ * NOTE on staging offsets: real silicon stages a single 72-byte BE key+result
+ * window at the NAT-C ENG sub-block (command @engine+0x10, key @+0x30) and copies
+ * the full 124-byte context to the DDR result table at result_base+idx*entry_size
+ * (§1/§5/§6). Those ABSOLUTE offsets are UNRESOLVED (§Unresolved: need a live
+ * devmem/FDT read on silicon), so the PSRAM staging windows below remain a
+ * driver<->QEMU-model contract; the pinned corrections applied here are the
+ * hash-derived slot and the cmd-3 delete.
  */
+
+/* XOR-fold hash of the masked key -> base slot (RE 01 §3, mode 0). */
+static u32 natc_hash(const struct natc_key *key)
+{
+	u32 h = __swab32(NATC_HASH_SEED);	/* seed 0x4899b351, byteswapped */
+	int i;
+
+	for (i = 0; i < 4; i++)
+		h ^= __swab32((__force u32)key->w[i]);	/* byteswap32(BE key word) */
+	/* fold the 32-bit hash to NATC_IDX_BITS index bits (§3, N<=15 form) */
+	return (((h ^ (h >> NATC_IDX_BITS)) & (NATC_TABLE_SLOTS - 1)) ^
+		(h >> (2 * NATC_IDX_BITS))) & (NATC_TABLE_SLOTS - 1);
+}
+
 int xrdp_natc_add(struct xrdp_offload *o, const struct natc_key *key,
 		  const struct fc_ucast_ctx *ctx, u32 *idx_out)
 {
 	struct runner_priv *p = o->drv;
-	u32 idx = p->natc_next_idx++;
+	u32 base = natc_hash(key);
+	u32 idx, probe;
 
-	/* 1. stage the 16-byte masked BE key */
+	/* open-addressed probe from the hash slot for a free entry (§3-4) */
+	for (probe = 0; probe < NATC_TABLE_SLOTS; probe++) {
+		idx = (base + probe) & (NATC_TABLE_SLOTS - 1);
+		if (!test_and_set_bit(idx, p->natc_occ))
+			break;
+	}
+	if (probe == NATC_TABLE_SLOTS)
+		return -ENOSPC;
+
+	/* stage {key, context} + issue command 3 (add) */
 	memcpy_toio(p->xrdp + XRDP_OFF_PSRAM + NATC_STAGE_KEY, key->w,
 		    sizeof(key->w));
-
-	/* 2. stage the variable-length context (result) */
 	memcpy_toio(p->xrdp + XRDP_OFF_PSRAM + NATC_STAGE_CTX, ctx->buf,
 		    ctx->len);
-
-	/* 3. write the table index */
 	writel(idx, p->xrdp + XRDP_OFF_PSRAM + NATC_INDIR_INDEX);
-
-	/* 4. issue the add command (cmd=3) - this is the "doorbell" the model
-	 *    keys on to copy {key, ctx} into its NAT-C table. */
 	dma_wmb();
 	writel(NATC_CMD_ADD, p->xrdp + XRDP_OFF_PSRAM + NATC_INDIR_CMD);
 
@@ -687,11 +709,22 @@ void xrdp_natc_del(struct xrdp_offload *o, const struct natc_key *key, u32 idx)
 {
 	struct runner_priv *p = o->drv;
 
+	if (idx >= NATC_TABLE_SLOTS)
+		return;
+	/*
+	 * Delete = a command-3 write of an INVALIDATED entry (RE 01 §7: there is no
+	 * command 4). We stage the key + index and re-issue cmd 3 with a zeroed
+	 * context; the model treats a cmd-3 whose staged context has valid=0
+	 * (FCU_VALID_BIT clear) as an invalidate of that slot.
+	 */
 	memcpy_toio(p->xrdp + XRDP_OFF_PSRAM + NATC_STAGE_KEY, key->w,
 		    sizeof(key->w));
+	memset_io(p->xrdp + XRDP_OFF_PSRAM + NATC_STAGE_CTX, 0, XPE_CTX_ENTRY_MAX);
 	writel(idx, p->xrdp + XRDP_OFF_PSRAM + NATC_INDIR_INDEX);
 	dma_wmb();
-	writel(NATC_CMD_DEL, p->xrdp + XRDP_OFF_PSRAM + NATC_INDIR_CMD);
+	writel(NATC_CMD_ADD, p->xrdp + XRDP_OFF_PSRAM + NATC_INDIR_CMD);
+
+	clear_bit(idx, p->natc_occ);
 }
 
 void xrdp_natc_stats(struct xrdp_offload *o, u32 idx, u64 *pkts, u64 *bytes)

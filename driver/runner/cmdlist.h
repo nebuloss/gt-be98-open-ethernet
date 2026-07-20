@@ -63,11 +63,12 @@
 #define XPE_OP_NOP	0x3f
 
 /*
- * Max cmdlist body in bytes. The live stock entry used cmd_list_data_length=28
- * with the context-entry command_list[] field being larger (cmd_list_length=40,
- * RDP-impl2 template reserves command_list[80]). We cap generously.
+ * Max cmdlist body in bytes. RE-CORRECTED (re-notes/re-firmware/03-fc-ucast-abi.md
+ * §1): the real FC_UCAST_FLOW_CONTEXT_ENTRY is 124 bytes with a 24-byte header, so
+ * the embedded command_list[] region is exactly 100 bytes (124-24), not the 80 the
+ * RDP-impl2 template reserved. Cap at the real region size.
  */
-#define XPE_CMDLIST_MAX_BYTES	80
+#define XPE_CMDLIST_MAX_BYTES	100
 
 /*
  * cmdlist builder state. Command words and inline operand data are emitted as

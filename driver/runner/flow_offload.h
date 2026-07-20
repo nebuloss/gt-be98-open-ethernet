@@ -42,24 +42,28 @@
  * / sec 1.1) - they only have to agree between driver and model.
  * ------------------------------------------------------------------------- */
 
-/* NAT-C engine block base, relative to the rdpa window (ABI 1.1: NATC@0x82950000). */
+/* NAT-C engine block base, relative to the rdpa window (NATC@0x82950000). */
 #define XRDP_OFF_NATC			0x00950000UL
 
 /*
- * Indirect add interface (open analog of ag_drv_natc_indir_*). The driver
- * stages the 16-byte key, then the variable-length context, into these PSRAM
- * staging windows, writes the table index, and issues NATC_CMD_ADD.
- *   key staging   : NATC_STAGE_KEY  (16 bytes)
- *   ctx staging   : NATC_STAGE_CTX  (XPE_CTX_ENTRY_MAX bytes)
- *   index + command via NATC_INDIR_*
+ * Flow-install staging. RE-PINNED sequence (re-notes/re-firmware/01-natc-abi.md
+ * §1): mask key -> hash-derived slot -> stage key+result -> command 3. On real
+ * silicon the command register is at NAT-C engine +0x10 (busy=bit4, table_id in
+ * bits[14:12]) and the key+result is a single 72-byte BE window, with the full
+ * 124-byte context in the DDR result table; those ABSOLUTE offsets are UNRESOLVED
+ * (§Unresolved: need a live devmem/FDT read). The PSRAM staging windows below are
+ * therefore a driver<->QEMU-model CONTRACT that the pinned corrections (hash slot
+ * in bcm4916_runner.c, cmd-3 delete) sit on top of.
  */
 #define NATC_STAGE_KEY			0x0100	/* PSRAM: 16-byte masked BE key */
-#define NATC_STAGE_CTX			0x0120	/* PSRAM: context entry */
+#define NATC_STAGE_CTX			0x0120	/* PSRAM: 124-byte context entry */
 #define NATC_INDIR_INDEX		0x0200	/* PSRAM: table index (u32) */
 #define NATC_INDIR_CMD			0x0204	/* PSRAM: command reg (u32) */
 
-#define NATC_CMD_ADD			3	/* eng_command_write(...,3) = add */
-#define NATC_CMD_DEL			4	/* delete (open extension) */
+#define NATC_CMD_ADD			3	/* engine command 3 = write/add (§6) */
+/* There is NO command 4 (RE 01 §7): delete = a cmd-3 write of an invalidated
+ * entry; a whole-table wipe uses the flush modifier below. */
+#define NATC_CMD_FLUSH			0x10001	/* cmd 1 | bit16 = flush a table (§6) */
 
 /* ------------------------------------------------------------------------- *
  * 16-byte NAT-C key (4x u32, masked, big-endian). ABI sec 1.1.
@@ -77,46 +81,52 @@ struct natc_key {
 };
 
 /* ------------------------------------------------------------------------- *
- * FC_UCAST_FLOW_CONTEXT_ENTRY (the NAT-C result).
+ * FC_UCAST_FLOW_CONTEXT_ENTRY (the NAT-C result) — REAL packed-BE layout.
  *
- * REAL SILICON LAYOUT (pinned): the GPL FC_UCAST_FLOW_CONTEXT_ENTRY_STRUCT
- * (rdd_data_structures_auto.h, BCM6813, big-endian) is a 124-byte packed
- * BITFIELD struct with command_list[100] at struct byte 24, and the cmdlist
- * length carried in the WORD-1 bitfield `command_list_length_32` (32-bit-word
- * units), NOT a flat cmd_list_data_length byte. The live capture
- * (re-notes/stock-watch-capture.md sec 2) confirms it byte-for-byte
- * (cmdlist body @ +24..+51 of the FC_UCAST struct, gdx_ctx_data @ struct +14).
+ * RE-PINNED (re-notes/re-firmware/03-fc-ucast-abi.md): the result entry is a
+ * 124-byte packed BITFIELD struct. The field positions below are the
+ * compiler-emitted bfi operands from the stock rdpa.ko builders
+ * (ucast_prepare_rdd_ip_flow_result @0x36d30 routed;
+ * l2_ucast_prepare_rdd_ip_flow_result.part.0 @0x32370 L2). The RE names a field
+ * "WORD@W bit b" = host byte (W + b/8), bit (b%8) of the native LE word; encoded
+ * here as absolute (byte, mask) into the driver's flat buf[], which the QEMU
+ * model decodes by the SAME positions.
  *
- * EMULATION CONTRACT (below): the open driver and the QEMU Runner model share a
- * simplified FLAT-BYTE view of the entry so the model can decode what the driver
- * stages without reimplementing the BE bitfield packer. The ONE field that must
- * match real silicon for a real-HW bring-up is the cmdlist offset, which is now
- * 24 (was 16). The remaining CTX_OFF_* are a driver<->model private contract;
- * a real-silicon builder must instead emit the GPL bitfield struct.
+ *   command_list body      @ struct byte 24 (0x18), rev32 per 32-bit word
+ *   command_list_length_32 (byte 7) = (24 + command_list_bytes) / 4   [WORD units,
+ *                          counting the 24-byte header]
+ *   valid                  = WORD@4 bit23  (byte 6 bit7)  set unconditionally
+ *   egress vport           = byte@5 (8-bit)
+ *   service_queue_id       = WORD@12 [28:24] (byte 15 [4:0]); enable = byte@21 bit4
+ *
+ * is_routed vs is_l2_accel is encoded STRUCTURALLY on silicon (which builder runs
+ * — RE 03 §3 Unresolved), not a single discriminator bit. For the driver<->model
+ * contract we set is_l2_accel in the L2-only flag candidate WORD@4 bit20 (byte 6
+ * bit4) so the model can still tell the paths apart. The many low-confidence
+ * 1-bit flags (RE 03 §3) are left 0: their positions are certain but their
+ * names/semantics are not, and they are not needed for the datapath.
  * ------------------------------------------------------------------------- */
-#define XPE_CTX_CMDLIST_OFF	24	/* real: command_list @ struct byte 24 */
-#define XPE_CTX_ENTRY_MAX	124	/* real: FC_UCAST_FLOW_CONTEXT_ENTRY = 124 B */
+#define XPE_CTX_CMDLIST_OFF	24	/* command_list @ struct byte 24 (RE 03 §1) */
+#define XPE_CTX_ENTRY_MAX	124	/* FC_UCAST_FLOW_CONTEXT_ENTRY = 124 B (RE 03 §1) */
 
 struct fc_ucast_ctx {
 	u8	buf[XPE_CTX_ENTRY_MAX];
-	u16	len;		/* total context bytes */
+	u16	len;		/* total context bytes (= XPE_CTX_ENTRY_MAX) */
 };
 
-/* context byte offsets (driver<->QEMU-model contract; real layout = GPL
- * bitfield struct, see stock-watch-capture.md sec 2). */
-#define CTX_OFF_FLAGS		8	/* byte: bit7 mcast,b5 is_routed,b4 is_l2_accel */
-#define  CTX_FLAG_MCAST		BIT(7)
-#define  CTX_FLAG_IS_ROUTED	BIT(5)
-#define  CTX_FLAG_IS_L2_ACCEL	BIT(4)
-#define  CTX_FLAG_IS_NAT	BIT(3)	/* open: NAT/NAPT rewrite present (model hint) */
-#define CTX_OFF_VPORT		12	/* byte: egress vport */
-#define CTX_OFF_SERVICE_Q	13	/* byte: service_queue_id */
-#define CTX_OFF_IS_HW_CSO	14	/* byte: bit0 is_hw_cso */
-/* the two cmdlist length fields live AFTER the 100-byte command_list region
- * (contract bytes; real silicon uses command_list_length_32 in WORD 1). */
-#define CTX_OFF_CMDLIST_DLEN	(XPE_CTX_CMDLIST_OFF + XPE_CMDLIST_MAX_BYTES + 0)
-#define CTX_OFF_CMDLIST_LEN	(XPE_CTX_CMDLIST_OFF + XPE_CMDLIST_MAX_BYTES + 1)
-#define CTX_OFF_VALID		(XPE_CTX_CMDLIST_OFF + XPE_CMDLIST_MAX_BYTES + 2)
+/* real packed-BE field positions (RE 03 §1-4), as (byte, mask) into buf[]. */
+#define FCU_VALID_BYTE		6	/* WORD@4 bit23 */
+#define FCU_VALID_BIT		BIT(7)
+#define FCU_L2ACCEL_BYTE	6	/* WORD@4 bit20 (contract is_l2_accel discriminator) */
+#define FCU_L2ACCEL_BIT		BIT(4)
+#define FCU_CLLEN32_BYTE	7	/* WORD@4 [31:24] = (24 + clen)/4 in 32-bit words */
+#define FCU_VPORT_BYTE		5	/* byte@5 = egress vport (8-bit) */
+#define FCU_SQ_BYTE		15	/* WORD@12 [28:24] = service_queue_id (5-bit) */
+#define FCU_SQ_MASK		0x1f
+#define FCU_SQ_EN_BYTE		21	/* byte@21 bit4 = service_queue enable */
+#define FCU_SQ_EN_BIT		BIT(4)
+#define FCU_HWCSO_BYTE		14	/* byte@14 bit2 = is_hw_cso candidate (RE 03 §3 low-conf) */
+#define FCU_HWCSO_BIT		BIT(2)
 
 /* ------------------------------------------------------------------------- *
  * Packet byte offsets (from SOP) for an UNTAGGED IPv4 frame, used by the NAT

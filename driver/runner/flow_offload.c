@@ -154,51 +154,61 @@ void xrdp_build_nat_cmdlist(const struct xrdp_flow *f, struct xpe_cmdlist *cl)
 	xpe_cmd_end(cl);
 }
 
-/* Build the FC_UCAST_FLOW_CONTEXT_ENTRY embedding the cmdlist. */
+/*
+ * Build the FC_UCAST_FLOW_CONTEXT_ENTRY (the NAT-C result) embedding the cmdlist.
+ *
+ * Emits the REAL 124-byte packed-BE layout RE'd in re-notes/re-firmware/03-fc-ucast-abi.md
+ * (was a flat-byte CTX_OFF_* contract). The QEMU model decodes the same positions.
+ */
 void xrdp_build_ctx(const struct xrdp_flow *f, const struct xpe_cmdlist *cl,
 		    struct fc_ucast_ctx *ctx)
 {
-	u16 dlen = xpe_cmdlist_data_len(cl);
-	u16 clen = xpe_cmdlist_len(cl);
+	u16 clen = xpe_cmdlist_len(cl);		/* 4-byte-aligned cmdlist length */
+	int i;
 
 	memset(ctx, 0, sizeof(*ctx));
 
-	/* flags: routed (L3/NAT) vs pure L2 accelerate (live-flow-dump.md: a
-	 * routed/NAT flow sets is_routed=1; a bridge flow sets is_l2_accel=1). */
-	if (f->is_routed) {
-		ctx->buf[CTX_OFF_FLAGS] = CTX_FLAG_IS_ROUTED;
-		if (f->nat_sip || f->nat_dip || f->nat_sport || f->nat_dport)
-			ctx->buf[CTX_OFF_FLAGS] |= CTX_FLAG_IS_NAT;
-	} else {
-		ctx->buf[CTX_OFF_FLAGS] = CTX_FLAG_IS_L2_ACCEL;
+	/* valid = WORD@4 bit23, set unconditionally (RE 03 §3). */
+	ctx->buf[FCU_VALID_BYTE] |= FCU_VALID_BIT;
+
+	/* is_routed vs is_l2_accel is structural on silicon (which builder runs);
+	 * mark the L2 path in the contract discriminator bit so the model can tell
+	 * the paths apart (RE 03 §3). Routed flows leave it clear. */
+	if (!f->is_routed)
+		ctx->buf[FCU_L2ACCEL_BYTE] |= FCU_L2ACCEL_BIT;
+
+	/* egress vport (byte@5) + service_queue_id (WORD@12[28:24]) + enable
+	 * (byte@21 bit4), RE 03 §3/§4. */
+	ctx->buf[FCU_VPORT_BYTE] = f->egress_vport & 0xff;
+	if (f->service_queue_id) {
+		ctx->buf[FCU_SQ_BYTE] = (ctx->buf[FCU_SQ_BYTE] & ~FCU_SQ_MASK) |
+					(f->service_queue_id & FCU_SQ_MASK);
+		ctx->buf[FCU_SQ_EN_BYTE] |= FCU_SQ_EN_BIT;
 	}
 
-	ctx->buf[CTX_OFF_VPORT]     = f->egress_vport & 0xff;
-	ctx->buf[CTX_OFF_SERVICE_Q] = f->service_queue_id & 0xff;
 	if (f->is_hw_cso)
-		ctx->buf[CTX_OFF_IS_HW_CSO] = BIT(0);
+		ctx->buf[FCU_HWCSO_BYTE] |= FCU_HWCSO_BIT;
 
-	/* Embed the cmdlist inline at struct byte +24 (XPE_CTX_CMDLIST_OFF, pinned
-	 * from the live FC_UCAST capture). Copy the full padded buffer (clen bytes =
-	 * executable dlen + the trailing 0xfc slot pad emitted by xpe_cmd_end), so
-	 * the context's command_list[] slack matches the stock 0xfc fill. The Runner
-	 * executes only the first dlen bytes (length-delimited; 0xfc never decoded). */
+	/* Embed the cmdlist at struct byte +24, byte-swapped per 32-bit word (rev32,
+	 * RE 03 §1). cl->buf holds 16-bit BE command words and is padded to a 4-byte
+	 * multiple by xpe_cmd_end, so rev32-per-word is well-defined. */
 	if (clen > XPE_CMDLIST_MAX_BYTES)
 		clen = XPE_CMDLIST_MAX_BYTES;
-	memcpy(&ctx->buf[XPE_CTX_CMDLIST_OFF], cl->buf, clen);
+	for (i = 0; i + 4 <= clen; i += 4) {
+		ctx->buf[XPE_CTX_CMDLIST_OFF + i + 0] = cl->buf[i + 3];
+		ctx->buf[XPE_CTX_CMDLIST_OFF + i + 1] = cl->buf[i + 2];
+		ctx->buf[XPE_CTX_CMDLIST_OFF + i + 2] = cl->buf[i + 1];
+		ctx->buf[XPE_CTX_CMDLIST_OFF + i + 3] = cl->buf[i + 0];
+	}
+	for (; i < clen; i++)	/* remainder (should be none after xpe_cmd_end pad) */
+		ctx->buf[XPE_CTX_CMDLIST_OFF + i] = cl->buf[i];
 
-	/* the TWO length fields (live-flow-dump.md "CORRECTS").
-	 * REAL SILICON: the length is carried as command_list_length_32 in 32-bit
-	 * WORD units (stock-watch-capture.md sec 2: cmd_list_length=40 -> 0x0a). Our
-	 * driver<->model contract stores raw byte counts; a real-HW context builder
-	 * must instead write round_up(clen,4)/4 into the command_list_length_32
-	 * bitfield of WORD 1. */
-	ctx->buf[CTX_OFF_CMDLIST_DLEN] = dlen;
-	ctx->buf[CTX_OFF_CMDLIST_LEN]  = clen;	/* model contract: byte count.
-						 * real HW: clen/4 in length_32. */
-	ctx->buf[CTX_OFF_VALID]        = 1;
+	/* command_list_length_32 = (24 + cmdlist_bytes)/4 in 32-bit WORDS, byte 7
+	 * (RE 03 §2 — counts the 24-byte header). clen is 4-byte-aligned so this is
+	 * exact word units. */
+	ctx->buf[FCU_CLLEN32_BYTE] = (u8)((XPE_CTX_CMDLIST_OFF + clen) / 4);
 
-	ctx->len = CTX_OFF_VALID + 1;
+	ctx->len = XPE_CTX_ENTRY_MAX;
 }
 
 /*

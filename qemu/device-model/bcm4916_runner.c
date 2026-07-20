@@ -33,9 +33,9 @@
  *     frame to the backend, free the token, and advance the runner read_idx
  *     (mirrored back into the indices entry @+0).
  *
- * BUILD: copied to hw/net/bcm4916_runner.c on dev-build, added to
+ * BUILD: copied to hw/net/bcm4916_runner.c on the build machine, added to
  * hw/net/meson.build, wired into hw/arm/virt.c create_bcm4916(). Never build on
- * dev-code.
+ * the dev machine.
  *
  * ALL multi-byte descriptor fields are BIG-ENDIAN in guest memory (the Runner is
  * BE). We use ldl_be / stl_be on a byte buffer DMA'd to/from guest RAM.
@@ -131,24 +131,26 @@
 
 /* -------- NAT-C offload contract (matches driver/runner/flow_offload.h) ---- */
 #define PSRAM_NATC_STAGE_KEY     0x0100   /* 16-byte masked BE key */
-#define PSRAM_NATC_STAGE_CTX     0x0120   /* FC_UCAST_FLOW_CONTEXT_ENTRY */
+#define PSRAM_NATC_STAGE_CTX     0x0120   /* FC_UCAST_FLOW_CONTEXT_ENTRY (124 B) */
 #define PSRAM_NATC_INDIR_INDEX   0x0200   /* table index (u32) */
-#define PSRAM_NATC_INDIR_CMD     0x0204   /* command reg (u32): 3=add 4=del */
-#define  NATC_CMD_ADD            3
-#define  NATC_CMD_DEL            4
+#define PSRAM_NATC_INDIR_CMD     0x0204   /* command reg (u32): 3=add, del=3 w/ valid=0 */
+#define  NATC_CMD_ADD            3        /* cmd 3 = write; delete = cmd 3, valid bit clear */
 
-/* context-entry byte offsets (matches flow_offload.h CTX_OFF_*).
- * cmdlist offset corrected to 24 from the live capture (real silicon: GPL
- * FC_UCAST_FLOW_CONTEXT_ENTRY_STRUCT has command_list @ struct byte 24;
- * re-notes/stock-watch-capture.md sec 2). XPE_CMDLIST_MAX = 80. */
-#define CTX_OFF_FLAGS            8
-#define  CTX_FLAG_IS_L2_ACCEL    (1u << 4)
-#define CTX_OFF_VPORT            12
+/*
+ * FC_UCAST result-entry packed-BE field positions (matches the driver's
+ * flow_offload.h FCU_*; RE-pinned re-notes/re-firmware/03-fc-ucast-abi.md). The
+ * command_list body is at struct byte 24, stored rev32 per 32-bit word; its length
+ * is command_list_length_32 at byte 7 = (24 + cmdlist_bytes)/4 (word units, incl
+ * the 24-byte header).
+ */
+#define FCU_VALID_BYTE           6        /* WORD@4 bit23 = valid */
+#define FCU_VALID_BIT            (1u << 7)
+#define FCU_L2ACCEL_BYTE         6        /* WORD@4 bit20 = contract is_l2_accel */
+#define FCU_L2ACCEL_BIT          (1u << 4)
+#define CTX_OFF_CLLEN32          7        /* command_list_length_32 (words, incl 24-B hdr) */
+#define CTX_OFF_VPORT_B          5        /* egress vport (byte@5) */
 #define CTX_OFF_CMDLIST_OFF      24
-#define XPE_CMDLIST_MAX_M        80
-#define CTX_OFF_CMDLIST_DLEN     (CTX_OFF_CMDLIST_OFF + XPE_CMDLIST_MAX_M + 0) /* 104 */
-#define CTX_OFF_CMDLIST_LEN      (CTX_OFF_CMDLIST_OFF + XPE_CMDLIST_MAX_M + 1) /* 105 */
-#define CTX_OFF_VALID            (CTX_OFF_CMDLIST_OFF + XPE_CMDLIST_MAX_M + 2) /* 106 */
+#define XPE_CMDLIST_MAX_M        100      /* command_list region = 124 - 24 */
 #define CTX_ENTRY_MAX            124
 
 /*
@@ -181,10 +183,6 @@
  */
 #define XPE_OP_NOP               0x3f
 #define XPE_PAD_BYTE             0xfc   /* stock slot pad fill (outside dlen) */
-
-/* context flag bits (matches flow_offload.h CTX_FLAG_*) */
-#define CTX_FLAG_IS_ROUTED       (1u << 5)
-#define CTX_FLAG_IS_NAT          (1u << 3)
 
 /* IPv4 packet byte offsets for an untagged frame (matches flow_offload.h) */
 #define L2_HLEN_M                14
@@ -403,13 +401,32 @@ static void runner_parse_ring(const uint8_t *d, RunnerRing *r, uint32_t res_shif
 static void natc_add(Bcm4916RunnerState *s)
 {
     uint32_t idx = s->natc_stage_idx % NATC_MAX_ENTRIES;
+    bool valid = !!(s->natc_stage_ctx[FCU_VALID_BYTE] & FCU_VALID_BIT);
+    int dlen, i;
+
+    /* delete = a cmd-3 write of an invalidated entry (RE 01 §7): valid bit clear. */
+    if (!valid) {
+        s->natc[idx].valid = false;
+        qemu_log("bcm4916-runner: NAT-C DEL idx=%u\n", idx);
+        return;
+    }
 
     memcpy(s->natc[idx].key, s->natc_stage_key, 16);
     memcpy(s->natc[idx].ctx, s->natc_stage_ctx, CTX_ENTRY_MAX);
     s->natc[idx].ctx_len = CTX_ENTRY_MAX;
     s->natc[idx].valid = true;
+
+    /* command_list_length_32 (byte 7, word units incl 24-B header) -> bytes */
+    dlen = (int)s->natc_stage_ctx[CTX_OFF_CLLEN32] * 4 - CTX_OFF_CMDLIST_OFF;
+    if (dlen < 0) {
+        dlen = 0;
+    }
+    if (dlen > XPE_CMDLIST_MAX_M) {
+        dlen = XPE_CMDLIST_MAX_M;
+    }
+
     qemu_log("bcm4916-runner: NAT-C ADD idx=%u key=%02x%02x%02x%02x%02x%02x%02x%02x"
-             "%02x%02x%02x%02x%02x%02x%02x%02x is_l2_accel=%d cmdlist_dlen=%u\n",
+             "%02x%02x%02x%02x%02x%02x%02x%02x is_l2_accel=%d cmdlist_bytes=%d\n",
              idx,
              s->natc_stage_key[0], s->natc_stage_key[1], s->natc_stage_key[2],
              s->natc_stage_key[3], s->natc_stage_key[4], s->natc_stage_key[5],
@@ -417,31 +434,20 @@ static void natc_add(Bcm4916RunnerState *s)
              s->natc_stage_key[9], s->natc_stage_key[10], s->natc_stage_key[11],
              s->natc_stage_key[12], s->natc_stage_key[13], s->natc_stage_key[14],
              s->natc_stage_key[15],
-             !!(s->natc_stage_ctx[CTX_OFF_FLAGS] & CTX_FLAG_IS_L2_ACCEL),
-             s->natc_stage_ctx[CTX_OFF_CMDLIST_DLEN]);
+             !!(s->natc_stage_ctx[FCU_L2ACCEL_BYTE] & FCU_L2ACCEL_BIT),
+             dlen);
     {
-        /* dump the embedded cmdlist bytes (16-bit BE words) for validation */
-        uint8_t dl = s->natc_stage_ctx[CTX_OFF_CMDLIST_DLEN];
+        /* de-rev32 the embedded cmdlist into a readable (logical BE) hex dump. */
         char hex[3 * 64 + 1];
-        int i, n = 0;
-        if (dl > 60) {
-            dl = 60;
+        int n = 0, cap = dlen > 60 ? 60 : dlen;
+        const uint8_t *src = s->natc_stage_ctx + CTX_OFF_CMDLIST_OFF;
+        for (i = 0; i < cap; i++) {
+            int g = i & ~3;                        /* 32-bit group base */
+            uint8_t b = (g + 4 <= dlen) ? src[g + (3 - (i & 3))] : src[i];
+            n += snprintf(hex + n, sizeof(hex) - n, "%02x ", b);
         }
-        for (i = 0; i < dl; i++) {
-            n += snprintf(hex + n, sizeof(hex) - n, "%02x ",
-                          s->natc_stage_ctx[CTX_OFF_CMDLIST_OFF + i]);
-        }
-        qemu_log("bcm4916-runner: NAT-C ADD idx=%u cmdlist=[ %s]\n",
-                 idx, hex);
+        qemu_log("bcm4916-runner: NAT-C ADD idx=%u cmdlist=[ %s]\n", idx, hex);
     }
-}
-
-static void natc_del(Bcm4916RunnerState *s)
-{
-    uint32_t idx = s->natc_stage_idx % NATC_MAX_ENTRIES;
-
-    s->natc[idx].valid = false;
-    qemu_log("bcm4916-runner: NAT-C DEL idx=%u\n", idx);
 }
 
 /*
@@ -687,9 +693,31 @@ static void fixup_l4_csum(uint8_t *frame, size_t len, uint8_t csum_off)
  */
 static size_t natc_run_cmdlist(const uint8_t *ctx, uint8_t *frame, size_t len)
 {
-    uint8_t dlen = ctx[CTX_OFF_CMDLIST_DLEN];
-    const uint8_t *cl = ctx + CTX_OFF_CMDLIST_OFF;
-    int pos = 0;
+    uint8_t cl[XPE_CMDLIST_MAX_M];
+    const uint8_t *src = ctx + CTX_OFF_CMDLIST_OFF;
+    int dlen, i, pos = 0;
+
+    /* command_list_length_32 (byte 7, word units incl the 24-B header) -> the
+     * executable cmdlist byte count (RE 03 §2). */
+    dlen = (int)ctx[CTX_OFF_CLLEN32] * 4 - CTX_OFF_CMDLIST_OFF;
+    if (dlen < 0) {
+        dlen = 0;
+    }
+    if (dlen > XPE_CMDLIST_MAX_M) {
+        dlen = XPE_CMDLIST_MAX_M;
+    }
+
+    /* the cmdlist body is stored rev32 per 32-bit word (RE 03 §1); undo it into a
+     * local buffer holding the 16-bit BE command-word stream the walker expects. */
+    for (i = 0; i + 4 <= dlen; i += 4) {
+        cl[i + 0] = src[i + 3];
+        cl[i + 1] = src[i + 2];
+        cl[i + 2] = src[i + 1];
+        cl[i + 3] = src[i + 0];
+    }
+    for (; i < dlen; i++) {
+        cl[i] = src[i];
+    }
 
     while (pos + 4 <= dlen) {
         uint8_t b0 = cl[pos];
@@ -930,8 +958,10 @@ static ssize_t runner_receive(NetClientState *nc, const uint8_t *buf, size_t len
         if (hit >= 0) {
             g_autofree uint8_t *fwd = g_malloc(RX_BUF_MAX);
             size_t newlen;
+            /* is_routed vs is_l2_accel is structural (RE 03 §3); the driver marks
+             * the L2 path in the contract bit, so routed = NOT is_l2_accel. */
             bool is_routed_ctx =
-                !!(s->natc[hit].ctx[CTX_OFF_FLAGS] & CTX_FLAG_IS_ROUTED);
+                !(s->natc[hit].ctx[FCU_L2ACCEL_BYTE] & FCU_L2ACCEL_BIT);
 
             memcpy(fwd, buf, len);
             newlen = natc_run_cmdlist(s->natc[hit].ctx, fwd, len);
@@ -1363,10 +1393,10 @@ static void runner_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             return;
         }
         if (off == PSRAM_NATC_INDIR_CMD && size == 4) {
-            switch ((uint32_t)val) {
-            case NATC_CMD_ADD: natc_add(s); break;
-            case NATC_CMD_DEL: natc_del(s); break;
-            default: break;
+            /* cmd 3 = write/add; a cmd-3 whose staged ctx has valid=0 is a
+             * delete (RE 01 §7 - there is no command 4). natc_add() dispatches. */
+            if ((uint32_t)val == NATC_CMD_ADD) {
+                natc_add(s);
             }
             return;
         }

@@ -135,7 +135,19 @@ void xpe_cmd_replace_bits_16(struct xpe_cmdlist *cl, u8 offset, u8 position,
 {
 	u8 b0 = 0x50;					/* opcode 0x14 << 2 */
 	u8 b1 = xpe_to_idx(offset);
-	u8 b2 = 0x94;					/* .data "from" base (pre-reloc) */
+	/*
+	 * RE-PINNED (re-notes/re-firmware/02-cmdlist-abi.md §C.1): the stock emitter
+	 * writes byte2 = 0x94 + (running .data half-word index), i.e. the "from"
+	 * reference is RELOCATED per operand into a separate .data region that
+	 * xpe_cmd_end concatenates .data-first. Emitting that stock-faithful layout is
+	 * pinned but DEFERRED here: the Runner's *parse* side (how the microcode reads
+	 * the concatenated .data/.text buffer, and the GDMA descriptor path for
+	 * replace_16/32) is unresolved microcode (02-cmdlist-abi.md Unresolved #1/#2),
+	 * so it cannot be QEMU-validated yet. We keep the constant 0x94 (correct for a
+	 * single operand-bearing op) as the driver<->model contract until the parse
+	 * side is pinned from a live cmdlist capture. See docs/audit/10 M1c.
+	 */
+	u8 b2 = 0x94;					/* .data "from" base (see note above) */
 	u8 b3 = (u8)((position & 0xf) |
 		     ((((width - 1) + position) & 0xf) << 4));
 
@@ -243,11 +255,18 @@ void xpe_cmd_decrement_8(struct xpe_cmdlist *cl, u8 offset)
 	 *   byte2 = (offset>>1)+1   (same word index)     (bfi #8,#8)
 	 *   byte3 = 0xff sentinel ("all bytes / to end")  (orr ...,#0xff)
 	 *   no inline data; the -1 delta is implicit in the opcode.
-	 * (odd offsets set byte0 bits[25:24]=1 -> 0x6a|..; even offset path = 0x6a.)
+	 *
+	 * RE-CONFIRMED (re-notes/re-firmware/02-cmdlist-abi.md §C): the sub-flags in
+	 * byte0[1:0] encode the low bit of the byte offset -- EVEN offset -> byte0
+	 * 0x6a (subflag 0b10), ODD offset -> byte0 0x69 (subflag 0b01). The opcode
+	 * (byte0>>2 = 0x1a = ADD) is identical for both, so the QEMU model decode is
+	 * unaffected; this only makes the emitted byte exact for odd offsets. (TTL is
+	 * at an even offset, so the even path is the one exercised today.)
 	 */
 	u8 b1 = xpe_to_idx(offset);
+	u8 b0 = (offset & 1) ? 0x69 : 0x6a;
 
-	xpe_emit_cmd32(cl, (0x6aU << 24) | ((u32)b1 << 16) |
+	xpe_emit_cmd32(cl, ((u32)b0 << 24) | ((u32)b1 << 16) |
 			   ((u32)b1 << 8) | 0xff);
 }
 
