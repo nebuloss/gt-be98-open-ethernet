@@ -294,10 +294,13 @@ latter logging `TX emit(route_a)`.
 When an RX frame **hits** a programmed NAT-C entry (§offload), the model runs
 the cmdlist embedded in the FC_UCAST context at byte offset
 `XPE_CTX_CMDLIST_OFF = 24` and forwards the result without delivering to the
-CPU. The cmdlist is **length-delimited** by `cmd_list_data_length`
-(`ctx[CTX_OFF_CMDLIST_DLEN]`) — there is **no NOP terminator**; trailing slot
-slack is padded with the byte `0xfc`, which lies past `dlen` and is never
-decoded.
+CPU. The context is now the REAL packed-BE layout (RE'd in
+`re-notes/re-firmware/03-fc-ucast-abi.md`): the executable cmdlist length is
+derived from `command_list_length_32` at **entry byte 7** (word units incl the
+24-byte header, so `dlen = ctx[7]*4 - 24`), and the cmdlist body is stored
+**rev32 per 32-bit word** — the model de-rev32's it into a local buffer before
+decoding. There is **no NOP terminator**; trailing slot slack is padded with the
+byte `0xfc`, which lies past `dlen` and is never decoded.
 
 **Encoding (contract source: `driver/runner/cmdlist.c`, the byte-exact emitter
 pinned from `xpe_api.armb53_6813.o`).** Every command word is 32-bit
