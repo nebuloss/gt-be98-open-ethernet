@@ -145,6 +145,12 @@ static uint serdes_lane;	/* lane within the core */
 module_param(serdes_lane, uint, 0444);
 MODULE_PARM_DESC(serdes_lane, "merlin16 SerDes lane index for the 10G port (default 0).");
 
+static int port10g = -1;	/* xport_port_id of the 10G port to bring up (-1=off) */
+module_param(port10g, int, 0444);
+MODULE_PARM_DESC(port10g,
+		 "Bring up a 10G XPORT MAC + BBH: xport_port_id 0 = eth0/port5 (internal "
+		 "XPHY), 2 = eth1/port6 (merlin16). -1 = off (default). Opt-in, HW only.");
+
 /* ---- Route A: QM + TM-core egress (opt-in; see bcm4916_runner.h + spec 11) --
  * route_a brings up the QM + a RUNNER_GRP + BBH_TX QMQ binding so an injected
  * CPU_TX PD egresses out a LAN port (the stock image_2 thread routes through the
@@ -1228,6 +1234,85 @@ static void runner_bbh_init(struct runner_priv *p, int rx_port)
 		 rx_port);
 }
 
+/* ============================ 10G XPORT MAC bring-up ===================== *
+ * Bring up one 10G XPORT/XLMAC MAC: eth0/port5 = xport_port_id 0, eth1/port6 =
+ * id 2 (both on physical XLMAC0; xport_num = id & 3). All register blocks live
+ * inside p->ethphytop (the 0x837f0000 region) - no extra ioremap. This configures
+ * the MAC + msbus path only; the PHY link (eth0 internal XPHY / eth1 merlin16) is
+ * a separate concern. ⚠ XLMAC_CORE regs are 64-bit but committed by one low-word
+ * writel() (fields >bit31 rely on HW default). Sequence + offsets from the stock
+ * xport_drv init_driver / xlmac_init / msbus_init.
+ * [re-notes/realhw/12-10g-xport-bringup.md §2]  Values marked "TBD" are
+ * RE-summary-derived and to be confirmed against a live-silicon dump.
+ */
+static void runner_xport_init(struct runner_priv *p, int xport_port_id)
+{
+	int num = xport_port_id & 3;			/* intra-XLMAC0 port 0..3 */
+	void __iomem *core = p->ethphytop + XPORT_OFF_XLMAC0_CORE +
+			     (u32)num * XPORT_XLMAC_PORT_STRIDE;
+	void __iomem *top  = p->ethphytop + XPORT_OFF_TOP;
+	void __iomem *mab  = p->ethphytop + XPORT_OFF_MAB;
+	void __iomem *prst = p->ethphytop + XPORT_OFF_PORTRESET;
+	u32 pctrl = (num == 0) ? XPORT_PORTRESET_P0_CTRL : XPORT_PORTRESET_P2_CTRL;
+	u32 sigen = (num == 0) ? XPORT_PORTRESET_P0_SIG_EN : XPORT_PORTRESET_P2_SIG_EN;
+	u32 v;
+	int i;
+
+	/* --- Phase A: init_driver -> leave the port in reset --- */
+	/* Px_SIG_EN: assert MAC/MAB reset+init strobes (rx/tx_disab b9/b8, xlmac
+	 * soft_reset b6, mab rx/tx_port_init b5/b4, tx_credit_disab b3, tx_fifo_init
+	 * b2, port_is_under_reset b1; ep_discard b0 left 0). */
+	writel((1u<<9)|(1u<<8)|(1u<<6)|(1u<<5)|(1u<<4)|(1u<<3)|(1u<<2)|(1u<<1),
+	       prst + sigen);
+	writel(readl(prst + XPORT_PORTRESET_CONFIG) | (1u << num),
+	       prst + XPORT_PORTRESET_CONFIG);		/* ENABLE_SM_RUN[num] */
+	udelay(5000);
+	writel(readl(core + XLMAC_CORE_RX_LSS_CTRL) | XLMAC_CORE_RX_LSS_LOCAL_FAULT_DIS,
+	       core + XLMAC_CORE_RX_LSS_CTRL);
+	/* xport_reset: MAB RX/TX port reset (per-port bit) + XLMAC soft reset */
+	writel(readl(mab + XPORT_MAB_CONTROL) | (1u << (0 + num)) | (1u << (4 + num)),
+	       mab + XPORT_MAB_CONTROL);
+	writel(readl(core + XLMAC_CORE_CTRL) | XLMAC_CORE_CTRL_SOFT_RESET,
+	       core + XLMAC_CORE_CTRL);
+
+	/* --- Phase B: link-up config --- */
+	writel(XPORT_PORTRESET_CTRL_SW_RESET, prst + pctrl);	/* assert port SW reset */
+	/* TOP.CONTROL: this port's MODE = XGMII/10G (2 bits/port) */
+	v = readl(top + XPORT_TOP_CONTROL);
+	v = (v & ~(0x3u << (num * 2))) |
+	    ((u32)XPORT_TOP_CONTROL_MODE_XGMII << (num * 2));
+	writel(v, top + XPORT_TOP_CONTROL);
+	writel(XLMAC_CORE_TX_CTRL_CRC_PERPKT | XLMAC_CORE_TX_CTRL_PAD_EN,
+	       core + XLMAC_CORE_TX_CTRL);
+	writel(XLMAC_CORE_RX_CTRL_RX_PASS, core + XLMAC_CORE_RX_CTRL); /* runt_thr TBD */
+	writel((u32)XLMAC_CORE_MODE_SPEED_10G << XLMAC_CORE_MODE_SPEED_SHIFT,
+	       core + XLMAC_CORE_MODE);			/* SPEED_MODE = 10G (0x40) */
+	writel(XLMAC_CORE_RX_MAX_SIZE_VAL, core + XLMAC_CORE_RX_MAX_SIZE);
+	writel(readl(core + XLMAC_CORE_CTRL) & ~XLMAC_CORE_CTRL_SOFT_RESET,
+	       core + XLMAC_CORE_CTRL);			/* release XLMAC soft reset */
+	/* msbus: clear this port's credit-disable + fifo/port resets */
+	writel(readl(mab + XPORT_MAB_CONTROL) &
+	       ~((1u<<(12+num)) | (1u<<(8+num)) | (1u<<(0+num)) | (1u<<(4+num))),
+	       mab + XPORT_MAB_CONTROL);
+	writel(0, prst + pctrl);			/* release port SW reset */
+
+	/* --- Phase C: enable RX/TX --- */
+	writel(readl(core + XLMAC_CORE_CTRL) |
+	       XLMAC_CORE_CTRL_TX_EN | XLMAC_CORE_CTRL_RX_EN,
+	       core + XLMAC_CORE_CTRL);
+
+	for (i = 0; i < 100; i++) {
+		if (readl(top + XPORT_TOP_STATUS) & (1u << num))
+			break;
+		udelay(1000);
+	}
+	dev_info(p->dev,
+		 "bring-up: XPORT id%d (xlmac0/p%d) 10G MAC enabled, link=%d "
+		 "(top_sts=0x%08x ctrl=0x%08x)\n",
+		 xport_port_id, num, !!(readl(top + XPORT_TOP_STATUS) & (1u << num)),
+		 readl(top + XPORT_TOP_STATUS), readl(core + XLMAC_CORE_CTRL));
+}
+
 /* ============================ 1G MAC/PHY bring-up ======================== *
  * Bring up one 1G UNIMAC + internal EGPHY port (the eth2=port_gphy1 class) so a
  * physical link exists for the Runner to RX/TX through. No proprietary blob (the
@@ -1821,6 +1906,16 @@ static int runner_probe(struct platform_device *pdev)
 	if (!runner_emulated && serdes_fw_load)
 		runner_serdes_load(p);		/* 10G XPORT merlin16 fw (opt-in, step 1) */
 	runner_bbh_init(p, RUNNER_FIRST_PORT);
+	/*
+	 * Opt-in 10G XPORT port (eth0/port5 = xport_port_id 0, eth1/port6 = id 2).
+	 * eth1/merlin16 also needs serdes_fw_load=1 (loaded above); eth0's internal
+	 * XPHY is self-contained. bbh_id: xport_port_id 0 -> port5, 2 -> port6.
+	 * [re-notes/realhw/12-10g-xport-bringup.md]
+	 */
+	if (!runner_emulated && port10g >= 0) {
+		runner_xport_init(p, port10g);			/* 10G XPORT/XLMAC MAC */
+		runner_bbh_init(p, port10g == 0 ? 5 : 6);	/* + its BBH_RX/TX */
+	}
 	if (route_a)
 		runner_bbh_tx_route_a(p);	/* QMQ=1 binding so the TM core's queue egresses */
 	runner_thread_regfile_init(p);	/* CPU thread initial registers (post-zero, pre-enable) */
