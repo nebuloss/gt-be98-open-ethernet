@@ -67,6 +67,18 @@
 #define XRDP_BBH_RX_STRIDE	0x00000400UL
 #define XRDP_OFF_BBH_TX0	0x00890000UL	/* 4, stride 0x2000 */
 #define XRDP_BBH_TX_STRIDE	0x00002000UL
+/* XLIF0 = the XLMAC<->Runner interface for the 10G ports (abs 0x828b2000).
+ * [RE rdpa.o XLIF0_{RX,TX}_IF_ADDRS + XRDP_AG.h *_REG_OFFSET]: 4 channels,
+ * stride 0x200; RX_IF sub-block @ chan+0x00, TX_IF sub-block @ chan+0x40.
+ * eth0 = channel 0, eth1 = channel 2 (channel == XLMAC mac index). */
+#define XRDP_OFF_XLIF0		0x008b2000UL	/* XLIF0 ch0 RX_IF base */
+#define XLIF0_CHANNEL_STRIDE	0x00000200UL
+#define XLIF0_RX_IF_OFF		0x00000000UL	/* RX_IF sub-block within a channel */
+#define   XLIF_RX_IF_IF_DIS	0x00000000UL	/*   bit0 = RX disable */
+#define XLIF0_TX_IF_OFF		0x00000040UL	/* TX_IF sub-block within a channel */
+#define   XLIF_TX_IF_IF_ENABLE	0x00000000UL	/*   bit0 dis_w_credits, bit1 dis_wo_credits */
+#define   XLIF_TX_IF_URUN_PORT_EN 0x00000010UL	/*   bit0 = underrun port enable */
+#define   XLIF_TX_IF_TX_THRESHOLD 0x00000014UL	/*   bits[3:0] = credit threshold (=12) */
 #define XRDP_OFF_UNIMAC_RDP0	0x008a8004UL	/* 4, stride 0x1000 */
 #define XRDP_OFF_FPM		0x00a00000UL
 #define XRDP_OFF_QM		0x00c00000UL
@@ -243,6 +255,28 @@
 #define BBH_RX_SOPOFFSET	0x30
 #define BBH_RX_SBPMCFG		0x64	/* MAXREQ[3:0] */
 #define BBH_RX_SBPMCFG_VAL	0x0000000f
+/* Packet-size window: without these the reset-default MAXPKT (0) drops every
+ * frame as TOOLONG. 4 size profiles; per-flow selectors -> profile 0.
+ * [SDK bbh_rx_cfg -> drv_bbh_rx_pkt_size{0..3}_set / XRDP_AG.h fields] */
+#define BBH_RX_MINPKT0		0x24	/* MINPKT{0..3}[7:0 each] = min eth size 64 */
+#define BBH_RX_MAXPKT0		0x28	/* MAXPKT0[13:0], MAXPKT1[29:16] */
+#define BBH_RX_MAXPKT1		0x2c	/* MAXPKT2[13:0], MAXPKT3[29:16] */
+#define BBH_RX_PERFLOWTH	0x44	/* per-flow group divider = 255 */
+#define BBH_RX_MINPKTSEL0	0x50	/* flow->min-profile sel (2b/flow); 0 */
+#define BBH_RX_MINPKTSEL1	0x54
+#define BBH_RX_MAXPKTSEL0	0x58
+#define BBH_RX_MAXPKTSEL1	0x5c
+#define BBH_RX_MIN_ETH_PKT	64
+#define BBH_RX_MAX_PKT		2048	/* accepts std+VLAN+QinQ; MAC caps upstream */
+/* BBH_RX PM counters (per-port) — RX-path diagnostics [XRDP_AG.h PM_COUNTERS] */
+#define BBH_RX_PM_INPKT		0x100	/* incoming packets (pre size-filter) */
+#define BBH_RX_PM_TOOSHORT	0x10c
+#define BBH_RX_PM_TOOLONG	0x110
+#define BBH_RX_PM_CRCERROR	0x114
+#define BBH_RX_PM_DISPCONG	0x11c	/* dispatcher-congestion drops */
+#define BBH_RX_PM_NOSBPMSBN	0x124	/* no SBPM buffer -> drop */
+#define BBH_RX_PM_NOSDMACD	0x12c	/* no SDMA chunk descriptor -> drop */
+#define BBH_RX_PM_RUNTERROR	0x148
 /* BBH_TX */
 #define BBH_TX_MACTYPE		0x00	/* = 1 (GPON; 7 is invalid) */
 #define BBH_TX_MACTYPE_VAL	1
@@ -408,6 +442,16 @@
 #define XPORT_OFF_TOP		0x00002000UL	/* XLMAC0 TOP */
 #define XPORT_OFF_MAB		0x00003300UL	/* XLMAC0 MAB */
 #define XPORT_OFF_PORTRESET	0x00003400UL	/* XLMAC0 PORTRESET */
+/* XPORT MIB core: per-port RX/TX stat counters. abs 0x837f1000 (mac0), stride
+ * 0x400 -> in p->ethphytop at +0x1000 + mac_index*0x400. Counters are 40-bit
+ * (lo32 @ offset, hi8 @ offset+4); the lo32 read suffices to detect activity.
+ * [SDK bcm6813_xport_mib_core_ag / XPORT_MIB_CORE_ADDRS] */
+#define XPORT_MIB_CORE_OFF	0x00001000UL	/* + mac_index*0x400, in ethphytop */
+#define XPORT_MIB_STRIDE	0x00000400UL
+#define XPORT_MIB_GRX64		0x00		/* good rx 0-64B */
+#define XPORT_MIB_GRXPKT	0x58		/* good rx packets (total) */
+#define XPORT_MIB_GRXPOK	0x110		/* good rx packets ok */
+#define XPORT_MIB_GTXPKT	0x228		/* good tx packets */
 /* XLMAC_CORE per-port (base XPORT_OFF_XLMAC0_CORE + port*0x400) */
 #define XLMAC_CORE_CTRL		0x00		/* TX_EN b0, RX_EN b1, SOFT_RESET b6 */
 #define XLMAC_CORE_CTRL_TX_EN	BIT(0)
@@ -419,8 +463,9 @@
 #define XLMAC_CORE_TX_CTRL	0x20		/* CRC_MODE[1:0]=3, PAD_EN b4 */
 #define XLMAC_CORE_TX_CTRL_CRC_PERPKT 0x3
 #define XLMAC_CORE_TX_CTRL_PAD_EN BIT(4)
-#define XLMAC_CORE_RX_CTRL	0x30		/* STRIP_CRC b2=0, RUNT_THR[?]=0x40, RX_PASS_CTRL b13 */
+#define XLMAC_CORE_RX_CTRL	0x30		/* STRIP_CRC b2=0, RUNT_THR[10:4]=0x40, RX_PASS_CTRL b13 */
 #define XLMAC_CORE_RX_CTRL_RX_PASS BIT(13)
+#define XLMAC_CORE_RX_CTRL_RUNT_SHIFT 4		/* RUNT_THRESHOLD field [10:4] */
 #define XLMAC_CORE_RX_MAX_SIZE	0x40
 #define XLMAC_CORE_RX_MAX_SIZE_VAL 0x3fff
 #define XLMAC_CORE_RX_LSS_CTRL	0x50		/* LOCAL_FAULT_DISABLE */

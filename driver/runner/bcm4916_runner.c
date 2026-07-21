@@ -235,6 +235,11 @@ struct runner_priv {
 	void __iomem		*natc;		/* xrdp + XRDP_OFF_NATC */
 	DECLARE_BITMAP(natc_occ, NATC_TABLE_SLOTS); /* hash-slot occupancy (RE 01 §3) */
 	struct dentry		*dbg;		/* debugfs dir */
+
+	/* one-shot RX-path diagnostic (BBH_RX PM counters + XLIF flags) */
+	struct delayed_work	diag_dwork;
+	u32			diag_bbh_port;	/* BBH_RX port to sample */
+	u32			diag_xlif_ch;	/* XLIF0 channel to sample */
 };
 
 /* ============================ FPM pool driver ============================ *
@@ -1226,6 +1231,12 @@ static int runner_dsptchr_init(struct runner_priv *p)
 	return 0;	/* non-fatal for first-light */
 }
 
+/* Per-BBH SDMA chunk allocation (each BBH gets its own slice of its SDMA's
+ * descriptor RAM; a shared base would collide). Indexed by bbh_id/port.
+ * [SDK data_path_init.c g_bbh_rx_buffers_offset / _num]. */
+static const u8 bbh_rx_chunk_off[13] = {0, 4, 8, 12, 16, 20, 0, 10, 20, 24, 28, 0, 12};
+static const u8 bbh_rx_chunk_num[13] = {4, 4, 4, 4,  4, 12, 10, 10, 4,  4,  4, 12, 12};
+
 /* configure + enable one BBH_RX MAC port and the LAN BBH_TX instance */
 static void runner_bbh_init(struct runner_priv *p, int rx_port)
 {
@@ -1236,19 +1247,37 @@ static void runner_bbh_init(struct runner_priv *p, int rx_port)
 	/* BBH_RX full per-port config [SDK bbh_rx_cfg / data_path_init.c]:
 	 *  BBCFG = SDMABBID[5:0] | DISPBBID[15:8] | SBPMBBID[23:16]
 	 *  DISPVIQ = NORMALVIQ | EXCLVIQ, both = bbh_id (★VIQ == bbh_id rule)
-	 *  SDMAADDR=0, SDMACFG=4 chunks, SOPOFFSET=0, SBPMCFG MAXREQ, ENABLE last.
+	 *  SDMAADDR/SDMACFG = per-port chunk slice, SOPOFFSET=0, MINPKT/MAXPKT
+	 *  size window, SBPMCFG MAXREQ, ENABLE last.
 	 * (Previously only DISPBBID/SBPMBBID + ENABLE were written -> the BBH could
 	 * not reassemble/enqueue a PD to the dispatcher.) */
 	{
 		u32 sdma_bb = (rx_port <= 5) ? BBH_BBID_SDMA0 : BBH_BBID_SDMA1;
+		u32 first   = (rx_port < 13) ? bbh_rx_chunk_off[rx_port] : 0;
+		u32 nchunks = (rx_port < 13) ? bbh_rx_chunk_num[rx_port] : 4;
 
 		writel(sdma_bb | ((u32)BBH_BBID_DISPATCHER << 8) |
 		       ((u32)BBH_BBID_SBPM << 16), rx + BBH_RX_BBCFG);
 		writel(((u32)rx_port & 0xff) | (((u32)rx_port & 0xff) << 8),
 		       rx + BBH_RX_DISPVIQ);
-		writel(0, rx + BBH_RX_SDMAADDR);
-		writel(BBH_RX_SDMACFG_VAL, rx + BBH_RX_SDMACFG);
-		writel(0, rx + BBH_RX_SOPOFFSET);
+		/* SDMAADDR = DATABASE | DESCBASE<<8 (both = first chunk index);
+		 * SDMACFG = NUMOFCD | EXCLTH<<8 (both = chunk count). Per-port to
+		 * avoid the shared-base collision. [drv_bbh_rx_sdma_configuration_set] */
+		writel((first & 0xff) | ((first & 0xff) << 8), rx + BBH_RX_SDMAADDR);
+		writel((nchunks & 0xff) | ((nchunks & 0xff) << 8), rx + BBH_RX_SDMACFG);
+		writel(0, rx + BBH_RX_SOPOFFSET);	/* SOP_OFFSET=0 for 6813 */
+		/* packet-size window (else every frame drops as TOOLONG): all 4
+		 * size profiles = [64 .. MAX_PKT], all per-flow selectors -> 0. */
+		writel(((u32)BBH_RX_MIN_ETH_PKT) * 0x01010101u, rx + BBH_RX_MINPKT0);
+		writel((BBH_RX_MAX_PKT & 0x3fff) | ((BBH_RX_MAX_PKT & 0x3fff) << 16),
+		       rx + BBH_RX_MAXPKT0);
+		writel((BBH_RX_MAX_PKT & 0x3fff) | ((BBH_RX_MAX_PKT & 0x3fff) << 16),
+		       rx + BBH_RX_MAXPKT1);
+		writel(0, rx + BBH_RX_MINPKTSEL0);
+		writel(0, rx + BBH_RX_MINPKTSEL1);
+		writel(0, rx + BBH_RX_MAXPKTSEL0);
+		writel(0, rx + BBH_RX_MAXPKTSEL1);
+		writel(255, rx + BBH_RX_PERFLOWTH);
 		writel(BBH_RX_SBPMCFG_VAL, rx + BBH_RX_SBPMCFG);
 		writel(BBH_RX_ENABLE_PKTEN | BBH_RX_ENABLE_SBPMEN,
 		       rx + BBH_RX_ENABLE);	/* LAST */
@@ -1260,6 +1289,90 @@ static void runner_bbh_init(struct runner_priv *p, int rx_port)
 	       tx + BBH_TX_BBCFG_1);
 	dev_info(p->dev, "bring-up: BBH_RX port %d + LAN BBH_TX configured\n",
 		 rx_port);
+}
+
+/* ============================ XLIF channel enable ======================= *
+ * XLIF is the XLMAC<->Runner interface for the 10G ports. After MAC bring-up
+ * its per-channel RX/TX still sit disabled (reset default), so frames from the
+ * MAC never cross into BBH_RX (rnr0 RX stays 0 even with link=1). The stock
+ * data_path_init() "setting up XLIF" block clears those disable bits
+ * (ag_drv_xlif0_rx_if_if_dis_set(ch,0) / ag_drv_xlif0_tx_if_if_enable_set(ch,0,0)),
+ * with tx_threshold=12 and urun_port_enable=0. Those accessors live in rdpa.ko
+ * (absent on the datapath-skip boot), so we write the registers directly.
+ * eth0 = XLIF0 channel 0, eth1 = XLIF0 channel 2 (channel == XLMAC mac index).
+ * [SDK BCM6813 data_path_init.c; regs from rdpa.o XLIF0_*_IF_ADDRS + XRDP_AG.h]
+ */
+static void runner_xport_xlif_enable(struct runner_priv *p, u32 channel)
+{
+	void __iomem *rx = p->xrdp + XRDP_OFF_XLIF0 +
+			   channel * XLIF0_CHANNEL_STRIDE + XLIF0_RX_IF_OFF;
+	void __iomem *tx = p->xrdp + XRDP_OFF_XLIF0 +
+			   channel * XLIF0_CHANNEL_STRIDE + XLIF0_TX_IF_OFF;
+
+	/* TX: no underrun-port stall, credit threshold 12 (stock values) */
+	writel(0, tx + XLIF_TX_IF_URUN_PORT_EN);
+	writel(12, tx + XLIF_TX_IF_TX_THRESHOLD);
+	/* clear the RX and TX disable bits -> frames flow MAC<->Runner */
+	writel(0, rx + XLIF_RX_IF_IF_DIS);
+	writel(0, tx + XLIF_TX_IF_IF_ENABLE);
+
+	dev_info(p->dev,
+		 "bring-up: XLIF0 ch%u enabled (rx_dis=0x%08x tx_en=0x%08x thr=0x%08x)\n",
+		 channel, readl(rx + XLIF_RX_IF_IF_DIS),
+		 readl(tx + XLIF_TX_IF_IF_ENABLE),
+		 readl(tx + XLIF_TX_IF_TX_THRESHOLD));
+}
+
+/* One-shot RX-path diagnostic: fired ~40 s after bring-up, once the link and
+ * far end have had time to send frames. Reads the BBH_RX PM counters (did any
+ * frame reach the Runner, and where does it die?) plus the XLIF RX flags, and
+ * logs to dmesg so the trial harness can read it. Purely read-only. */
+static void runner_diag_work(struct work_struct *work)
+{
+	struct runner_priv *p = container_of(work, struct runner_priv,
+					     diag_dwork.work);
+	void __iomem *rx = p->xrdp + XRDP_OFF_BBH_RX0 +
+			   p->diag_bbh_port * XRDP_BBH_RX_STRIDE;
+	void __iomem *xr = p->xrdp + XRDP_OFF_XLIF0 +
+			   p->diag_xlif_ch * XLIF0_CHANNEL_STRIDE + XLIF0_RX_IF_OFF;
+	void __iomem *mib = p->ethphytop + XPORT_MIB_CORE_OFF +
+			    p->diag_xlif_ch * XPORT_MIB_STRIDE;
+
+	/* XLMAC MIB: did the MAC receive ANY frame from the wire? (grxpkt>0 =
+	 * traffic reaching the MAC; if BBH inpkt stays 0 with grxpkt>0 the gap
+	 * is MAC->XLIF->BBH, else it is upstream / no traffic). */
+	dev_info(p->dev,
+		 "diag: XLMAC MIB[mac%u] grxpkt=%u grxpok=%u grx64=%u gtxpkt=%u\n",
+		 p->diag_xlif_ch, readl(mib + XPORT_MIB_GRXPKT),
+		 readl(mib + XPORT_MIB_GRXPOK), readl(mib + XPORT_MIB_GRX64),
+		 readl(mib + XPORT_MIB_GTXPKT));
+	dev_info(p->dev,
+		 "diag: BBH_RX[p%u] inpkt=%u tooshort=%u toolong=%u crc=%u dispcong=%u nosbpm=%u nosdma=%u runt=%u\n",
+		 p->diag_bbh_port,
+		 readl(rx + BBH_RX_PM_INPKT), readl(rx + BBH_RX_PM_TOOSHORT),
+		 readl(rx + BBH_RX_PM_TOOLONG), readl(rx + BBH_RX_PM_CRCERROR),
+		 readl(rx + BBH_RX_PM_DISPCONG), readl(rx + BBH_RX_PM_NOSBPMSBN),
+		 readl(rx + BBH_RX_PM_NOSDMACD), readl(rx + BBH_RX_PM_RUNTERROR));
+	dev_info(p->dev,
+		 "diag: XLIF0[ch%u] if_dis=0x%08x oflw=0x%08x err=0x%08x\n",
+		 p->diag_xlif_ch, readl(xr + 0x0), readl(xr + 0x4), readl(xr + 0x8));
+
+	/* Ground truth: the REAL XPHY copper link status (vs the forced MAC
+	 * SW_LINK_STATUS). dev 0x1e reg 0x400d: bit5=copper link up, [4:2]=speed
+	 * (6=10G,4=1G,1=2.5G,3=5G). link=0 -> no peer -> grxpkt=0 is expected.
+	 * [phy_drv_ext3.c _phy_read_status]. eth0 XPHY @ MDIO addr 9. */
+	if (p->diag_xlif_ch == 0) {
+		int (*c45r)(u32, u16, u16, u16 *) =
+			(void *)kallsyms_lookup_name("mdio_read_c45_register");
+		if (c45r) {
+			u16 st = 0;
+
+			c45r(XPHY0_MDIO_ADDR, 0x1e, 0x400d, &st);
+			dev_info(p->dev,
+				 "diag: XPHY[ad9] sts(1e.400d)=0x%04x link=%u speedmode=%u\n",
+				 st, (st >> 5) & 1, (st >> 2) & 7);
+		}
+	}
 }
 
 /* ============================ 10G XPHY (eth0) bring-up =================== *
@@ -1370,9 +1483,29 @@ static int runner_xphy_fw_load(struct runner_priv *p, u32 ad)
 		if (rv == 0x2040)
 			break;
 	}
-	dev_info(p->dev, "XPHY fw: uC %s (dev1.reg0=0x%04x, %d B)\n",
-		 rv == 0x2040 ? "RUNNING" : "NOT running", rv, total);
-	return rv == 0x2040 ? 0 : -EIO;
+	if (rv != 0x2040) {
+		dev_warn(p->dev, "XPHY fw: uC NOT running (dev1.reg0=0x%04x)\n", rv);
+		return -EIO;
+	}
+	dev_info(p->dev, "XPHY fw: uC RUNNING (%d B)\n", total);
+
+	/*
+	 * Post-firmware PHY config. For the XPHY the XFI/USXGMII/polarity commands
+	 * are firmware-internal no-ops (cmd_handler returns 0), so host config =
+	 * _phy_set_mode(line) + _phy_caps_set(10GBASE-T AN). [phy_drv_ext3.c
+	 * _phy_init / _phy_set_mode:2127 / _phy_caps_set:1826]. Advertise all speeds
+	 * up to 10G + pause + restart auto-neg (dev 0x07 = AN).
+	 */
+	c45w(ad, 0x1e, 0x4110, 0x0001);
+	c45w(ad, 0x1e, 0x4111, 0x0001);
+	c45w(ad, 0x1e, 0x4113, 0x1002);			/* set-mode: line side */
+	c45r(ad, 0x07, 0xffe4, &rv); rv = (rv & ~0x0ee0) | 0x05e0; c45w(ad, 0x07, 0xffe4, rv);
+	c45r(ad, 0x07, 0xffe9, &rv); rv = (rv & ~0x0700) | 0x0700; c45w(ad, 0x07, 0xffe9, rv);
+	c45r(ad, 0x07, 0x0020, &rv); rv = (rv & ~0x3180) | 0x3180; c45w(ad, 0x07, 0x0020, rv);
+	c45r(ad, 0x07, 0xffe0, &rv); rv = (rv & ~0x3140) | 0x1140; c45w(ad, 0x07, 0xffe0, rv);
+	c45w(ad, 0x07, 0xffe0, rv | 0x0200);		/* restart auto-neg */
+	dev_info(p->dev, "XPHY fw: 10G AN advertised (set-mode + caps + restart)\n");
+	return 0;
 }
 #else
 static int runner_xphy_fw_load(struct runner_priv *p, u32 ad) { return -ENOSYS; }
@@ -1459,7 +1592,21 @@ static void runner_xport_init(struct runner_priv *p, int xport_port_id)
 	writel(v, top + XPORT_TOP_CONTROL);
 	writel(XLMAC_CORE_TX_CTRL_CRC_PERPKT | XLMAC_CORE_TX_CTRL_PAD_EN,
 	       core + XLMAC_CORE_TX_CTRL);
-	writel(XLMAC_CORE_RX_CTRL_RX_PASS, core + XLMAC_CORE_RX_CTRL); /* runt_thr TBD */
+	/* RX_CTRL: rx_pass_ctrl=1 + runt_threshold=0x40 (rest 0 = strip_crc off so
+	 * BBH validates CRC, strict_preamble off for interop). [stock xlmac_init] */
+	writel(XLMAC_CORE_RX_CTRL_RX_PASS | (0x40u << XLMAC_CORE_RX_CTRL_RUNT_SHIFT),
+	       core + XLMAC_CORE_RX_CTRL);
+	/* ★ PFC_STATS_EN (bit35) = the stock "2.5G/10G AE HW work around". It lives
+	 * in the HIGH 32-bit word of the 64-bit PFC_CTRL, which a low-word writel()
+	 * never touches -> it has been stuck at its reset default. Set bit3 of the
+	 * high word, then re-commit the low word. [stock xport_xlmac_init]. */
+	{
+		void __iomem *pfc = core + XLMAC_CORE_PFC_CTRL;
+		u32 pfc_lo = readl(pfc);
+
+		writel(readl(pfc + 4) | (1u << 3), pfc + 4);	/* pfc_stats_en */
+		writel(pfc_lo, pfc);				/* commit */
+	}
 	writel((u32)XLMAC_CORE_MODE_SPEED_10G << XLMAC_CORE_MODE_SPEED_SHIFT,
 	       core + XLMAC_CORE_MODE);			/* SPEED_MODE = 10G (0x40) */
 	writel(XLMAC_CORE_RX_MAX_SIZE_VAL, core + XLMAC_CORE_RX_MAX_SIZE);
@@ -1469,18 +1616,28 @@ static void runner_xport_init(struct runner_priv *p, int xport_port_id)
 	writel(readl(mab + XPORT_MAB_CONTROL) &
 	       ~((1u<<(12+num)) | (1u<<(8+num)) | (1u<<(0+num)) | (1u<<(4+num))),
 	       mab + XPORT_MAB_CONTROL);
-	writel(0, prst + pctrl);			/* release port SW reset */
 
-	/* --- Phase C: enable RX/TX --- */
+	/* --- Phase C: wait for the PHY link BEFORE releasing the port from reset.
+	 * The XPORT port-reset state machine gates the MAC RX/TX datapath on
+	 * (SW_RESET released AND link up): stock xport_init() holds SW_RESET
+	 * asserted across MAC config + the link-status poll, and releases it LAST.
+	 * Releasing it while the link is still down leaves the SM holding
+	 * xlmac_rx_disab, so the MAC never receives even after the link later
+	 * comes up (observed: real XPHY link=1 at 10G but grxpkt=0). top_status
+	 * reflects the XPHY/PCS link, which trains independently of SW_RESET.
+	 * [xport_drv.c xport_init / xport_handle_link_up]. */
+	for (i = 0; i < 800; i++) {	/* up to ~8s: 10GBASE-T AN + PMD lock takes time */
+		if (readl(top + XPORT_TOP_STATUS) & (1u << num))
+			break;
+		msleep(10);
+	}
+	writel(0, prst + pctrl);			/* release port SW reset (LAST) */
+	udelay(2000);
+	/* enable the MAC RX/TX (the port-reset SM releases its internal
+	 * rx/tx_disab now that SW_RESET is clear and the link is up) */
 	writel(readl(core + XLMAC_CORE_CTRL) |
 	       XLMAC_CORE_CTRL_TX_EN | XLMAC_CORE_CTRL_RX_EN,
 	       core + XLMAC_CORE_CTRL);
-
-	for (i = 0; i < 3000; i++) {	/* up to 3s: XPHY PLL/PMD/AN link takes time */
-		if (readl(top + XPORT_TOP_STATUS) & (1u << num))
-			break;
-		udelay(1000);
-	}
 	dev_info(p->dev,
 		 "bring-up: XPORT id%d (xlmac0/p%d) 10G MAC enabled, link=%d "
 		 "(top_sts=0x%08x ctrl=0x%08x)\n",
@@ -2087,6 +2244,7 @@ static int runner_probe(struct platform_device *pdev)
 	 * XPHY is self-contained. bbh_id: xport_port_id 0 -> port5, 2 -> port6.
 	 * [re-notes/realhw/12-10g-xport-bringup.md]
 	 */
+	INIT_DELAYED_WORK(&p->diag_dwork, runner_diag_work);	/* armed only for 10G */
 	if (!runner_emulated && port10g >= 0) {
 		u32 pviq = (port10g == 0) ? 5 : 6;	/* xport_port_id 0->port5, 2->port6 */
 
@@ -2095,8 +2253,14 @@ static int runner_probe(struct platform_device *pdev)
 			runner_xphy_fw_load(p, XPHY0_MDIO_ADDR);	/* + load its uC firmware */
 		}
 		runner_xport_init(p, port10g);			/* 10G XPORT/XLMAC MAC */
+		runner_xport_xlif_enable(p, (u32)port10g);	/* open MAC<->Runner XLIF channel */
 		runner_bbh_init(p, pviq);			/* + its BBH_RX/TX */
 		runner_dsptchr_add_port_viq(p, pviq);		/* + dispatcher VIQ -> CPU_RX */
+
+		/* arm the RX-path diagnostic to sample BBH_RX counters at +40s */
+		p->diag_bbh_port = pviq;
+		p->diag_xlif_ch  = (u32)port10g;
+		schedule_delayed_work(&p->diag_dwork, msecs_to_jiffies(40000));
 	}
 	if (route_a)
 		runner_bbh_tx_route_a(p);	/* QMQ=1 binding so the TM core's queue egresses */
@@ -2154,6 +2318,8 @@ static void runner_remove(struct platform_device *pdev)
 {
 	struct runner_priv *p = platform_get_drvdata(pdev);
 	int c;
+
+	cancel_delayed_work_sync(&p->diag_dwork);	/* stop the RX-path diag probe */
 
 	/*
 	 * QUIESCE the Runner before devm frees the DMA rings/pool: the microcode'd
