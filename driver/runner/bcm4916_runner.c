@@ -1042,6 +1042,33 @@ static void runner_dsptchr_cpu_rx_setup(struct runner_priv *p)
 }
 
 /*
+ * Add an extra ingress port VIQ (e.g. a 10G XPORT port5/6) to the SAME CPU_RX
+ * dispatcher group set up by runner_dsptchr_cpu_rx_setup(). The port's BBH_RX
+ * already pushes to VIQ == bbh_id (runner_bbh_init); here we register that VIQ's
+ * credit-cfg + dest, OR it into the group's consumed-queue mask, and enable it.
+ * The CPU_RX core + task->group mapping are shared (already programmed for the
+ * first-light port). Frames then reach the same rnr0 conduit; the Runner
+ * microcode's flow-miss/unknown-SA default traps them to the CPU. If they do NOT
+ * arrive on rnr0 under traffic, the reason->TC->RXQ + SAL/DAL tables (Area 5)
+ * are the follow-up. [re-notes/realhw/12-10g-xport-bringup.md §4-5]
+ */
+static void runner_dsptchr_add_port_viq(struct runner_priv *p, u32 viq)
+{
+	void __iomem *d = p->xrdp + XRDP_OFF_DSPTCHR;
+	u32 grp   = DSPTCHR_CPU_RX_GROUP;
+	u32 bb_id = BBH_BBID_RX_BBH0 + 2 * viq;		/* port5 -> 41, port6 -> 43 */
+
+	writel(bb_id | (DSPTCHR_VIQ_TARGET_NORMAL << 8),
+	       d + DSPTCHR_QUEUE_CRDT_CFG + 4 * viq);
+	writel(0, d + DSPTCHR_Q_DEST + 4 * viq);	/* dest = dispatcher */
+	writel(readl(d + DSPTCHR_MASK_MSK_Q + 4 * grp) | (1u << viq),
+	       d + DSPTCHR_MASK_MSK_Q + 4 * grp);
+	writel(readl(d + DSPTCHR_VQ_EN) | (1u << viq), d + DSPTCHR_VQ_EN);
+	dev_info(p->dev, "bring-up: DSPTCHR ingress VIQ%u added (bb_id=%u -> CPU_RX grp%u)\n",
+		 viq, bb_id, grp);
+}
+
+/*
  * Register the CPU_TX EGRESS (delayed-credit) VIQ so the dispatcher GRANTS
  * egress credits to the CPU_TX thread. Without this the credit table (core-2
  * @0x29d0) stays 0 and the CPU_TX thread stalls after its initial buffers
@@ -1913,8 +1940,11 @@ static int runner_probe(struct platform_device *pdev)
 	 * [re-notes/realhw/12-10g-xport-bringup.md]
 	 */
 	if (!runner_emulated && port10g >= 0) {
+		u32 pviq = (port10g == 0) ? 5 : 6;	/* xport_port_id 0->port5, 2->port6 */
+
 		runner_xport_init(p, port10g);			/* 10G XPORT/XLMAC MAC */
-		runner_bbh_init(p, port10g == 0 ? 5 : 6);	/* + its BBH_RX/TX */
+		runner_bbh_init(p, pviq);			/* + its BBH_RX/TX */
+		runner_dsptchr_add_port_viq(p, pviq);		/* + dispatcher VIQ -> CPU_RX */
 	}
 	if (route_a)
 		runner_bbh_tx_route_a(p);	/* QMQ=1 binding so the TM core's queue egresses */
