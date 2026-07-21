@@ -42,6 +42,7 @@
 #include <linux/etherdevice.h>
 #include <linux/interrupt.h>
 #include <linux/firmware.h>
+#include <linux/fs.h>		/* filp_open/kernel_read: XPHY fw from /rom/etc/fw (4.19 trial) */
 #include <linux/delay.h>
 #include <linux/byteorder/generic.h>
 #include <linux/bitops.h>	/* test_and_set_bit/clear_bit for the NAT-C slot map */
@@ -1292,6 +1293,91 @@ static void runner_xphy_init(struct runner_priv *p, u32 xphy_id, u32 phyad)
 		 xphy_id, phyad, readl(test), readl(cntrl));
 }
 
+/* ============================ eth0 XPHY firmware load ==================== *
+ * Reimplements phy_drv_ext3.c load_blackfin() for the internal 10G XPHY (eth0,
+ * C45 MDIO addr 9): halt the on-chip uC, stream /rom/etc/fw/xphy_firmware.bin
+ * (179548 B ARM image) into on-chip RAM over C45 MDIO, reset the uC to run it,
+ * and poll running. Without firmware the XPHY cannot link (link=0). C45 access =
+ * the stock mdio_write/read_c45_register via kallsyms (4.19; same mechanism we
+ * use to read the 1G PHY). Register set = default_load_reg (dev 0x01: ctrl
+ * 0xa817, addr_low 0xa819/high 0xa81a, data_low 0xa81b/high 0xa81c).
+ * [SDK phy_drv_ext3.c:3170 load_blackfin / :2597 _load_firmware_file]
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+static int runner_xphy_fw_load(struct runner_priv *p, u32 ad)
+{
+	int (*c45w)(u32, u16, u16, u16) =
+		(void *)kallsyms_lookup_name("mdio_write_c45_register");
+	int (*c45r)(u32, u16, u16, u16 *) =
+		(void *)kallsyms_lookup_name("mdio_read_c45_register");
+	const char *path = "/rom/etc/fw/xphy_firmware.bin";
+	struct file *fp;
+	loff_t pos = 0;
+	u8 *buf;
+	int len, i, total = 0;
+	u16 rv = 0;
+
+	if (!c45w || !c45r) {
+		dev_warn(p->dev, "XPHY fw: mdio_*_c45_register absent - skip\n");
+		return -ENOSYS;
+	}
+	c45r(ad, 1, 2, &rv);
+	dev_info(p->dev, "XPHY fw: addr %u dev1.reg2(idhi)=0x%04x\n", ad, rv);
+
+	/* halt the XPHY uC */
+	c45w(ad, 0x1e, 0x4110, 0x0001); c45w(ad, 0x1e, 0x418c, 0x0000);
+	c45w(ad, 0x1e, 0x4188, 0x48f0); c45w(ad, 0x01, 0xa81a, 0xf000);
+	c45w(ad, 0x01, 0xa819, 0x3000); c45w(ad, 0x01, 0xa81c, 0x0000);
+	c45w(ad, 0x01, 0xa81b, 0x0121); c45w(ad, 0x01, 0xa817, 0x0009);
+	c45w(ad, 0x1e, 0x80a6, 0x0000); c45w(ad, 0x01, 0xa010, 0x0000);
+	c45w(ad, 0x01, 0x0000, 0x8000); mdelay(1);
+	c45w(ad, 0x1e, 0x4110, 0x0001); mdelay(1);
+
+	fp = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(fp)) {
+		dev_warn(p->dev, "XPHY fw: open %s failed (%ld)\n", path, PTR_ERR(fp));
+		return PTR_ERR(fp);
+	}
+	buf = kmalloc(1024, GFP_KERNEL);
+	if (!buf) { filp_close(fp, NULL); return -ENOMEM; }
+
+	/* stream the image into on-chip RAM (addr=0, ctrl=0x38, per-u32 hi/lo) */
+	c45w(ad, 0x01, 0xa819, 0x0000);		/* addr_low */
+	c45w(ad, 0x01, 0xa81a, 0x0000);		/* addr_high */
+	c45w(ad, 0x01, 0xa817, 0x0038);		/* ctrl: RAM write + autoinc */
+	while ((len = kernel_read(fp, buf, 1024, &pos)) > 0) {
+		for (i = 0; i + 3 < len; i += 4) {
+			u32 data = get_unaligned_le32(buf + i);
+
+			c45w(ad, 0x01, 0xa81c, data >> 16);	/* data_high */
+			c45w(ad, 0x01, 0xa81b, data & 0xffff);	/* data_low */
+			total += 4;
+		}
+	}
+	c45w(ad, 0x01, 0xa817, 0x0000);		/* ctrl off */
+	filp_close(fp, NULL);
+	kfree(buf);
+	dev_info(p->dev, "XPHY fw: streamed %d bytes\n", total);
+
+	/* reset the uC to run the code, then poll running (dev1.reg0 == 0x2040) */
+	c45w(ad, 0x01, 0xa81a, 0xf000); c45w(ad, 0x01, 0xa819, 0x3000);
+	c45w(ad, 0x01, 0xa81c, 0x0000); c45w(ad, 0x01, 0xa81b, 0x0020);
+	c45w(ad, 0x01, 0xa817, 0x0009); mdelay(2);
+	for (i = 0; i < 1000; i++) {
+		mdelay(2);
+		rv = 0;
+		c45r(ad, 0x01, 0x0000, &rv);
+		if (rv == 0x2040)
+			break;
+	}
+	dev_info(p->dev, "XPHY fw: uC %s (dev1.reg0=0x%04x, %d B)\n",
+		 rv == 0x2040 ? "RUNNING" : "NOT running", rv, total);
+	return rv == 0x2040 ? 0 : -EIO;
+}
+#else
+static int runner_xphy_fw_load(struct runner_priv *p, u32 ad) { return -ENOSYS; }
+#endif
+
 /* ============================ 10G XPORT MAC bring-up ===================== *
  * Bring up one 10G XPORT/XLMAC MAC: eth0/port5 = xport_port_id 0, eth1/port6 =
  * id 2 (both on physical XLMAC0; xport_num = id & 3). All register blocks live
@@ -2004,8 +2090,10 @@ static int runner_probe(struct platform_device *pdev)
 	if (!runner_emulated && port10g >= 0) {
 		u32 pviq = (port10g == 0) ? 5 : 6;	/* xport_port_id 0->port5, 2->port6 */
 
-		if (port10g == 0)
-			runner_xphy_init(p, 0, XPHY0_MDIO_ADDR);	/* eth0 internal 10G XPHY out of reset */
+		if (port10g == 0) {
+			runner_xphy_init(p, 0, XPHY0_MDIO_ADDR);	/* eth0 XPHY out of reset */
+			runner_xphy_fw_load(p, XPHY0_MDIO_ADDR);	/* + load its uC firmware */
+		}
 		runner_xport_init(p, port10g);			/* 10G XPORT/XLMAC MAC */
 		runner_bbh_init(p, pviq);			/* + its BBH_RX/TX */
 		runner_dsptchr_add_port_viq(p, pviq);		/* + dispatcher VIQ -> CPU_RX */
