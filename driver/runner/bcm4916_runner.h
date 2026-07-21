@@ -323,6 +323,26 @@
 #define QEGPHY_MDIO_ADDR		2
 
 /* ----------------------------------------------------------------------------
+ * Internal 10G XPHY (eth0 = xphy0 @MDIO addr 9) control in the eth-phy-top block
+ * (base ETH_PHY_TOP @0x837ff000 = ETHPHY_PHYS_BASE + 0xf000; offsets rel to
+ * p->ethphytop). The stock eth_phy_top.c xphy_init() (SKIPPED on the datapath-
+ * skip boot) releases the XPHY reset + sets its MDIO addr; without it eth0's
+ * XPHY stays in reset (link=0). 6813 offsets [eth_phy_top.c CONFIG_BCM96813].
+ * -------------------------------------------------------------------------- */
+#define ETHPHY_OFF_XPHY_TEST_CNTRL0	0x0000f234UL	/* abs 0x837ff234 */
+#define ETHPHY_OFF_XPHY_CNTRL0		0x0000f238UL	/* abs 0x837ff238 */
+#define ETHPHY_OFF_XPHY_TEST_CNTRL1	0x0000f240UL
+#define ETHPHY_OFF_XPHY_CNTRL1		0x0000f244UL
+#define ETHPHY_OFF_XPHY_MUX_SEL		0x0000f1fcUL	/* abs 0x837ff1fc (LED mux, =1) */
+#define XPHY_TEST_ISO_ENABLE		BIT(4)
+#define XPHY_TEST_TMODE			BIT(5)
+#define XPHY_CNTRL_SUPER_ISOLATE	BIT(0)
+#define XPHY_CNTRL_PHY_RESET		BIT(1)
+#define XPHY_CNTRL_PHYAD_SHIFT		2		/* [6:2] 5-bit MDIO addr */
+#define XPHY_CNTRL_PHYAD_MASK		0x1f
+#define XPHY0_MDIO_ADDR			9		/* eth0 xphy0-addr (DTS) */
+
+/* ----------------------------------------------------------------------------
  * 10G XPORT SerDes (merlin16_shortfin). Reached via an indirect register window
  * "brcm,serdes1" @ 0x837ff500 size 0x300 (separate ioremap, like the EGPHY).
  * Per-core block (core N at +N*0x100): ADDR @ +0x04, MASK @ +0x08, CNTRL @ +0xf0.

@@ -1261,6 +1261,37 @@ static void runner_bbh_init(struct runner_priv *p, int rx_port)
 		 rx_port);
 }
 
+/* ============================ 10G XPHY (eth0) bring-up =================== *
+ * Release the internal 10G XPHY (eth0 = xphy0 @MDIO addr 9) from reset via the
+ * eth-phy-top block. The stock eth_phy_top.c xphy_init() does this on a normal
+ * boot but our guard skips it, so eth0's XPHY sits in reset (link=0). Mirrors
+ * that sequence: clear iso/tmode in XPHY_TEST_CNTRL, then set phyad + clear
+ * phy_reset/super_isolate in XPHY_CNTRL, 100 ms settle each. The XPHY is a
+ * self-contained on-chip 10G PHY -> it should auto-link once out of reset (no
+ * merlin16 blob). [SDK eth_phy_top.c CONFIG_BCM96813 xphy_init]
+ */
+static void runner_xphy_init(struct runner_priv *p, u32 xphy_id, u32 phyad)
+{
+	void __iomem *test = p->ethphytop +
+		(xphy_id ? ETHPHY_OFF_XPHY_TEST_CNTRL1 : ETHPHY_OFF_XPHY_TEST_CNTRL0);
+	void __iomem *cntrl = p->ethphytop +
+		(xphy_id ? ETHPHY_OFF_XPHY_CNTRL1 : ETHPHY_OFF_XPHY_CNTRL0);
+	u32 v;
+
+	writel(1, p->ethphytop + ETHPHY_OFF_XPHY_MUX_SEL);	/* LED mux (stock=1) */
+	v = readl(test) & ~(XPHY_TEST_ISO_ENABLE | XPHY_TEST_TMODE);
+	writel(v, test);
+	mdelay(100);
+	v = readl(cntrl);
+	v &= ~(XPHY_CNTRL_SUPER_ISOLATE | XPHY_CNTRL_PHY_RESET |
+	       ((u32)XPHY_CNTRL_PHYAD_MASK << XPHY_CNTRL_PHYAD_SHIFT));
+	v |= (phyad & XPHY_CNTRL_PHYAD_MASK) << XPHY_CNTRL_PHYAD_SHIFT;
+	writel(v, cntrl);
+	mdelay(100);
+	dev_info(p->dev, "bring-up: XPHY%u out of reset (addr=%u) test=0x%08x cntrl=0x%08x\n",
+		 xphy_id, phyad, readl(test), readl(cntrl));
+}
+
 /* ============================ 10G XPORT MAC bring-up ===================== *
  * Bring up one 10G XPORT/XLMAC MAC: eth0/port5 = xport_port_id 0, eth1/port6 =
  * id 2 (both on physical XLMAC0; xport_num = id & 3). All register blocks live
@@ -1359,7 +1390,7 @@ static void runner_xport_init(struct runner_priv *p, int xport_port_id)
 	       XLMAC_CORE_CTRL_TX_EN | XLMAC_CORE_CTRL_RX_EN,
 	       core + XLMAC_CORE_CTRL);
 
-	for (i = 0; i < 100; i++) {
+	for (i = 0; i < 3000; i++) {	/* up to 3s: XPHY PLL/PMD/AN link takes time */
 		if (readl(top + XPORT_TOP_STATUS) & (1u << num))
 			break;
 		udelay(1000);
@@ -1973,6 +2004,8 @@ static int runner_probe(struct platform_device *pdev)
 	if (!runner_emulated && port10g >= 0) {
 		u32 pviq = (port10g == 0) ? 5 : 6;	/* xport_port_id 0->port5, 2->port6 */
 
+		if (port10g == 0)
+			runner_xphy_init(p, 0, XPHY0_MDIO_ADDR);	/* eth0 internal 10G XPHY out of reset */
 		runner_xport_init(p, port10g);			/* 10G XPORT/XLMAC MAC */
 		runner_bbh_init(p, pviq);			/* + its BBH_RX/TX */
 		runner_dsptchr_add_port_viq(p, pviq);		/* + dispatcher VIQ -> CPU_RX */
