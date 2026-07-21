@@ -1285,6 +1285,37 @@ static void runner_xport_init(struct runner_priv *p, int xport_port_id)
 	u32 v;
 	int i;
 
+	/*
+	 * ★POWER/CLOCK FIRST. The XLMAC block is NOT powered on the datapath-skip
+	 * boot: the stock mac_drv_xport port_xport_drv_init() calls
+	 * pmc_xport_power_on(xlmac_instance) (-> bcm_rpc_ba_xport_set_state) per
+	 * XLMAC, and our guard skips that -> the first XLMAC register access HANGS
+	 * the SoC. Call the stock kernel's pmc_xport_power_on() via kallsyms before
+	 * touching anything. xlmac instance = xport_port_id >> 2 (eth0/eth1 -> 0).
+	 * (4.19 vendor kernel exports kallsyms_lookup_name; a mainline port needs a
+	 * clk/reset/pmc driver instead.) [SDK misc/pmc/impl2/pmc_xport.c,
+	 * phy/mac_drv_xport.c:490]
+	 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+	{
+		int (*xport_pwr)(int) =
+			(void *)kallsyms_lookup_name("pmc_xport_power_on");
+
+		if (!xport_pwr) {
+			dev_warn(p->dev,
+				 "XPORT: pmc_xport_power_on not found - block unpowered, ABORT to avoid SoC hang\n");
+			return;
+		}
+		i = xport_pwr(xport_port_id >> 2);
+		dev_info(p->dev, "XPORT: pmc_xport_power_on(xlmac%d) rc=%d\n",
+			 xport_port_id >> 2, i);
+		mdelay(1);
+	}
+#else
+	dev_warn(p->dev, "XPORT: no pmc_xport_power_on path on this kernel - ABORT\n");
+	return;
+#endif
+
 	/* --- Phase A: init_driver -> leave the port in reset --- */
 	/* Px_SIG_EN: assert MAC/MAB reset+init strobes (rx/tx_disab b9/b8, xlmac
 	 * soft_reset b6, mab rx/tx_port_init b5/b4, tx_credit_disab b3, tx_fifo_init
