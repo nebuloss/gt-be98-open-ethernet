@@ -369,6 +369,60 @@
 #define SERDES_FW_SIZE		31664
 
 /* ----------------------------------------------------------------------------
+ * XPORT / XLMAC 10G MAC (ports 5/6 = eth0/eth1). The whole XPORT window
+ * 0x837f0000 size 0x8000 lives INSIDE the already-mapped p->ethphytop region
+ * (ETHPHY_PHYS_BASE 0x837f0000, size 0x10000) -> all offsets below are relative
+ * to ETHPHY_PHYS_BASE / p->ethphytop, no extra ioremap.
+ *
+ * MAC instance is chosen by DT mac-index (=xport_port_id), NOT the switch port:
+ *   eth0 = xport_port_id 0 -> XLMAC0 / port 0 -> XLMAC_CORE @ +0x0000
+ *   eth1 = xport_port_id 2 -> XLMAC0 / port 2 -> XLMAC_CORE @ +0x0800
+ * Both 10G ports are on physical XLMAC0 (TOP/MAB/PORTRESET @ +0x2000/3300/3400).
+ * xport_num = xport_port_id & 3 (0 and 2). [re-notes/realhw/12-10g-xport-bringup.md
+ * §2; SDK xport/xport_drv.c, XPORT_AG.h]  ⚠ XLMAC_CORE regs are 64-bit committed
+ * by a single low-word 32-bit write: fields >bit31 (TX_THRESHOLD b38, PFC_STATS
+ * b35) are NOT delivered by writel() and rely on HW default.
+ * -------------------------------------------------------------------------- */
+#define XPORT_OFF_XLMAC0_CORE	0x00000000UL	/* + xport_num*0x400 (port stride) */
+#define XPORT_XLMAC_PORT_STRIDE	0x00000400UL
+#define XPORT_OFF_TOP		0x00002000UL	/* XLMAC0 TOP */
+#define XPORT_OFF_MAB		0x00003300UL	/* XLMAC0 MAB */
+#define XPORT_OFF_PORTRESET	0x00003400UL	/* XLMAC0 PORTRESET */
+/* XLMAC_CORE per-port (base XPORT_OFF_XLMAC0_CORE + port*0x400) */
+#define XLMAC_CORE_CTRL		0x00		/* TX_EN b0, RX_EN b1, SOFT_RESET b6 */
+#define XLMAC_CORE_CTRL_TX_EN	BIT(0)
+#define XLMAC_CORE_CTRL_RX_EN	BIT(1)
+#define XLMAC_CORE_CTRL_SOFT_RESET BIT(6)
+#define XLMAC_CORE_MODE		0x08		/* SPEED_MODE[6:4]; 10G = 4 -> 0x40 */
+#define XLMAC_CORE_MODE_SPEED_SHIFT 4
+#define XLMAC_CORE_MODE_SPEED_10G 4
+#define XLMAC_CORE_TX_CTRL	0x20		/* CRC_MODE[1:0]=3, PAD_EN b4 */
+#define XLMAC_CORE_TX_CTRL_CRC_PERPKT 0x3
+#define XLMAC_CORE_TX_CTRL_PAD_EN BIT(4)
+#define XLMAC_CORE_RX_CTRL	0x30		/* STRIP_CRC b2=0, RUNT_THR[?]=0x40, RX_PASS_CTRL b13 */
+#define XLMAC_CORE_RX_CTRL_RX_PASS BIT(13)
+#define XLMAC_CORE_RX_MAX_SIZE	0x40
+#define XLMAC_CORE_RX_MAX_SIZE_VAL 0x3fff
+#define XLMAC_CORE_RX_LSS_CTRL	0x50		/* LOCAL_FAULT_DISABLE */
+#define XLMAC_CORE_RX_LSS_LOCAL_FAULT_DIS BIT(0)
+#define XLMAC_CORE_PAUSE_CTRL	0x68
+#define XLMAC_CORE_PFC_CTRL	0x70
+/* XPORT TOP (base XPORT_OFF_TOP) */
+#define XPORT_TOP_CONTROL	0x00		/* Px_MODE (2b/port); 10G/XGMII = 1 */
+#define XPORT_TOP_CONTROL_MODE_XGMII 1
+#define XPORT_TOP_STATUS	0x04		/* LINK_STATUS bit (1<<xport_num) */
+/* XPORT MAB (base XPORT_OFF_MAB) */
+#define XPORT_MAB_CONTROL	0x00		/* RX_PORT_RST b(0+num), TX_PORT_RST b(4+num), TX_CREDIT_DISAB b(12+num), TX_FIFO_RST b(8+num) */
+#define XPORT_MAB_TX_WRR_CTRL	0x04
+/* XPORT PORTRESET (base XPORT_OFF_PORTRESET) */
+#define XPORT_PORTRESET_CONFIG	0x10		/* LINK_DOWN_RST_EN, ENABLE_SM_RUN[per-port], TICK_TIMER_NDIV */
+#define XPORT_PORTRESET_P0_CTRL	0x00		/* port0 SW reset; PORT_SW_RESET b0 */
+#define XPORT_PORTRESET_P2_CTRL	0x08		/* port2 */
+#define XPORT_PORTRESET_CTRL_SW_RESET BIT(0)
+#define XPORT_PORTRESET_P0_SIG_EN 0x30		/* port0 */
+#define XPORT_PORTRESET_P2_SIG_EN 0x90		/* port2 */
+
+/* ----------------------------------------------------------------------------
  * FPM register block. Layout from the GPL FpmControl struct (fpm_priv.h):
  *   ctrl  @ 0x0000, pool(broadcast) @ 0x0200, pool0 @ 0x0400, pool1 @ 0x0600.
  * The alloc/dealloc register is at +0x000 of the pool0 management block,
