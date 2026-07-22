@@ -779,6 +779,19 @@ struct runner_ring_cfg {
  * advances, QM occupancy AND drop counters both stay 0).
  * [rdd_data_structures_auto.h TX_FLOW_ENTRY_STRUCT; spec 11 sec D
  *  rdd_tx_flow_enable(); for non-PON/DSL tx_flow = port] */
+/* CPU_TX_SYNC_FIFO (image_2 / core 2, RDD 0x3780): 2 x
+ * CPU_TX_SYNC_FIFO_ENTRY_STRUCT, 8 B each, one per CPU_TX thread (6 and 7).
+ * Big-endian: write_ptr:u16 | read_ptr:u16 | fifo:u16 | reserved:u16.
+ * Live stock seeds write_ptr == read_ptr with a valid RDD address (empty ring):
+ *   entry[0] 0x3784/0x3784 fifo 0   entry[1] 0x378d/0x378d fifo 1
+ * We left it all-zero, i.e. the pointers are not valid RDD addresses.
+ * [rdd_data_structures_auto.h CPU_TX_SYNC_FIFO_ENTRY_STRUCT; live stock dump] */
+#define RDD_CPU_TX_SYNC_FIFO		0x3780
+#define RDD_CPU_TX_SYNC_FIFO_E0_PTRS	0x37843784	/* write_ptr|read_ptr */
+#define RDD_CPU_TX_SYNC_FIFO_E0_FIFO	0x00000000	/* fifo 0 | reserved */
+#define RDD_CPU_TX_SYNC_FIFO_E1_PTRS	0x378d378d
+#define RDD_CPU_TX_SYNC_FIFO_E1_FIFO	0x00010000	/* fifo 1 | reserved */
+
 #define RDD_VPORT_TX_FLOW_TABLE		0x0fc0
 #define RDD_VPORT_TX_FLOW_ENTRIES	64
 #define RDD_TX_FLOW_ENTRY_VALID		0x80	/* valid=1, qos_table_ptr=0 */

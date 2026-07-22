@@ -1433,6 +1433,25 @@ static void runner_xport_xlif_enable(struct runner_priv *p, u32 channel)
 		 readl(tx + XLIF_TX_IF_TX_THRESHOLD));
 }
 
+/* Seed the image_2 CPU_TX_SYNC_FIFO the way live stock does: write_ptr ==
+ * read_ptr (empty) but pointing at a VALID RDD address, one entry per CPU_TX
+ * thread. We were leaving it all-zero, so the threads' FIFO pointers were not
+ * valid RDD addresses. Logs the prior contents so a trial shows both the
+ * before-state and the effect. */
+static void runner_cpu_tx_sync_fifo_init(struct runner_priv *p)
+{
+	void __iomem *f = p->rnr_mem[CPU_TX_RING_CORE] + RDD_CPU_TX_SYNC_FIFO;
+	u32 was0 = be32_to_cpu(readl(f)), was1 = be32_to_cpu(readl(f + 8));
+
+	writel(cpu_to_be32(RDD_CPU_TX_SYNC_FIFO_E0_PTRS), f + 0);
+	writel(cpu_to_be32(RDD_CPU_TX_SYNC_FIFO_E0_FIFO), f + 4);
+	writel(cpu_to_be32(RDD_CPU_TX_SYNC_FIFO_E1_PTRS), f + 8);
+	writel(cpu_to_be32(RDD_CPU_TX_SYNC_FIFO_E1_FIFO), f + 12);
+	dev_info(p->dev,
+		 "bring-up: CPU_TX_SYNC_FIFO seeded (e0 0x%08x->0x%08x, e1 0x%08x->0x%08x)\n",
+		 was0, be32_to_cpu(readl(f)), was1, be32_to_cpu(readl(f + 8)));
+}
+
 /* Mark a vport's TX flow entry VALID in the image_2 VPORT_TX_FLOW_TABLE, the
  * equivalent of the stock rdd_tx_flow_enable(). A CPU_TX descriptor with
  * is_vport=1 makes the microcode resolve the egress target through this table;
@@ -2391,8 +2410,10 @@ static int runner_probe(struct platform_device *pdev)
 	 * [re-notes/realhw/12-10g-xport-bringup.md]
 	 */
 	/* make the CPU_TX egress vport resolvable (needed when tx_is_vport=1) */
-	if (tx_port >= 0)
+	if (tx_port >= 0) {
+		runner_cpu_tx_sync_fifo_init(p);
 		runner_rdd_tx_flow_enable(p, (u32)tx_port);
+	}
 
 	INIT_DELAYED_WORK(&p->diag_dwork, runner_diag_work);	/* armed only for 10G */
 	if (!runner_emulated && port10g >= 0) {
