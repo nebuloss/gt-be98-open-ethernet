@@ -1191,6 +1191,45 @@ static void runner_qm_init(struct runner_priv *p)
 	       QM_RNR_CFG_RNR_ENABLE,
 	       qm + grpoff + QM_RUNNER_GRP_RNR_CONFIG);
 
+	/* 3b. ★PER-QUEUE CONTEXT. The SRAM auto-init leaves every queue at WRED
+	 * profile 15 (= drop-all) and its DQM output-logic disabled, so a PD
+	 * enqueued here is silently discarded - exactly the observed "CPU_TX
+	 * accepted, XLMAC gtxpkt=0, zero errors anywhere". Program a pass-through
+	 * WRED profile, point the queue at it, and enable the queue.
+	 * [spec 11 sec C: qm_q_context_set + dqm_dqmol_cfgb_set(Q,1)] */
+	{
+		void __iomem *wred = qm + QM_WRED_PROFILE_BASE +
+				     QM_WRED_PROFILE_PASS * QM_WRED_PROFILE_STEP;
+		void __iomem *qctx = qm + QM_QUEUE_CONTEXT +
+				     (route_a_queue & 0x1ff) * QM_QUEUE_CONTEXT_STEP;
+		void __iomem *cfgb = p->xrdp + XRDP_OFF_DQM + DQM_DQMOL_CFGB +
+				     (route_a_queue & 0x1ff) * DQM_DQMOL_CFGB_STEP;
+		u32 ctx, oldb, newb;
+
+		/* thresholds at max for both colors => WRED never drops */
+		writel(QM_WRED_THR_MAX, wred + QM_WRED_MIN_THR_0);
+		writel(QM_WRED_THR_MAX, wred + QM_WRED_MIN_THR_1);
+		writel(QM_WRED_THR_MAX, wred + QM_WRED_MAX_THR_0);
+		writel(QM_WRED_THR_MAX, wred + QM_WRED_MAX_THR_1);
+
+		/* queue context: pass-through WRED profile, FPM user-group 0,
+		 * no DDR copy / no aggregation (slow-path CPU_TX egress). */
+		ctx = ((QM_WRED_PROFILE_PASS & QM_QCTX_WRED_PROFILE_MASK)
+		       << QM_QCTX_WRED_PROFILE_SHIFT) |
+		      ((0u & QM_QCTX_FPM_UG_MASK) << QM_QCTX_FPM_UG_SHIFT) |
+		      QM_QCTX_DDR_COPY_DISABLE | QM_QCTX_AGGREGATION_DISABLE;
+		writel(ctx, qctx);
+
+		/* enable the queue's DQM output logic (preserve token/watermark) */
+		oldb = readl(cfgb);
+		writel(oldb | DQM_DQMOL_CFGB_ENABLE, cfgb);
+		newb = readl(cfgb);
+		dev_info(p->dev,
+			 "route_a: QM q%u ctx=0x%08x (wred prof%u pass) dqmol_cfgb 0x%08x->0x%08x\n",
+			 route_a_queue, readl(qctx), QM_WRED_PROFILE_PASS,
+			 oldb, newb);
+	}
+
 	/* 4. enable the QM now that SRAM/FPM/grp are configured (full stock 0x307). */
 	en = qm_enable ? qm_enable : QM_ENABLE_CTRL_STOCK;
 	writel(en, qm + QM_GLOBAL_QM_ENABLE_CTRL);
@@ -1216,17 +1255,30 @@ static void runner_bbh_tx_route_a(struct runner_priv *p)
 	 * ★SILICON and left 0 - the QM RUNNER_GRP drives the wakeup regardless. */
 	writel((route_a_tm_task & 0xf) << BBH_TX_RNRCFG_2_TASK_SHIFT,
 	       tx + BBH_TX_RNRCFG_2_0);
-	/* Take THIS BBH's target queue from the QM aggregator (both register
-	 * views). ★The queue index matters: on 6813 BBH_TX_ID_LAN(0) carries
-	 * QGPHY on q0-3, XLMAC0 port1 on q4 and **XLMAC0 port0 (eth0) on q5**;
-	 * BBH_TX_ID_LAN_1(2) carries XLMAC0 port2 (eth1) on q0. Hardcoding q0
-	 * could never reach eth0. [6813 rdp_platform.h bbh_id_e comments] */
-	writel(1u << (route_a_bbh_q & 0x1f), tx + BBH_TX_QMQ_LAN);
-	writel(1u << (route_a_bbh_q & 0x1f), tx + BBH_TX_QMQ_UNIFIED);
-	dev_info(p->dev,
-		 "route_a: BBH_TX inst%u q%u QM-fed (QMQ=0x%08x, tm_bb=%u task=%u)\n",
-		 route_a_bbh_inst, route_a_bbh_q, 1u << (route_a_bbh_q & 0x1f),
-		 route_a_tm_bb_id, route_a_tm_task);
+	/* Take THIS BBH's target queue from the QM aggregator. ★The queue index
+	 * matters: on 6813 BBH_TX_ID_LAN(0) carries QGPHY on q0-3, XLMAC0 port1
+	 * on q4 and **XLMAC0 port0 (eth0) on q5**; BBH_TX_ID_LAN_1(2) carries
+	 * XLMAC0 port2 (eth1) on q0. [6813 rdp_platform.h bbh_id_e comments]
+	 *
+	 * ★QMQ is PAIR-INDEXED, not a bitmap: UNIFIED_CONFIGURATIONS_QMQ is a
+	 * 4-entry RAM (step 4) holding only Q0[0]/Q1[1] -- two queues each. So
+	 * queue q lives in entry q>>1 at bit q&1; a naive `1 << q` lands in the
+	 * RESERVED bits and is silently dropped (verified on silicon: wrote 0x20
+	 * for q5, read back 0x00000000). The LAN view (+0x4b0) reads 0xdeadbeef
+	 * on instance 0 = not implemented there, so only the unified view is
+	 * programmed. RMW so sibling queues in the same pair are preserved. */
+	{
+		void __iomem *qmq = tx + BBH_TX_QMQ_UNIFIED +
+				    ((route_a_bbh_q >> 1) & 0x3) * 4;
+		u32 bit = 1u << (route_a_bbh_q & 1);
+
+		writel(readl(qmq) | bit, qmq);
+		dev_info(p->dev,
+			 "route_a: BBH_TX inst%u q%u QM-fed (QMQ[%u] bit%u -> 0x%08x, tm_bb=%u task=%u)\n",
+			 route_a_bbh_inst, route_a_bbh_q,
+			 (route_a_bbh_q >> 1) & 0x3, route_a_bbh_q & 1,
+			 readl(qmq), route_a_tm_bb_id, route_a_tm_task);
+	}
 }
 
 static int runner_dsptchr_init(struct runner_priv *p)

@@ -142,6 +142,37 @@
 #define QM_RUNNER_GRP_REG(grp, reg) \
 	(QM_RUNNER_GRP_BASE + (u32)(grp) * QM_RUNNER_GRP_STRIDE + (reg))
 
+/* ---- per-queue QM context (spec 11 sec C: qm_q_context_set + queue enable) --
+ * Without these a queue keeps its init-default WRED profile 15 = DROP-ALL and
+ * stays disabled, so every enqueued PD is silently discarded (observed:
+ * CPU_TX accepted but XLMAC gtxpkt=0 with zero errors on every counter).
+ * ⚠ Field layout is 6813-SPECIFIC — BCM6888 shifts FPM_UG/EXCL differently.
+ * [BCM6813 XRDP_AG.h QM_QUEUE_CONTEXT_CONTEXT_* + ru_reg_rec RAM steps] */
+#define QM_QUEUE_CONTEXT	0x800		/* RAM, 160 queues, step 4 */
+#define QM_QUEUE_CONTEXT_STEP	4
+#define   QM_QCTX_WRED_PROFILE_SHIFT	0	/* [3:0]  15 = drop-all default */
+#define   QM_QCTX_WRED_PROFILE_MASK	0xf
+#define   QM_QCTX_COPY_DEC_PROFILE_SHIFT 4	/* [6:4] */
+#define   QM_QCTX_DDR_COPY_DISABLE	BIT(8)
+#define   QM_QCTX_AGGREGATION_DISABLE	BIT(9)
+#define   QM_QCTX_FPM_UG_SHIFT		10	/* [12:10] */
+#define   QM_QCTX_FPM_UG_MASK		0x7
+#define   QM_QCTX_EXCLUSIVE_PRIORITY	BIT(13)
+#define   QM_QCTX_RES_PROFILE_SHIFT	17	/* [19:17] */
+/* WRED profile RAM: 16 profiles, step 48; thresholds are 24-bit */
+#define QM_WRED_PROFILE_BASE	0x1000
+#define QM_WRED_PROFILE_STEP	48
+#define   QM_WRED_MIN_THR_0	0x00		/* MIN_THR [23:0], FLW_CTRL_EN b24 */
+#define   QM_WRED_MIN_THR_1	0x04
+#define   QM_WRED_MAX_THR_0	0x10		/* MAX_THR [23:0] */
+#define   QM_WRED_MAX_THR_1	0x14
+#define   QM_WRED_THR_MAX	0x00ffffffu	/* max threshold = never drop */
+#define QM_WRED_PROFILE_PASS	0		/* the profile we program to pass */
+/* DQM per-queue output-logic enable (block base XRDP_OFF_DQM) */
+#define DQM_DQMOL_CFGB		0x1fd4		/* RAM, 160 queues, step 32 */
+#define DQM_DQMOL_CFGB_STEP	32
+#define   DQM_DQMOL_CFGB_ENABLE	BIT(31)
+
 /* ----------------------------------------------------------------------------
  * RNR_REGS per-core control block (base XRDP_OFF_RNR_REGS0 + core*stride).
  * Offsets/values pinned vs BCM6813 rdpa.ko + CFE2 data_path_init / rdp_drv_rnr.c
