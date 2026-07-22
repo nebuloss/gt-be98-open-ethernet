@@ -182,6 +182,14 @@ MODULE_PARM_DESC(loopback,
  * [26:20] as a raw EMAC port and cannot resolve an egress target, so it
  * consumes the descriptor and discards it -- observed exactly: read_idx
  * advances but the QM never receives a PD (occupancy 0 AND drops 0). */
+/* Arm the Runner profiling window on the CPU_TX core, counting ONLY this task,
+ * so the 7 stall counters report why that thread parks. -1 = off. */
+static int profile_task = -1;
+module_param(profile_task, int, 0444);
+MODULE_PARM_DESC(profile_task,
+		 "Arm task-selective Runner profiling for this thread number on "
+		 "the CPU_TX core (e.g. 6). -1 = off (default).");
+
 static bool tx_is_vport;
 module_param(tx_is_vport, bool, 0444);
 MODULE_PARM_DESC(tx_is_vport,
@@ -994,6 +1002,8 @@ static void runner_thread_regfile_init(struct runner_priv *p)
 			   RNR_CPU_RX_THREAD * 128;
 	void __iomem *tx = p->rnr_mem[CPU_TX_RING_CORE] + XRDP_RNR_CNTXT_OFF +
 			   RNR_CPU_TX_THREAD * 128;
+	void __iomem *tx1 = p->rnr_mem[CPU_TX_RING_CORE] + XRDP_RNR_CNTXT_OFF +
+			    RNR_CPU_TX_THREAD_1 * 128;
 
 	/* CPU_RX: image_3 / core3 / thread1 */
 	iowrite32be(0x00001624, rx + 0  * 4);	/* R0  entry: cpu_rx_wakeup_request */
@@ -1004,15 +1014,52 @@ static void runner_thread_regfile_init(struct runner_priv *p)
 	iowrite32be(0x00002bd0, rx + 30 * 4);	/* R30 stack top */
 	iowrite32be(0x00000001, rx + 31 * 4);	/* R31 CONST_1 */
 
-	/* CPU_TX: image_2 / core2 / thread6 */
-	iowrite32be(0x00000215, tx + 0  * 4);	/* R0  entry: cpu_tx_wakeup_request */
-	iowrite32be(0x00000006, tx + 8  * 4);	/* R8  thread number */
-	iowrite32be(0x00003340, tx + 30 * 4);	/* R30 stack top */
-	iowrite32be(0x00000001, tx + 31 * 4);	/* R31 CONST_1 */
+	/* ★CPU_TX threads 6 and 7 (image_2 / core 2): the FULL register file,
+	 * captured verbatim off a LIVE STOCK boot (RNR_CNTXT[2] + thread*128).
+	 * The per-thread context is what hands the task every pointer it needs -
+	 * ring descriptor 0x33e0, ring indices 0x29c8, sync FIFO 0x3780/0x3788,
+	 * counter-reply 0x2b80/0x2ba0, queue-threshold 0x35c0 - plus its entry PC
+	 * and stack top. We previously seeded only 4 registers (r0/r8/r30/r31)
+	 * from a partial RE, leaving every table pointer at zero, which is why a
+	 * woken thread did a couple of descriptors and then parked.
+	 *
+	 * SAFE TO REPLAY: these are all RDD/SRAM offsets and small scalars. The
+	 * per-boot DDR physical addresses live in the ring descriptor at
+	 * 0x33e0+8/+15 (written from our own dma_alloc), NOT here.
+	 * [live stock RNR_CNTXT[2]; image_2 thread map rdd_data_structures_auto.h] */
+	{
+		static const u32 tx0_regs[32] = {
+			0x00600221, 0x00000000, 0x00000000, 0x000033e0,
+			0x000000e7, 0x0000ffff, 0x00ffffff, 0x000035c0,
+			0x00003788, 0x00000000, 0x0001376b, 0x00000012,
+			0x00000000, 0x0000001f, 0x00000038, 0x00003324,
+			0x000000a6, 0x00000000, 0x4828005c, 0x4112005a,
+			0x80000400, 0x000000a6, 0x00002b80, 0x00003780,
+			0x00000014, 0x00003788, 0x0000105d, 0x00000080,
+			0x000029c8, 0x00000000, 0x000032c0, 0x00000001,
+		};
+		static const u32 tx1_regs[32] = {
+			0x00600221, 0x00000000, 0x00000000, 0x000033e0,
+			0x000000e8, 0x0000ffff, 0x00ffffff, 0x000035c0,
+			0x00003788, 0x00000001, 0x0001376b, 0x00000012,
+			0x00000000, 0x0000001f, 0x00000038, 0x00003524,
+			0x00000066, 0x00000001, 0x4828002c, 0x4092002c,
+			0x80000400, 0x00000066, 0x00002ba0, 0x00003780,
+			0x00000014, 0x00003788, 0x0000105d, 0x00000080,
+			0x000029c8, 0x00000010, 0x000034c0, 0x00000001,
+		};
+		int i;
 
-	dev_info(p->dev, "bring-up: CPU thread regfiles initialized (RX c%d/t%d, TX c%d/t%d)\n",
+		for (i = 0; i < 32; i++) {
+			iowrite32be(tx0_regs[i], tx  + i * 4);
+			iowrite32be(tx1_regs[i], tx1 + i * 4);
+		}
+	}
+
+	dev_info(p->dev,
+		 "bring-up: CPU thread regfiles initialized (RX c%d/t%d, TX c%d/t%d+t%d full 32-reg stock context)\n",
 		 CPU_RX_RING_CORE, RNR_CPU_RX_THREAD,
-		 CPU_TX_RING_CORE, RNR_CPU_TX_THREAD);
+		 CPU_TX_RING_CORE, RNR_CPU_TX_THREAD, RNR_CPU_TX_THREAD_1);
 }
 
 static void runner_rnr_enable(struct runner_priv *p)
@@ -1035,6 +1082,9 @@ static void runner_rnr_enable(struct runner_priv *p)
 	writel(RNR_CPU_RX_THREAD & RNR_CFG_CPU_WAKEUP_THREAD_MASK,
 	       p->rnr_regs[CPU_RX_RING_CORE] + RNR_CFG_CPU_WAKEUP);
 	writel(RNR_CPU_TX_THREAD & RNR_CFG_CPU_WAKEUP_THREAD_MASK,
+	       p->rnr_regs[CPU_TX_RING_CORE] + RNR_CFG_CPU_WAKEUP);
+	/* ★also start the peer CPU_TX task (image_2 runs two, and they sync) */
+	writel(RNR_CPU_TX_THREAD_1 & RNR_CFG_CPU_WAKEUP_THREAD_MASK,
 	       p->rnr_regs[CPU_TX_RING_CORE] + RNR_CFG_CPU_WAKEUP);
 	dev_info(p->dev,
 		 "bring-up: RNR enabled + CPU threads woken (RX core%d/thr%d, TX core%d/thr%d)\n",
@@ -1447,6 +1497,27 @@ static void runner_xport_xlif_enable(struct runner_priv *p, u32 channel)
 		 readl(tx + XLIF_TX_IF_TX_THRESHOLD));
 }
 
+/* Arm the CPU_TX core's profiling window to count ONE task, so the otherwise
+ * inert stall counters become a direct answer to "why does this thread park".
+ * Reset the window, select the task, then enable + manual-start. */
+static void runner_profile_arm(struct runner_priv *p, u32 task)
+{
+	void __iomem *r = p->rnr_regs[CPU_TX_RING_CORE];
+	u32 cfg;
+
+	if (!r)
+		return;
+	writel(PROF_CFG1_WINDOW_RESET, r + RNR_CFG_PROFILING_CFG_1);
+	cfg = PROF_CFG1_COUNTERS_SEL_TASK |
+	      ((task & 0xf) << PROF_CFG1_COUNTERS_TASK_SHIFT) |
+	      PROF_CFG1_WINDOW_MODE | PROF_CFG1_WINDOW_ENABLE |
+	      PROF_CFG1_WINDOW_MANUAL_START;
+	writel(cfg, r + RNR_CFG_PROFILING_CFG_1);
+	dev_info(p->dev, "bring-up: profiling armed for task %u (cfg1=0x%08x sts=0x%08x)\n",
+		 task, readl(r + RNR_CFG_PROFILING_CFG_1),
+		 readl(r + RNR_CFG_PROFILING_STS));
+}
+
 /* Configure a vport in the image_2 VPORT_CFG_TABLE + QUEUE_THRESHOLD_VECTOR.
  * A vport left at 0 is simply unconfigured, so the microcode has no VIQ /
  * bb_rx_id / is_lan for it and cannot build an egress. The entry is rebuilt
@@ -1583,6 +1654,38 @@ static void runner_diag_work(struct work_struct *work)
 	dev_info(p->dev,
 		 "diag: XLIF0[ch%u] if_dis=0x%08x oflw=0x%08x err=0x%08x\n",
 		 p->diag_xlif_ch, readl(xr + 0x0), readl(xr + 0x4), readl(xr + 0x8));
+
+	/* CPU_TX core: profiling status + the task-selective stall counters */
+	if (p->rnr_regs[CPU_TX_RING_CORE]) {
+		void __iomem *r = p->rnr_regs[CPU_TX_RING_CORE];
+		u32 sts = readl(r + RNR_CFG_PROFILING_STS);
+		u32 s[RNR_CFG_STALL_CNT_N];
+		int i;
+
+		for (i = 0; i < RNR_CFG_STALL_CNT_N; i++)
+			s[i] = readl(r + RNR_CFG_STALL_CNT1 + i * 4);
+		dev_info(p->dev,
+			 "diag: RNR core%d sts=0x%08x (curr_thr=%u idle_no_task=%u prof_active=%u) pc=0x%04x\n",
+			 CPU_TX_RING_CORE, sts,
+			 (sts >> PROF_STS_CURR_THREAD_SHIFT) & 0xf,
+			 !!(sts & PROF_STS_IDLE_NO_ACTIVE_TASK),
+			 !!(sts & PROF_STS_PROFILING_ACTIVE),
+			 readl(r + RNR_CFG_PC_STS) & 0x1fff);
+		dev_info(p->dev,
+			 "diag: stall[1..7]=%u,%u,%u,%u,%u,%u,%u exec=%u idle=%u jmp=%u\n",
+			 s[0], s[1], s[2], s[3], s[4], s[5], s[6],
+			 readl(r + RNR_CFG_EXEC_CMDS_CNT),
+			 readl(r + RNR_CFG_IDLE_CNT1),
+			 readl(r + RNR_CFG_JMP_CNT));
+		/* real FW error vector (0x3760); we were reading FPI's 0x35a0 */
+		dev_info(p->dev, "diag: FW_ERROR_VECTOR=0x%08x  ring_idx rd/wr=%04x/%04x\n",
+			 be32_to_cpu(readl(p->rnr_mem[CPU_TX_RING_CORE] +
+					   RDD_FW_ERROR_VECTOR_TABLE)),
+			 be16_to_cpu(readw(p->rnr_mem[CPU_TX_RING_CORE] +
+					   CPU_TX_RING_INDICES_OFF)),
+			 be16_to_cpu(readw(p->rnr_mem[CPU_TX_RING_CORE] +
+					   CPU_TX_RING_INDICES_OFF + 2)));
+	}
 
 	/* Ground truth: the REAL XPHY copper link status (vs the forced MAC
 	 * SW_LINK_STATUS). dev 0x1e reg 0x400d: bit5=copper link up, [4:2]=speed
@@ -2489,6 +2592,9 @@ static int runner_probe(struct platform_device *pdev)
 		runner_rdd_vport_cfg(p, (u32)tx_port, (u32)tx_port,
 				     BBH_BBID_RX_BBH0 + 2u * (u32)tx_port, 3);
 	}
+
+	if (profile_task >= 0)
+		runner_profile_arm(p, (u32)profile_task);
 
 	INIT_DELAYED_WORK(&p->diag_dwork, runner_diag_work);	/* armed only for 10G */
 	if (!runner_emulated && port10g >= 0) {

@@ -214,9 +214,47 @@
  * start_thread 8); ours was 0 (external-access windows unconfigured). */
 #define RNR_CFG_EXT_ACC_CFG	0x60
 #define RNR_CFG_EXT_ACC_CFG_VAL	0x08881000
+
+/* ---- Runner profiling unit: task-selective stall/exec counters -------------
+ * The 7 stall counters + exec/idle/jmp counters are INERT until a profiling
+ * window is enabled; they read 0 on stock too, so stock is no reference here.
+ * CFG_PROFILING_CFG_1 (0xb8) carries the enables, and crucially
+ * COUNTERS_SELECTED_TASK_MODE + COUNTERS_TASK let us count ONE thread - i.e.
+ * ask directly "why is CPU_TX thread 6 stalling" instead of guessing tables.
+ * CFG_PROFILING_STS (0xb0) also reports CURR_THREAD_NUM and IDLE_NO_ACTIVE_TASK. */
+#define RNR_CFG_PC_STS		0x5c	/* CURRENT_PC_ADDR[12:0], PC_RET[28:16] */
+#define RNR_CFG_STALL_CNT1	0x90	/* .. CNT7 at 0xa8, step 4 */
+#define RNR_CFG_STALL_CNT_N	7
+#define RNR_CFG_PROFILING_STS	0xb0
+#define   PROF_STS_IDLE_NO_ACTIVE_TASK	BIT(13)
+#define   PROF_STS_CURR_THREAD_SHIFT	14	/* [17:14] */
+#define   PROF_STS_PROFILING_ACTIVE	BIT(18)
+#define RNR_CFG_PROFILING_CFG_1	0xb8
+#define   PROF_CFG1_COUNTERS_SEL_TASK	BIT(9)
+#define   PROF_CFG1_COUNTERS_TASK_SHIFT	10	/* [13:10] */
+#define   PROF_CFG1_WINDOW_MODE		BIT(14)
+#define   PROF_CFG1_WINDOW_MANUAL_START	BIT(21)
+#define   PROF_CFG1_WINDOW_RESET	BIT(25)
+#define   PROF_CFG1_WINDOW_ENABLE	BIT(26)
+#define RNR_CFG_EXEC_CMDS_CNT	0xc4
+#define RNR_CFG_IDLE_CNT1	0xc8
+#define RNR_CFG_JMP_CNT		0xcc
 /* CPU-host threads (rdpa runtime, core->image identity): RX core3/thr1, TX core2/thr6. */
 #define RNR_CPU_RX_THREAD	1	/* IMAGE_3_CPU_RX_THREAD_NUMBER (core 3) */
 #define RNR_CPU_TX_THREAD	6	/* IMAGE_2_CPU_TX_0_THREAD_NUMBER (core 2) */
+/* ★image_2 has TWO CPU_TX threads and they SYNC with each other (there is a
+ * cpu_tx_sync_tasks entry point, a 2-entry CPU_TX_RING_DESCRIPTOR_TABLE and a
+ * 2-entry CPU_TX_SYNC_FIFO_TABLE). Seeding only thread 6 leaves its peer
+ * uninitialised, which is consistent with thread 6 servicing a couple of
+ * descriptors and then parking. Stacks: CPU_TX_0 @0x3200 len 0x140 -> top
+ * 0x3340; CPU_TX_1 @0x3400 len 0x140 -> top 0x3540.
+ * [BCM6813 rdd_data_structures_auto.c + rdd_runner_defs_auto.h thread map] */
+#define RNR_CPU_TX_THREAD_1	7	/* IMAGE_2_CPU_TX_1_THREAD_NUMBER */
+#define RNR_CPU_TX0_STACK_TOP	0x3340
+#define RNR_CPU_TX1_STACK_TOP	0x3540
+/* rdd_global_registers_init (GEN>=50): reg[4] = (VPORT_CFG_EX<<16)|VPORT_CFG.
+ * For core 2 that is (0x3180<<16)|0x2580. We were leaving reg[4] at 0. */
+#define RNR_GLOBAL_REG4_CORE2	0x31802580
 
 /* ----------------------------------------------------------------------------
  * SBPM (base XRDP_OFF_SBPM). Spec sec 4: trigger the free-list init, poll RDY.
@@ -811,9 +849,16 @@ struct runner_ring_cfg {
 #define   VPORT_CFG_IS_LAN		BIT(14)
 #define   VPORT_CFG_BB_RX_ID_SHIFT	8	/* [13:8] */
 #define   VPORT_CFG_CNTR_ID_SHIFT	0	/* [7:0] */
-/* QUEUE_THRESHOLD_VECTOR (core 2, RDD 0x3540): one byte per vport; live stock
- * holds value == index for every CONFIGURED vport and 0xff elsewhere. */
-#define RDD_QUEUE_THRESHOLD_VECTOR	0x3540
+/* ★ADDRESSES BELOW COME FROM THE REAL 6813 MAP:
+ *   $SDK/rdp/projects/BCM6813/drivers/rdd/auto/rdd_data_structures_auto.c
+ * NOT from the BCM6813_FPI project - that map disagrees on 60 of the 104
+ * core-2 addresses and must never be used for this chip.
+ * QUEUE_THRESHOLD_VECTOR is 0x35c0 here; FPI's 0x3540 is actually
+ * VPORT_TO_LOOKUP_PORT_MAPPING_TABLE on real 6813 (we were corrupting it). */
+#define RDD_QUEUE_THRESHOLD_VECTOR	0x35c0
+#define RDD_VPORT_TO_LOOKUP_PORT_MAP	0x3540	/* do NOT clobber */
+#define RDD_VPORT_CFG_EX_TABLE		0x3180
+#define RDD_FW_ERROR_VECTOR_TABLE	0x3760	/* FPI said 0x35a0 = FPM_GLOBAL_CFG */
 
 /* ★QM_QUEUE_TO_TX_FLOW_TABLE_PTR_TABLE (image_2 / core 2, RDD 0x3600):
  * 160 x BYTES_2 (one big-endian u16 per QM tx queue, MAX_TX_QUEUES=160).
