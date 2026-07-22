@@ -934,7 +934,11 @@ static void runner_rnr_precfg(struct runner_priv *p)
 	u64 phys = p->pool_pbase;
 	u32 ddr_base = (((u32)(phys >> 32) << 12) |
 			((u32)(phys & 0xffffffff) >> 20)) & RNR_CFG_DDR_CFG_BASE_MASK;
-	u32 ddr_cfg = ddr_base | RNR_CFG_DDR_CFG_BUF_SIZE_MODE;
+	/* match live stock: DMA_BUF_SIZE=4, DMA_BUF_SIZE_MODE=0 (we previously
+	 * had size 0 + mode 1, a different DDR buffer geometry to the DMA's) */
+	u32 ddr_cfg = ddr_base |
+		      ((u32)RNR_CFG_DDR_CFG_BUF_SIZE_VAL <<
+		       RNR_CFG_DDR_CFG_BUF_SIZE_SHIFT);
 	const u32 zero = RNR_CFG_GEN_CFG_DIS_DMA_OLD_FC |
 			 RNR_CFG_GEN_CFG_ZERO_DATA_MEM |
 			 RNR_CFG_GEN_CFG_ZERO_CTX_MEM;
@@ -959,9 +963,19 @@ static void runner_rnr_precfg(struct runner_priv *p)
 		writel(RNR_CFG_SCH_CFG_VAL,   r + RNR_CFG_SCH_CFG);
 		writel(RNR_CFG_PSRAM_CFG_VAL, r + RNR_CFG_PSRAM_CFG);
 		writel(ddr_cfg,               r + RNR_CFG_DDR_CFG);
+		/* ★external-access window config (base/steps/start_thread). Was
+		 * left at 0; live stock carries 0x08881000 on every core. */
+		writel(RNR_CFG_EXT_ACC_CFG_VAL, r + RNR_CFG_EXT_ACC_CFG);
+		/* ★GEN_CFG upper bits stock sets and the zeroing write cleared:
+		 * BBTX_TCAM_DEST_SEL + b17 + b22. Preserve the low/done bits. */
+		writel(readl(r + RNR_CFG_GEN_CFG) | RNR_CFG_GEN_CFG_STOCK_HI,
+		       r + RNR_CFG_GEN_CFG);
 	}
-	dev_info(p->dev, "bring-up: RNR pre-cfg done (ddr_base=0x%05x)\n",
-		 ddr_base);
+	dev_info(p->dev,
+		 "bring-up: RNR pre-cfg done (ddr_cfg=0x%08x sch=%u ext_acc=0x%08x gen_cfg=0x%08x)\n",
+		 ddr_cfg, RNR_CFG_SCH_CFG_VAL, RNR_CFG_EXT_ACC_CFG_VAL,
+		 p->rnr_regs[CPU_TX_RING_CORE] ?
+			readl(p->rnr_regs[CPU_TX_RING_CORE] + RNR_CFG_GEN_CFG) : 0);
 }
 
 /*

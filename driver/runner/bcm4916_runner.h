@@ -192,13 +192,28 @@
 #define RNR_CFG_GEN_CFG_ZERO_CTX_DONE	BIT(5)
 /* CFG_DDR_CFG: DMA_BASE[19:0] = (phys_hi<<12)|(phys_lo>>20); BUF_SIZE_MODE b23.
  * [VERIFIED vs data_path_init.c:654-657 + rdp_drv_rnr.c:62 (mode arg = 1).] */
+/* CFG_DDR_CFG: DMA_BASE[19:0] | DMA_BUF_SIZE[22:20] | DMA_BUF_SIZE_MODE[23] |
+ * DMA_STATIC_OFFSET[31:24]. ★Live stock core2 reads 0x004006d0 = BUF_SIZE 4,
+ * MODE 0. We were writing BUF_SIZE 0 with MODE 1, i.e. telling the Runner a
+ * different DDR buffer geometry than the one its DMA actually uses. */
 #define RNR_CFG_DDR_CFG		0x40
 #define RNR_CFG_DDR_CFG_BASE_MASK	0x000fffff
-#define RNR_CFG_DDR_CFG_BUF_SIZE_MODE	BIT(23)
+#define RNR_CFG_DDR_CFG_BUF_SIZE_SHIFT	20		/* [22:20] */
+#define RNR_CFG_DDR_CFG_BUF_SIZE_VAL	4		/* stock */
+#define RNR_CFG_DDR_CFG_BUF_SIZE_MODE	BIT(23)		/* stock leaves this 0 */
 #define RNR_CFG_PSRAM_CFG	0x44	/* DMA_BASE[19:0] = psram_base>>20 = 0x820 */
 #define RNR_CFG_PSRAM_CFG_VAL	0x820
-#define RNR_CFG_SCH_CFG		0x4c	/* scheduler cfg = 4 (DRV_RNR_16SP) */
-#define RNR_CFG_SCH_CFG_VAL	0x4
+/* ★scheduler mode [2:0]: live stock core2 = 2; we were writing 4. */
+#define RNR_CFG_SCH_CFG		0x4c
+#define RNR_CFG_SCH_CFG_VAL	0x2
+/* ★CFG_GEN_CFG upper bits live stock core2 has and we never set:
+ * BBTX_TCAM_DEST_SEL b16 (BBH_TX destination select) + b17 + b22 = 0x00430000. */
+#define RNR_CFG_GEN_CFG_STOCK_HI	0x00430000
+/* ★CFG_EXT_ACC_CFG: ADDR_BASE[12:0] | ADDR_STEP_0[19:16] | ADDR_STEP_1[23:20] |
+ * START_THREAD[27:24]. Live stock core2 = 0x08881000 (base 0x1000, steps 8/8,
+ * start_thread 8); ours was 0 (external-access windows unconfigured). */
+#define RNR_CFG_EXT_ACC_CFG	0x60
+#define RNR_CFG_EXT_ACC_CFG_VAL	0x08881000
 /* CPU-host threads (rdpa runtime, core->image identity): RX core3/thr1, TX core2/thr6. */
 #define RNR_CPU_RX_THREAD	1	/* IMAGE_3_CPU_RX_THREAD_NUMBER (core 3) */
 #define RNR_CPU_TX_THREAD	6	/* IMAGE_2_CPU_TX_0_THREAD_NUMBER (core 2) */
