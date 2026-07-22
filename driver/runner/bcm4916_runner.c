@@ -152,6 +152,29 @@ MODULE_PARM_DESC(port10g,
 		 "Bring up a 10G XPORT MAC + BBH: xport_port_id 0 = eth0/port5 (internal "
 		 "XPHY), 2 = eth1/port6 (merlin16). -1 = off (default). Opt-in, HW only.");
 
+/* ---- eth0 TX-loopback self-test (opt-in, HW only) ------------------------
+ * With no traffic from the eth0 link partner there is nothing to receive, so
+ * the RX datapath cannot be observed. These two params make the port generate
+ * its own ingress: `loopback=1` puts the 10G XLMAC in LOCAL loopback (CTRL
+ * bit2: system-side TX folds back into RX), and `tx_port=<rdpa_emac>` retargets
+ * the CPU_TX descriptor's egress port so injected frames leave via that port
+ * instead of RUNNER_FIRST_PORT. Sending on rnr0 then walks the whole chain:
+ *   rnr0 -> CPU_TX -> BBH_TX -> XLIF_TX -> XLMAC TX -[loopback]- XLMAC RX
+ *        -> XLIF_RX -> BBH_RX -> DSPTCHR VIQ -> CPU_RX -> rnr0
+ * Each stage has its own counter in the +40 s diagnostic (gtxpkt / grxpkt /
+ * BBH inpkt / rnr0), so a partial path pinpoints the failing layer. */
+static int tx_port = -1;
+module_param(tx_port, int, 0444);
+MODULE_PARM_DESC(tx_port,
+		 "CPU_TX egress port (rdpa_emac) for injected frames; 5 = eth0, "
+		 "6 = eth1. -1 = RUNNER_FIRST_PORT (default).");
+
+static bool loopback;
+module_param(loopback, bool, 0444);
+MODULE_PARM_DESC(loopback,
+		 "Put the port10g XLMAC in LOCAL loopback (TX->RX) for the "
+		 "self-test. Opt-in, HW only.");
+
 /* ---- Route A: QM + TM-core egress (opt-in; see bcm4916_runner.h + spec 11) --
  * route_a brings up the QM + a RUNNER_GRP + BBH_TX QMQ binding so an injected
  * CPU_TX PD egresses out a LAN port (the stock image_2 thread routes through the
@@ -621,9 +644,10 @@ static netdev_tx_t runner_start_xmit(struct sk_buff *skb,
 	 * frame to the FPM buffer start). do_not_recycle stays 0 so the runner
 	 * auto-frees the FPM buffer after transmit (no host reclaim needed).
 	 */
+	/* egress port: tx_port overrides RUNNER_FIRST_PORT (self-test retarget) */
 	d->word2 = cpu_to_be32(TXD_W2_IS_EMAC |
-			       (((u32)RUNNER_FIRST_PORT & TXD_W2_PORT_MASK)
-				<< TXD_W2_PORT_SHIFT));
+			       ((((u32)(tx_port >= 0 ? tx_port : RUNNER_FIRST_PORT))
+				 & TXD_W2_PORT_MASK) << TXD_W2_PORT_SHIFT));
 	d->word3 = cpu_to_be32((fpm_token_to_bn(token) & TXD_W3_FPM_BN0_MASK) |
 			       ((0u & TXD_W3_FPM_SOP_MASK) << TXD_W3_FPM_SOP_SHIFT));
 
@@ -1638,6 +1662,14 @@ static void runner_xport_init(struct runner_priv *p, int xport_port_id)
 	writel(readl(core + XLMAC_CORE_CTRL) |
 	       XLMAC_CORE_CTRL_TX_EN | XLMAC_CORE_CTRL_RX_EN,
 	       core + XLMAC_CORE_CTRL);
+	/* self-test: fold the MAC's system-side TX back into its RX so injected
+	 * CPU_TX frames become ingress (no link partner needed). LOCAL_LPBK needs
+	 * the TSC clock/credits live, which they are once the link is up. */
+	if (loopback) {
+		writel(readl(core + XLMAC_CORE_CTRL) | XLMAC_CORE_CTRL_LOCAL_LPBK,
+		       core + XLMAC_CORE_CTRL);
+		dev_info(p->dev, "bring-up: XLMAC LOCAL loopback ENABLED (self-test)\n");
+	}
 	dev_info(p->dev,
 		 "bring-up: XPORT id%d (xlmac0/p%d) 10G MAC enabled, link=%d "
 		 "(top_sts=0x%08x ctrl=0x%08x)\n",
