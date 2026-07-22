@@ -1496,15 +1496,16 @@ static void runner_rdd_qm_queue_tx_flow_init(struct runner_priv *p)
 static void runner_cpu_tx_sync_fifo_init(struct runner_priv *p)
 {
 	void __iomem *f = p->rnr_mem[CPU_TX_RING_CORE] + RDD_CPU_TX_SYNC_FIFO;
-	u32 was0 = be32_to_cpu(readl(f)), was1 = be32_to_cpu(readl(f + 8));
 
-	writel(cpu_to_be32(RDD_CPU_TX_SYNC_FIFO_E0_PTRS), f + 0);
-	writel(cpu_to_be32(RDD_CPU_TX_SYNC_FIFO_E0_FIFO), f + 4);
-	writel(cpu_to_be32(RDD_CPU_TX_SYNC_FIFO_E1_PTRS), f + 8);
-	writel(cpu_to_be32(RDD_CPU_TX_SYNC_FIFO_E1_FIFO), f + 12);
+	/* ★DO NOT SEED. These are LIVE microcode pointers, not init constants:
+	 * successive reads of the same running stock box gave e1 = 0x378d378d
+	 * and then 0x378c378c, i.e. they move. Forcing our own value left the
+	 * FIFO INCONSISTENT on silicon (write_ptr 0x378c != read_ptr 0x378d),
+	 * which is worse than leaving the microcode to manage them. Read-only
+	 * here purely so a trial records the state. */
 	dev_info(p->dev,
-		 "bring-up: CPU_TX_SYNC_FIFO seeded (e0 0x%08x->0x%08x, e1 0x%08x->0x%08x)\n",
-		 was0, be32_to_cpu(readl(f)), was1, be32_to_cpu(readl(f + 8)));
+		 "bring-up: CPU_TX_SYNC_FIFO (read-only) e0=0x%08x e1=0x%08x\n",
+		 be32_to_cpu(readl(f)), be32_to_cpu(readl(f + 8)));
 }
 
 /* Mark a vport's TX flow entry VALID in the image_2 VPORT_TX_FLOW_TABLE, the

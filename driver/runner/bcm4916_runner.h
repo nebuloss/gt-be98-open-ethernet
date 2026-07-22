@@ -817,15 +817,16 @@ struct runner_ring_cfg {
 /* CPU_TX_SYNC_FIFO (image_2 / core 2, RDD 0x3780): 2 x
  * CPU_TX_SYNC_FIFO_ENTRY_STRUCT, 8 B each, one per CPU_TX thread (6 and 7).
  * Big-endian: write_ptr:u16 | read_ptr:u16 | fifo:u16 | reserved:u16.
- * Live stock seeds write_ptr == read_ptr with a valid RDD address (empty ring):
- *   entry[0] 0x3784/0x3784 fifo 0   entry[1] 0x378d/0x378d fifo 1
- * We left it all-zero, i.e. the pointers are not valid RDD addresses.
- * [rdd_data_structures_auto.h CPU_TX_SYNC_FIFO_ENTRY_STRUCT; live stock dump] */
+ * ★These are LIVE microcode pointers, NOT init constants - two reads of the
+ * same running stock box gave e1 = 0x378d378d then 0x378c378c. Do not write
+ * them: seeding left the FIFO inconsistent on silicon (write != read). Kept
+ * only as a read-only diagnostic address.
+ * ⚠ The BCM6813_FPI rdd address map lists CPU_TX_SYNC_FIFO_TABLE at 0x3580 and
+ * CPU_TX_RING_DESCRIPTOR_TABLE at 0x3360, but on THIS image both stock and we
+ * use 0x3780 / 0x33e0 - that map is only partially applicable (it IS correct
+ * for VPORT_TX_FLOW_TABLE 0xfc0, ring indices 0x29c8 and egress credit 0x29d0,
+ * all three confirmed on silicon). Trust silicon over the FPI map. */
 #define RDD_CPU_TX_SYNC_FIFO		0x3780
-#define RDD_CPU_TX_SYNC_FIFO_E0_PTRS	0x37843784	/* write_ptr|read_ptr */
-#define RDD_CPU_TX_SYNC_FIFO_E0_FIFO	0x00000000	/* fifo 0 | reserved */
-#define RDD_CPU_TX_SYNC_FIFO_E1_PTRS	0x378d378d
-#define RDD_CPU_TX_SYNC_FIFO_E1_FIFO	0x00010000	/* fifo 1 | reserved */
 
 #define RDD_VPORT_TX_FLOW_TABLE		0x0fc0
 #define RDD_VPORT_TX_FLOW_ENTRIES	64
