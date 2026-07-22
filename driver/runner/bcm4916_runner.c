@@ -175,6 +175,19 @@ MODULE_PARM_DESC(loopback,
 		 "Put the port10g XLMAC in LOCAL loopback (TX->RX) for the "
 		 "self-test. Opt-in, HW only.");
 
+/* ★TXD is_vport (bit27). Spec 11 sec D: for the QM/TM egress path the open
+ * driver must set is_egress=1, **is_vport=1**, flow_or_port_id=<vport> and
+ * is_emac -- the GPL rdd_cpu_tx_set_ring_descriptor() sets NONE of those (they
+ * come from proprietary rdpa_cpu_tx). With is_vport=0 the microcode reads
+ * [26:20] as a raw EMAC port and cannot resolve an egress target, so it
+ * consumes the descriptor and discards it -- observed exactly: read_idx
+ * advances but the QM never receives a PD (occupancy 0 AND drops 0). */
+static bool tx_is_vport;
+module_param(tx_is_vport, bool, 0444);
+MODULE_PARM_DESC(tx_is_vport,
+		 "Set TXD word2 is_vport (bit27) so flow_or_port_id resolves as a "
+		 "vport. Required for the route_a QM/TM egress path.");
+
 /* ---- Route A: QM + TM-core egress (opt-in; see bcm4916_runner.h + spec 11) --
  * route_a brings up the QM + a RUNNER_GRP + BBH_TX QMQ binding so an injected
  * CPU_TX PD egresses out a LAN port (the stock image_2 thread routes through the
@@ -656,8 +669,11 @@ static netdev_tx_t runner_start_xmit(struct sk_buff *skb,
 	 * frame to the FPM buffer start). do_not_recycle stays 0 so the runner
 	 * auto-frees the FPM buffer after transmit (no host reclaim needed).
 	 */
-	/* egress port: tx_port overrides RUNNER_FIRST_PORT (self-test retarget) */
+	/* egress port: tx_port overrides RUNNER_FIRST_PORT (self-test retarget).
+	 * is_vport marks [26:20] as a vport id rather than a raw EMAC port, which
+	 * is what the QM/TM egress path resolves against (spec 11 sec D). */
 	d->word2 = cpu_to_be32(TXD_W2_IS_EMAC |
+			       (tx_is_vport ? TXD_W2_IS_VPORT : 0) |
 			       ((((u32)(tx_port >= 0 ? tx_port : RUNNER_FIRST_PORT))
 				 & TXD_W2_PORT_MASK) << TXD_W2_PORT_SHIFT));
 	d->word3 = cpu_to_be32((fpm_token_to_bn(token) & TXD_W3_FPM_BN0_MASK) |
@@ -1138,9 +1154,10 @@ static void runner_dsptchr_cpu_tx_setup(struct runner_priv *p)
 	writel(cur | (1u << viq), d + DSPTCHR_MASK_DLY_Q);
 	/* per-VIQ ingress limits: CMN_MAX=0x3FF, GURNTD_MAX=8 (match stock) */
 	writel(DSPTCHR_TX_INGRS_LIMITS, d + DSPTCHR_INGRS_Q_LIMITS + 4 * viq);
-	/* seed the dispatcher's delayed-egress QM credit pool (stock=8). Without a
-	 * QM feeding this, the dispatcher cannot RELEASE delayed-queue credit. */
+	/* seed the dispatcher's delayed-egress QM credit pool (stock=8). Live stock
+	 * carries 8 in BOTH words at +0x630 and +0x634, so seed both. */
 	writel(DSPTCHR_EGRS_DLY_QM_CRDT_VAL, d + DSPTCHR_EGRS_DLY_QM_CRDT);
+	writel(DSPTCHR_EGRS_DLY_QM_CRDT_VAL, d + DSPTCHR_EGRS_DLY_QM_CRDT + 4);
 	/* enable this VIQ alongside the CPU_RX one already set */
 	cur = readl(d + DSPTCHR_VQ_EN);
 	writel(cur | (1u << viq), d + DSPTCHR_VQ_EN);
@@ -1414,6 +1431,34 @@ static void runner_xport_xlif_enable(struct runner_priv *p, u32 channel)
 		 channel, readl(rx + XLIF_RX_IF_IF_DIS),
 		 readl(tx + XLIF_TX_IF_IF_ENABLE),
 		 readl(tx + XLIF_TX_IF_TX_THRESHOLD));
+}
+
+/* Mark a vport's TX flow entry VALID in the image_2 VPORT_TX_FLOW_TABLE, the
+ * equivalent of the stock rdd_tx_flow_enable(). A CPU_TX descriptor with
+ * is_vport=1 makes the microcode resolve the egress target through this table;
+ * with the entry invalid (the power-on state - the whole table reads zero) the
+ * PD is consumed and silently dropped before it ever reaches the QM.
+ *
+ * The table is a byte array, but the Runner SRAM is word-accessed and holds
+ * BIG-ENDIAN content, so update the containing u32 read-modify-write with the
+ * byte lane picked MSB-first. [spec 11 sec D; rdd_common.c: for non-PON/DSL
+ * tx_flow == port, so vport = the egress port id.] */
+static void runner_rdd_tx_flow_enable(struct runner_priv *p, u32 vport)
+{
+	void __iomem *base = p->rnr_mem[CPU_TX_RING_CORE] + RDD_VPORT_TX_FLOW_TABLE;
+	void __iomem *w;
+	u32 cur, shift;
+
+	if (vport >= RDD_VPORT_TX_FLOW_ENTRIES)
+		return;
+	w = base + (vport & ~3u);
+	shift = 8u * (3u - (vport & 3u));	/* big-endian: byte0 = MSB */
+	cur = be32_to_cpu(readl(w));
+	cur = (cur & ~(0xffu << shift)) | ((u32)RDD_TX_FLOW_ENTRY_VALID << shift);
+	writel(cpu_to_be32(cur), w);
+	dev_info(p->dev,
+		 "bring-up: RDD tx_flow_enable(vport %u) -> entry=0x%02x (word 0x%08x)\n",
+		 vport, RDD_TX_FLOW_ENTRY_VALID, be32_to_cpu(readl(w)));
 }
 
 /* One-shot RX-path diagnostic: fired ~40 s after bring-up, once the link and
@@ -2345,6 +2390,10 @@ static int runner_probe(struct platform_device *pdev)
 	 * XPHY is self-contained. bbh_id: xport_port_id 0 -> port5, 2 -> port6.
 	 * [re-notes/realhw/12-10g-xport-bringup.md]
 	 */
+	/* make the CPU_TX egress vport resolvable (needed when tx_is_vport=1) */
+	if (tx_port >= 0)
+		runner_rdd_tx_flow_enable(p, (u32)tx_port);
+
 	INIT_DELAYED_WORK(&p->diag_dwork, runner_diag_work);	/* armed only for 10G */
 	if (!runner_emulated && port10g >= 0) {
 		u32 pviq = (port10g == 0) ? 5 : 6;	/* xport_port_id 0->port5, 2->port6 */

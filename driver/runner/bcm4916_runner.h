@@ -254,7 +254,14 @@
  * EGRS_DLY_QM_CRDT seeded to 8.
  */
 #define DSPTCHR_CPU_TX_EGRESS_VIQ	13	/* DISP_REOR_VIQ_CPU_TX_EGRESS (stock, verified live) */
-#define DSPTCHR_TX_INGRS_LIMITS		0x000023ff /* CMN_MAX=0x3FF, GURNTD_MAX=8 (match stock) */
+/* CMN_MAX[9:0]=0x3FF, GURNTD_MAX[19:10]=8, ★CREDIT_CNT[31:20]=224.
+ * ★CREDIT_CNT was 0 here, which is what stalled open-driver TX: the CPU_TX
+ * egress thread consumes its one initial descriptor and then parks forever
+ * waiting for egress credit that is never granted (observed on silicon:
+ * read_idx=1 vs write_idx=35, credit word core2+0x29d0 = 0, and the QM never
+ * saw a single PD - occupancy 0 AND drop counters 0). Stock VIQ13 reads
+ * 0x0e0023ff; match it exactly. [live DSPTCHR oracle 2026-07-22] */
+#define DSPTCHR_TX_INGRS_LIMITS		0x0e0023ff
 #define DSPTCHR_EGRS_DLY_QM_CRDT_VAL	8	/* match stock EGRS_DLY_QM_CRDT */
 #define DSPTCHR_CPU_TX_CRDT_TGT		(((CPU_TX_EGRESS_CREDIT_OFF >> 3) | \
 					  (RNR_CPU_TX_THREAD << 12)) & 0xffff)
@@ -764,6 +771,17 @@ struct runner_ring_cfg {
  * replenished by the QM/dispatcher; if it stays 0 the CPU_TX thread stalls after
  * its initial credits. [rdd_runner_reg_dump_addrs.c core 2] */
 #define CPU_TX_EGRESS_CREDIT_OFF	0x29d0	/* 3 x u32 */
+/* VPORT_TX_FLOW_TABLE (image_2 / core 2, RDD 0x0fc0): TX_FLOW_ENTRY_STRUCT
+ * entry[64], ONE BYTE each, indexed directly by vport. Firmware is big-endian:
+ * valid:1 (bit7) | reserved:2 | qos_table_ptr:5. An all-zero table means every
+ * vport is INVALID, so a CPU_TX descriptor with is_vport=1 is consumed and then
+ * dropped by the microcode - which is exactly what we measured (read_idx
+ * advances, QM occupancy AND drop counters both stay 0).
+ * [rdd_data_structures_auto.h TX_FLOW_ENTRY_STRUCT; spec 11 sec D
+ *  rdd_tx_flow_enable(); for non-PON/DSL tx_flow = port] */
+#define RDD_VPORT_TX_FLOW_TABLE		0x0fc0
+#define RDD_VPORT_TX_FLOW_ENTRIES	64
+#define RDD_TX_FLOW_ENTRY_VALID		0x80	/* valid=1, qos_table_ptr=0 */
 #define CPU_TX_INGRESS_CREDIT_OFF	0x2b70	/* 3 x u32 */
 #define CPU_TX_SYNC_FIFO_OFF		0x3780	/* {write_ptr@+0, read_ptr@+2} */
 
