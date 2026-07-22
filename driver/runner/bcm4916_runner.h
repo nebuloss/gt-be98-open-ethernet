@@ -779,6 +779,41 @@ struct runner_ring_cfg {
  * advances, QM occupancy AND drop counters both stay 0).
  * [rdd_data_structures_auto.h TX_FLOW_ENTRY_STRUCT; spec 11 sec D
  *  rdd_tx_flow_enable(); for non-PON/DSL tx_flow = port] */
+/* ★VPORT_CFG_TABLE (image_2 / core 2, RDD 0x2580): VPORT_CFG_ENTRY_STRUCT,
+ * 4 B per vport, firmware BIG-ENDIAN field order (MSB first):
+ *   exception:1 | congestion_flow_control:1 | ingress_filter_profile:6 |
+ *   natc_tbl_id:3 | viq:4 | port_dbg_stat_en:1 | mcast_whitelist_skip:1 |
+ *   is_lan:1 | bb_rx_id:6 | cntr_id:8
+ * Live stock entry for vport 5 (eth0) is 0x000ae903, which decodes to
+ * viq=5, is_lan=1, bb_rx_id=41, mcast_whitelist_skip=1, cntr_id=3 -- i.e.
+ * exactly this port's own dispatcher VIQ and BBH_RX bb_id, so we build it from
+ * those rather than hardcoding. Ours was 0 (vport unconfigured).
+ * [rdd_data_structures_auto.h VPORT_CFG_ENTRY_STRUCT; live stock dump] */
+#define RDD_VPORT_CFG_TABLE		0x2580
+#define   VPORT_CFG_VIQ_SHIFT		17	/* [20:17] */
+#define   VPORT_CFG_PORT_DBG_STAT_EN	BIT(16)
+#define   VPORT_CFG_MCAST_WL_SKIP	BIT(15)
+#define   VPORT_CFG_IS_LAN		BIT(14)
+#define   VPORT_CFG_BB_RX_ID_SHIFT	8	/* [13:8] */
+#define   VPORT_CFG_CNTR_ID_SHIFT	0	/* [7:0] */
+/* QUEUE_THRESHOLD_VECTOR (core 2, RDD 0x3540): one byte per vport; live stock
+ * holds value == index for every CONFIGURED vport and 0xff elsewhere. */
+#define RDD_QUEUE_THRESHOLD_VECTOR	0x3540
+
+/* ★QM_QUEUE_TO_TX_FLOW_TABLE_PTR_TABLE (image_2 / core 2, RDD 0x3600):
+ * 160 x BYTES_2 (one big-endian u16 per QM tx queue, MAX_TX_QUEUES=160).
+ * THE missing indirection for CPU_TX egress: the microcode resolves a QM queue
+ * to its TX-flow table through this pointer, then indexes that table by vport.
+ * Live stock fills EVERY entry with 0x0fc0 == RDD_VPORT_TX_FLOW_TABLE. We left
+ * it all-zero, so a queue resolved to a NULL flow-table pointer, resolution
+ * failed and the PD was discarded inside the microcode -- before the QM, which
+ * is why QM occupancy AND the QM drop counters were both 0.
+ * (NB spec 11 sec C calls this table "#if BCM_DSL_XRDP, a no-op on 6813" --
+ * live silicon contradicts that: it is populated and required.)
+ * [rdd_data_structures_auto.{h,c}; live stock core-2 RDD dump 2026-07-22] */
+#define RDD_QM_QUEUE_TO_TX_FLOW_PTR	0x3600
+#define RDD_QM_QUEUE_TO_TX_FLOW_ENTRIES	160
+
 /* CPU_TX_SYNC_FIFO (image_2 / core 2, RDD 0x3780): 2 x
  * CPU_TX_SYNC_FIFO_ENTRY_STRUCT, 8 B each, one per CPU_TX thread (6 and 7).
  * Big-endian: write_ptr:u16 | read_ptr:u16 | fifo:u16 | reserved:u16.

@@ -1433,6 +1433,61 @@ static void runner_xport_xlif_enable(struct runner_priv *p, u32 channel)
 		 readl(tx + XLIF_TX_IF_TX_THRESHOLD));
 }
 
+/* Configure a vport in the image_2 VPORT_CFG_TABLE + QUEUE_THRESHOLD_VECTOR.
+ * A vport left at 0 is simply unconfigured, so the microcode has no VIQ /
+ * bb_rx_id / is_lan for it and cannot build an egress. The entry is rebuilt
+ * from this port's own dispatcher VIQ and BBH_RX bb_id, which reproduces the
+ * live-stock value for vport 5 (0x000ae903) exactly. */
+static void runner_rdd_vport_cfg(struct runner_priv *p, u32 vport, u32 viq,
+				 u32 bb_rx_id, u32 cntr_id)
+{
+	void __iomem *c = p->rnr_mem[CPU_TX_RING_CORE] + RDD_VPORT_CFG_TABLE +
+			  vport * 4;
+	void __iomem *q = p->rnr_mem[CPU_TX_RING_CORE] +
+			  RDD_QUEUE_THRESHOLD_VECTOR;
+	u32 val, was = be32_to_cpu(readl(c));
+	u32 w, shift, cur;
+
+	val = ((viq & 0xf) << VPORT_CFG_VIQ_SHIFT) |
+	      VPORT_CFG_MCAST_WL_SKIP | VPORT_CFG_IS_LAN |
+	      ((bb_rx_id & 0x3f) << VPORT_CFG_BB_RX_ID_SHIFT) |
+	      ((cntr_id & 0xff) << VPORT_CFG_CNTR_ID_SHIFT);
+	writel(cpu_to_be32(val), c);
+
+	/* QUEUE_THRESHOLD_VECTOR: byte per vport, stock uses value == index */
+	w = vport & ~3u;
+	shift = 8u * (3u - (vport & 3u));		/* big-endian byte lane */
+	cur = be32_to_cpu(readl(q + w));
+	cur = (cur & ~(0xffu << shift)) | ((vport & 0xff) << shift);
+	writel(cpu_to_be32(cur), q + w);
+
+	dev_info(p->dev,
+		 "bring-up: RDD vport%u cfg=0x%08x (viq=%u bb_rx=%u is_lan) was 0x%08x; qthr[%u]=%u\n",
+		 vport, be32_to_cpu(readl(c)), viq, bb_rx_id, was, vport, vport);
+}
+
+/* Point every QM tx queue at the VPORT_TX_FLOW_TABLE, exactly as live stock
+ * does. This is the indirection the CPU_TX microcode uses to resolve an egress
+ * target: QM queue -> (this table) -> TX-flow table -> index by vport. With the
+ * table zeroed the queue resolves to a NULL flow-table pointer and the PD is
+ * dropped inside the microcode, before it is ever enqueued (QM occupancy 0 AND
+ * QM drop counters 0 - the drop is not the QM's).
+ * 160 big-endian u16 entries; write two per 32-bit word. */
+static void runner_rdd_qm_queue_tx_flow_init(struct runner_priv *p)
+{
+	void __iomem *t = p->rnr_mem[CPU_TX_RING_CORE] + RDD_QM_QUEUE_TO_TX_FLOW_PTR;
+	u32 pair = ((u32)RDD_VPORT_TX_FLOW_TABLE << 16) | RDD_VPORT_TX_FLOW_TABLE;
+	u32 was = be32_to_cpu(readl(t));
+	int i;
+
+	for (i = 0; i < RDD_QM_QUEUE_TO_TX_FLOW_ENTRIES / 2; i++)
+		writel(cpu_to_be32(pair), t + i * 4);
+	dev_info(p->dev,
+		 "bring-up: RDD qm_queue->tx_flow table seeded with 0x%04x x%d (word0 0x%08x->0x%08x)\n",
+		 RDD_VPORT_TX_FLOW_TABLE, RDD_QM_QUEUE_TO_TX_FLOW_ENTRIES,
+		 was, be32_to_cpu(readl(t)));
+}
+
 /* Seed the image_2 CPU_TX_SYNC_FIFO the way live stock does: write_ptr ==
  * read_ptr (empty) but pointing at a VALID RDD address, one entry per CPU_TX
  * thread. We were leaving it all-zero, so the threads' FIFO pointers were not
@@ -2412,7 +2467,12 @@ static int runner_probe(struct platform_device *pdev)
 	/* make the CPU_TX egress vport resolvable (needed when tx_is_vport=1) */
 	if (tx_port >= 0) {
 		runner_cpu_tx_sync_fifo_init(p);
+		runner_rdd_qm_queue_tx_flow_init(p);
 		runner_rdd_tx_flow_enable(p, (u32)tx_port);
+		/* vport N uses VIQ N and BBH_RX bb_id = BBH0 + 2N (same rule the
+		 * dispatcher wiring uses), cntr_id 3 as live stock. */
+		runner_rdd_vport_cfg(p, (u32)tx_port, (u32)tx_port,
+				     BBH_BBID_RX_BBH0 + 2u * (u32)tx_port, 3);
 	}
 
 	INIT_DELAYED_WORK(&p->diag_dwork, runner_diag_work);	/* armed only for 10G */
