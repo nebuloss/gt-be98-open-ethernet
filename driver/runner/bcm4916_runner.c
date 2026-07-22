@@ -208,6 +208,18 @@ static uint route_a_tm_task;	/* ★SILICON TM core egress thread number */
 module_param(route_a_tm_task, uint, 0444);
 MODULE_PARM_DESC(route_a_tm_task, "TM-core egress thread number (oracle).");
 
+/* ★ORACLE 2026-07-22 (tools/stock-watch/route-a-oracle.sh on live stock):
+ * BBH_TX[1] is BBH_ID_QM_COPY (the only instance with QMQ set) -- NOT a LAN
+ * egress, so the old bbh_inst=1 pinning could never carry eth0. eth0 egresses
+ * via BBH_TX_ID_LAN(0) QUEUE 5 (BBH_TX[0] is runner-fed, BBCFG_2=0x607 = fed by
+ * both TM cores 7 and 6). QM groups (live): grp0 = bb_id7/task3/queues 80-111
+ * (DS_TM, FIRST_QUEUE_MAPPING=80); grp1 = bb_id6/task4/queues 0-79 (US_TM). */
+static uint route_a_bbh_q;	/* BBH_TX queue index within the instance (eth0 = 5) */
+module_param(route_a_bbh_q, uint, 0444);
+MODULE_PARM_DESC(route_a_bbh_q,
+		 "BBH_TX queue index to make QM-fed within route_a_bbh_inst "
+		 "(eth0 = BBH_TX_ID_LAN inst0 q5; eth1 = inst2 q0). Default 0.");
+
 static uint route_a_bbh_inst;	/* ★SILICON BBH_TX instance for the LAN port */
 module_param(route_a_bbh_inst, uint, 0444);
 MODULE_PARM_DESC(route_a_bbh_inst, "BBH_TX instance index for the LAN egress port (default 0).");
@@ -1204,12 +1216,17 @@ static void runner_bbh_tx_route_a(struct runner_priv *p)
 	 * ★SILICON and left 0 - the QM RUNNER_GRP drives the wakeup regardless. */
 	writel((route_a_tm_task & 0xf) << BBH_TX_RNRCFG_2_TASK_SHIFT,
 	       tx + BBH_TX_RNRCFG_2_0);
-	/* take queue 0 of this BBH from the QM aggregator (both register views) */
-	writel(BBH_TX_QMQ_Q0, tx + BBH_TX_QMQ_LAN);
-	writel(BBH_TX_QMQ_Q0, tx + BBH_TX_QMQ_UNIFIED);
+	/* Take THIS BBH's target queue from the QM aggregator (both register
+	 * views). ★The queue index matters: on 6813 BBH_TX_ID_LAN(0) carries
+	 * QGPHY on q0-3, XLMAC0 port1 on q4 and **XLMAC0 port0 (eth0) on q5**;
+	 * BBH_TX_ID_LAN_1(2) carries XLMAC0 port2 (eth1) on q0. Hardcoding q0
+	 * could never reach eth0. [6813 rdp_platform.h bbh_id_e comments] */
+	writel(1u << (route_a_bbh_q & 0x1f), tx + BBH_TX_QMQ_LAN);
+	writel(1u << (route_a_bbh_q & 0x1f), tx + BBH_TX_QMQ_UNIFIED);
 	dev_info(p->dev,
-		 "route_a: BBH_TX inst%u QM-fed (QMQ q0=1, tm_bb=%u task=%u)\n",
-		 route_a_bbh_inst, route_a_tm_bb_id, route_a_tm_task);
+		 "route_a: BBH_TX inst%u q%u QM-fed (QMQ=0x%08x, tm_bb=%u task=%u)\n",
+		 route_a_bbh_inst, route_a_bbh_q, 1u << (route_a_bbh_q & 0x1f),
+		 route_a_tm_bb_id, route_a_tm_task);
 }
 
 static int runner_dsptchr_init(struct runner_priv *p)
